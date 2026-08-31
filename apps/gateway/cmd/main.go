@@ -109,10 +109,16 @@ func newHandler(log zerolog.Logger, q handler.Enqueuer) *handler.Handler {
 // /health and /ready and nothing anyone asked for.
 //
 // main's own body is reachable too — openStore is replaceable, so a test can
-// run main() with no database. Pinning the one argument left uncovered there
-// costs an os.Stdout swap and a self-directed SIGTERM, heavier and flakier
-// machinery than anything else in this suite. It is uncovered by judgement,
-// not because it cannot be reached.
+// run main() with no database. None does: under -coverprofile every statement
+// in main is count 0, and mutating the PORT default, the DSN default or the
+// 10s shutdown timeout leaves the suite green. So the logger is not the one
+// argument left uncovered there — the whole body is. It is only the one that
+// was mutated and recorded as surviving.
+//
+// Closing that gap means running main() under test: a self-directed SIGTERM to
+// make it return, and an os.Stdout swap to see what it logged. That is heavier
+// and flakier machinery than anything else in this suite. The body is uncovered
+// by judgement, not because it cannot be reached.
 func newServer(log zerolog.Logger, st storeHandle) *echo.Echo {
 	return newRouter(readinessFor(log, st).Ready, newHandler(log, jobs.New(st.Pool())))
 }
