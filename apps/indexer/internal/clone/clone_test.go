@@ -154,7 +154,11 @@ const recordingGit = "#!/bin/sh\n{ printf 'ARG:%s\\n' \"$@\"; env; } > \"$SHIM_R
 // hangingGit spawns a child that outlives it and then blocks, so that killing
 // only the direct child leaves the grandchild running — and holding the pipe
 // Run is reading. It records the child's pid so the test can bury it.
-const hangingGit = "#!/bin/sh\nsleep 300 &\necho $! > \"$SHIM_RECORD\"\nwait\n"
+//
+// It ignores SIGTERM first, and an ignored disposition survives exec, so the
+// sleep inherits it: a fixture that dies on any signal cannot tell a group
+// SIGKILL from a group SIGTERM, and would let the weaker signal pass.
+const hangingGit = "#!/bin/sh\ntrap \"\" TERM\nsleep 300 &\necho $! > \"$SHIM_RECORD\"\nwait\n"
 
 // escapingGit puts its child in a new session, outside the process group the
 // deadline kills, where it goes on holding the output pipe Run is reading.
@@ -491,6 +495,27 @@ func TestCloneCreatesThePrivateScratchParent(t *testing.T) {
 	}
 	if perm := fi.Mode().Perm(); perm != 0o700 {
 		t.Fatalf("scratch parent mode %o, want 700", perm)
+	}
+}
+
+// An empty repository is a normal thing for a stranger to submit: an
+// allowlisted forge serves one happily, the clone succeeds, and only the head
+// lookup fails — so that failure has to carry git's own message rather than a
+// bare exit status.
+func TestCloneOnAnEmptyRepositoryExplainsItself(t *testing.T) {
+	src := t.TempDir()
+	gitIn(t, src, "init", "-q", "-b", "main", ".")
+	dst := filepath.Join(t.TempDir(), "checkout")
+
+	_, err := Run(context.Background(), "file://"+src, "HEAD", dst, limits(time.Minute))
+	if err == nil {
+		t.Fatal("want an error from the head lookup")
+	}
+	if !strings.Contains(err.Error(), "fatal:") {
+		t.Fatalf("the failure must carry git's own message, got %q", err)
+	}
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Fatal("the empty checkout must not be left on disk")
 	}
 }
 
