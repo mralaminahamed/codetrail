@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -13,8 +14,11 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/rs/zerolog"
 
+	"github.com/mralaminahamed/codetrail/apps/gateway/internal/handler"
 	"github.com/mralaminahamed/codetrail/apps/gateway/internal/server"
+	"github.com/mralaminahamed/codetrail/packages/shared/admit"
 	"github.com/mralaminahamed/codetrail/packages/shared/config"
+	"github.com/mralaminahamed/codetrail/packages/shared/jobs"
 	"github.com/mralaminahamed/codetrail/packages/shared/logger"
 	"github.com/mralaminahamed/codetrail/packages/shared/metrics"
 )
@@ -75,8 +79,21 @@ func (r *readiness) Ready() bool {
 
 // newRouter builds the router the binary actually serves. A function rather
 // than inline in main so a test can pin the composition.
-func newRouter(ready func() bool) *echo.Echo {
-	return server.New(ready)
+func newRouter(ready func() bool, h *handler.Handler) *echo.Echo {
+	e := server.New(ready)
+	handler.Mount(e, h)
+	return e
+}
+
+// allowedHosts reads the exact-host allowlist: ALLOWED_HOSTS, comma-separated,
+// replacing the default rather than extending it. NewPolicy trims, so a list
+// written with spaces works.
+//
+// A host whose repository paths nest deeper than /owner/name is only half
+// served by adding it — gitlab.com's group/repo would be accepted and its
+// group/subgroup/repo refused — because Check requires exactly two segments.
+func allowedHosts() []string {
+	return strings.Split(config.Get("ALLOWED_HOSTS", strings.Join(admit.DefaultHosts, ",")), ",")
 }
 
 func main() {
@@ -91,7 +108,8 @@ func main() {
 	defer st.Close()
 	log.Info().Msg("postgres ready, schema up to date")
 
-	e := newRouter(readinessFor(log, st).Ready)
+	h := &handler.Handler{Policy: admit.NewPolicy(allowedHosts()), Jobs: jobs.New(st.Pool())}
+	e := newRouter(readinessFor(log, st).Ready, h)
 
 	addr := ":" + config.Get("PORT", "8080")
 	go func() {

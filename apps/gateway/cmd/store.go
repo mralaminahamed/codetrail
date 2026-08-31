@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/mralaminahamed/codetrail/packages/shared/store"
 )
 
@@ -11,6 +13,7 @@ import (
 // Postgres to connect to.
 type storeHandle interface {
 	Ping(context.Context) error
+	Pool() *pgxpool.Pool
 	Close()
 }
 

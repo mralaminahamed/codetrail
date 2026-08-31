@@ -109,6 +109,12 @@ against a hostile allowlisted forge, and codetrail claims no DNS-rebinding prote
 subprocess and cannot be handed a validating dialer. That is a real limitation and it is written
 here rather than left for someone to discover.
 
+**Configuring the allowlist.** `ALLOWED_HOSTS` is a comma-separated list of exact hosts, and it
+replaces the default (`github.com`, `codeberg.org`) rather than extending it. One limitation to
+know before setting it: an accepted path is exactly `/owner/name`, so a forge that nests namespaces
+deeper is only half served — adding `gitlab.com` accepts `group/repo` and refuses
+`group/subgroup/repo`.
+
 **Nothing grows without bound.** Hard admission caps plus LRU eviction on last-queried time. Anyone
 may submit; a popular repository stays warm; the least recently queried one goes when the quota is
 reached, in a single `DELETE` that cascades.
