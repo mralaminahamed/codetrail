@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 )
 
 var ErrTooManyFiles = errors.New("walk: file count exceeds the cap")
@@ -38,6 +39,16 @@ var langByExt = map[string]string{
 // repository can contain `link -> /etc/passwd`, and following it would read
 // and index the host's files.
 func Files(root string, lim Limits) ([]File, error) {
+	// Both caps fail closed, the way clone's do: zero is a refusal, not
+	// "unlimited". An int-valued config knob that parses to 0 must not arrive
+	// here as permission to index a repository of any size.
+	if lim.MaxFiles <= 0 {
+		return nil, fmt.Errorf("walk: MaxFiles must be positive, got %d", lim.MaxFiles)
+	}
+	if lim.MaxFileBytes <= 0 {
+		return nil, fmt.Errorf("walk: MaxFileBytes must be positive, got %d", lim.MaxFileBytes)
+	}
+
 	var out []File
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -50,11 +61,28 @@ func Files(root string, lim Limits) ([]File, error) {
 		if rel == "." {
 			return nil
 		}
-		if d.IsDir() {
-			// The object database is enormous and meaningless to index.
-			if d.Name() == ".git" {
+		// Git stores path bytes verbatim, so a checkout can hold a name that is
+		// not UTF-8. encoding/json does not reject one, it substitutes U+FFFD,
+		// so such a path would be served back naming a file that does not
+		// exist. Measured, not assumed: json.Marshal of "bad\xff\xfe.go"
+		// returns no error and a different string.
+		if !utf8.ValidString(rel) {
+			if d.IsDir() {
 				return filepath.SkipDir
 			}
+			return nil
+		}
+		// As a directory .git is the object database: enormous, and meaningless
+		// to index. As a regular file it is a gitlink, whose one line is an
+		// absolute path on this host — also not the repository's content. The
+		// name is matched exactly, so .github and .gitignore are unaffected.
+		if d.Name() == ".git" {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() {
 			return nil
 		}
 		// IsRegular is true only when no type bit is set, so this rejects every
@@ -68,10 +96,13 @@ func Files(root string, lim Limits) ([]File, error) {
 		if ierr != nil {
 			return ierr
 		}
-		if lim.MaxFileBytes > 0 && info.Size() > lim.MaxFileBytes {
+		// Over the cap is a skip, not a failure: one generated blob should not
+		// lose the repository. Over the file count is a failure, because it
+		// means the caps were wrong for this repository.
+		if info.Size() > lim.MaxFileBytes {
 			return nil
 		}
-		if lim.MaxFiles > 0 && len(out) >= lim.MaxFiles {
+		if len(out) >= lim.MaxFiles {
 			return fmt.Errorf("%w: more than %d", ErrTooManyFiles, lim.MaxFiles)
 		}
 		body, rerr := os.ReadFile(p)
