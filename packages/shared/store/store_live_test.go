@@ -14,6 +14,11 @@ func dsn(t *testing.T) string {
 	t.Helper()
 	v := os.Getenv("DATABASE_URL")
 	if v == "" {
+		// A skipped live suite prints the same "ok" as one that ran, so in CI a
+		// dropped DATABASE_URL would look green with zero live coverage.
+		if os.Getenv("CI") != "" {
+			t.Fatal("DATABASE_URL unset in CI — the live suite must never silently skip")
+		}
 		t.Skip("set DATABASE_URL to run")
 	}
 	return v
