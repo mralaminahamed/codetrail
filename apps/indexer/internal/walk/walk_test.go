@@ -2,6 +2,7 @@ package walk
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -168,9 +169,14 @@ func link(t *testing.T, target, name string) {
 	}
 }
 
-// A link to an *empty* target discriminates between following and not only by
-// accident. These four give the follow-the-link mutant something to find:
-// a directory with entries, a loop, a link back into the tree, and a device.
+// Not a guard in this file: filepath.WalkDir reads each directory's own
+// listing and never resolves a link, so nothing here can be mutated to make
+// this test fail for the reason it states — under the realistic follow-links
+// mutant (d.Type/d.Info -> os.Stat) it passes outright, and under the
+// IsRegular mutant it dies on EISDIR from reading `vendor`, not on its own
+// assertion. It is a regression pin on that stdlib property, which the whole
+// package rests on. The target is populated so that a regression leaks
+// something visible rather than nothing.
 func TestNeverDescendsIntoALinkedDirectory(t *testing.T) {
 	root := tree(t, map[string]string{"main.go": "package main\n"})
 	outside := tree(t, map[string]string{"leak.go": "package leak\n", "deep/er.go": "package er\n"})
@@ -253,8 +259,11 @@ func TestSkipsAFifo(t *testing.T) {
 	}
 }
 
-// .git is skipped by name only when it is a directory; as a symlink it is the
-// symlink guard that stops it, so the two are not the same test.
+// Two guards would each stop this on their own — the name check it reaches
+// first, and the IsRegular check it would reach if the name check were gone —
+// so it kills neither in isolation and is not evidence for either. It pins the
+// composite: whatever `.git` is, a populated gitdir outside the checkout stays
+// out of the index.
 func TestSkipsADotGitThatIsASymlink(t *testing.T) {
 	root := tree(t, map[string]string{"main.go": "package main\n"})
 	real := tree(t, map[string]string{"config": "[core]\n", "objects/aa/bbbb": "binary"})
@@ -269,8 +278,10 @@ func TestSkipsADotGitThatIsASymlink(t *testing.T) {
 	}
 }
 
-// A .git *file* is a gitlink: its one line is an absolute path on this host,
-// which is not the repository's content and must not reach a public index.
+// A .git *file* is a gitlink: its one line points at a gitdir elsewhere on
+// this host — git writes a relative path for a submodule (`gitdir:
+// ../.git/modules/mod`) and an absolute one elsewhere, and neither is the
+// repository's content or fit for a public index.
 func TestSkipsADotGitThatIsAFile(t *testing.T) {
 	root := tree(t, map[string]string{
 		".git":    "gitdir: /home/victim/private/.git\n",
@@ -280,8 +291,14 @@ func TestSkipsADotGitThatIsAFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p := paths(got); p[".git"] {
+	p := paths(got)
+	if p[".git"] {
 		t.Fatalf("a gitlink file was indexed: %v", p)
+	}
+	// Skipping the entry, not the directory it sits in: a SkipDir here would
+	// drop the whole checkout and still satisfy the assertion above.
+	if !p["main.go"] {
+		t.Fatalf("skipping the gitlink cost the rest of the checkout: %v", p)
 	}
 }
 
@@ -464,5 +481,188 @@ func TestALinkToAFileOutsideTheTreeIsNotIndexed(t *testing.T) {
 	}
 	if p := paths(got); len(p) != 1 || !p["main.go"] {
 		t.Fatalf("a link to a file outside the checkout was indexed: %v", p)
+	}
+}
+
+// The DirEntry's "regular file" came from the parent directory's listing, and
+// nothing holds an attacker-controlled checkout still afterwards. These pin
+// what readRegular re-decides on the file itself, deterministically; the two
+// racing tests below show the same swaps happening for real.
+func TestReadRegularRefusesALinkAndReadsNothingThroughIt(t *testing.T) {
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(outside, []byte("SECRET\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(t.TempDir(), "bait.txt")
+	link(t, outside, p)
+
+	body, size, err := readRegular(p, 1<<20)
+	if !errors.Is(err, errSkipFile) {
+		t.Fatalf("want errSkipFile, got body=%q size=%d err=%v", body, size, err)
+	}
+}
+
+func TestReadRegularRefusesAFifoWithoutBlocking(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "pipe")
+	if err := exec.Command("mkfifo", p).Run(); err != nil {
+		t.Skip("mkfifo unavailable")
+	}
+	type res struct{ err error }
+	ch := make(chan res, 1)
+	go func() {
+		_, _, err := readRegular(p, 1<<20)
+		ch <- res{err}
+	}()
+	select {
+	case r := <-ch:
+		if !errors.Is(r.err, errSkipFile) {
+			t.Fatalf("want errSkipFile, got %v", r.err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("readRegular blocked on a fifo")
+	}
+}
+
+// /dev/zero never reaches EOF: a read of it returns only when memory runs out.
+func TestReadRegularRefusesADevice(t *testing.T) {
+	if _, err := os.Stat("/dev/zero"); err != nil {
+		t.Skip("/dev/zero unavailable")
+	}
+	if _, _, err := readRegular("/dev/zero", 1<<20); !errors.Is(err, errSkipFile) {
+		t.Fatalf("want errSkipFile, got %v", err)
+	}
+}
+
+// The decision, made explicitly rather than inherited: only "this stopped
+// being a file to index" is a skip. A file that vanished mid-walk means the
+// tree moved under us, and an index that quietly omits it still reports
+// success — so it stays fatal, as an unreadable directory already does.
+func TestReadRegularTreatsAVanishedFileAsFatal(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "gone.go")
+	_, _, err := readRegular(p, 1<<20)
+	if err == nil {
+		t.Fatal("want an error for a file that is not there")
+	}
+	if errors.Is(err, errSkipFile) {
+		t.Fatalf("a vanished file must not be silently skipped, got %v", err)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("want ErrNotExist, got %v", err)
+	}
+}
+
+// swapper flips path between two forms until stop closes, using rename so the
+// path is never briefly absent — the race under test is the swap, not a gap.
+func swapper(t *testing.T, dir, name string, make1, make2 func(tmp string), stop <-chan struct{}) <-chan struct{} {
+	t.Helper()
+	done := make(chan struct{})
+	target := filepath.Join(dir, name)
+	go func() {
+		defer close(done)
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			tmp := filepath.Join(dir, fmt.Sprintf(".swap%d", i%2))
+			os.RemoveAll(tmp)
+			if i%2 == 0 {
+				make1(tmp)
+			} else {
+				make2(tmp)
+			}
+			os.Rename(tmp, target)
+		}
+	}()
+	return done
+}
+
+// Measured before the fix: a racing swap leaked the outside file's contents
+// through os.ReadFile. This asserts only on an actual leak, so losing the race
+// makes it pass rather than flake.
+func TestAFileSwappedForALinkMidWalkIsNotRead(t *testing.T) {
+	root := tree(t, map[string]string{"main.go": "package main\n"})
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	// 64 lines, so a leaked read is unmistakable next to the bait's one.
+	if err := os.WriteFile(outside, []byte(strings.Repeat("SECRET\n", 64)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, ".probe")); err != nil {
+		t.Skip("symlinks unavailable on this platform")
+	}
+	os.Remove(filepath.Join(root, ".probe"))
+
+	stop := make(chan struct{})
+	done := swapper(t, root, "bait.txt",
+		func(tmp string) { os.WriteFile(tmp, []byte("package bait\n"), 0o644) },
+		func(tmp string) { os.Symlink(outside, tmp) },
+		stop)
+	defer func() { close(stop); <-done }()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for i := 0; time.Now().Before(deadline); i++ {
+		got, err := Files(root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
+		if err != nil {
+			continue // a swap can legitimately race the walk into an error
+		}
+		for _, f := range got {
+			if f.Path == "bait.txt" && f.Lines != 1 {
+				t.Fatalf("walk %d read through a link swapped in mid-walk: %+v", i, f)
+			}
+		}
+	}
+}
+
+// And the swap that a "copy a regular file in" attacker cannot do: os.ReadFile
+// on a fifo never returns, and Files has no deadline of its own.
+func TestAFileSwappedForAFifoMidWalkDoesNotHang(t *testing.T) {
+	if err := exec.Command("mkfifo", filepath.Join(t.TempDir(), "x")).Run(); err != nil {
+		t.Skip("mkfifo unavailable")
+	}
+	root := tree(t, map[string]string{"main.go": "package main\n"})
+	stop := make(chan struct{})
+	done := swapper(t, root, "bait.txt",
+		func(tmp string) { os.WriteFile(tmp, []byte("package bait\n"), 0o644) },
+		func(tmp string) { exec.Command("mkfifo", tmp).Run() },
+		stop)
+	defer func() { close(stop); <-done }()
+
+	walks := make(chan struct{})
+	go func() {
+		defer close(walks)
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			Files(root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
+		}
+	}()
+	select {
+	case <-walks:
+	case <-time.After(60 * time.Second):
+		t.Fatal("the walk hung on a fifo swapped in mid-walk")
+	}
+}
+
+// The cap is checked against fstat's size, and fstat is not always right: a
+// procfs file reports size 0 and then reads out real bytes. Nothing in a
+// checkout can be one — O_NOFOLLOW refuses a link to it — but it makes the
+// point deterministically that the read must be bounded by the cap and not by
+// what the stat claimed, which otherwise only matters when a file grows
+// between the two.
+func TestReadIsBoundedByTheCapNotByTheStatSize(t *testing.T) {
+	const proc = "/proc/self/environ"
+	info, err := os.Stat(proc)
+	if err != nil || !info.Mode().IsRegular() || info.Size() != 0 {
+		t.Skip("no size-0 regular file with content available here")
+	}
+	body, size, err := readRegular(proc, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size != 0 {
+		t.Fatalf("want the stat size, got %d", size)
+	}
+	if len(body) > 8 {
+		t.Fatalf("read %d bytes past a cap of 8", len(body))
 	}
 }
