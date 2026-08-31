@@ -2163,7 +2163,15 @@ func main() {
 			sleep(ctx, idle)
 			continue
 		}
-		runJob(ctx, log, st, q, job, lim, scratch)
+		runJob(ctx, log, st, q, job, worker, lim, scratch)
+	}
+}
+
+// fail records a job failure, logging when the lease was already lost — the
+// four call sites discarded this error before Complete and Fail could report it.
+func fail(ctx context.Context, l zerolog.Logger, q *jobs.Queue, id, worker, reason string, tries int) {
+	if err := q.Fail(ctx, id, worker, reason, tries); err != nil {
+		l.Warn().Err(err).Msg("could not record failure: lease no longer held")
 	}
 }
 
@@ -2177,7 +2185,7 @@ func sleep(ctx context.Context, d time.Duration) {
 }
 
 func runJob(ctx context.Context, log zerolog.Logger, st *store.Store, q *jobs.Queue,
-	job jobs.Job, lim limits, scratch string) {
+	job jobs.Job, worker string, lim limits, scratch string) {
 
 	l := log.With().Str("job", job.ID).Str("remote", job.Remote).Logger()
 	dir := filepath.Join(scratch, job.ID)
@@ -2188,13 +2196,13 @@ func runJob(ctx context.Context, log zerolog.Logger, st *store.Store, q *jobs.Qu
 	res, err := clone.Run(ctx, job.Remote, job.Ref, dir, lim.clone)
 	if err != nil {
 		l.Warn().Err(err).Msg("clone failed")
-		_ = q.Fail(ctx, job.ID, err.Error(), lim.tries)
+		fail(ctx, l, q, job.ID, worker, err.Error(), lim.tries)
 		return
 	}
 	files, err := walk.Files(res.Dir, lim.walk)
 	if err != nil {
 		l.Warn().Err(err).Msg("walk failed")
-		_ = q.Fail(ctx, job.ID, err.Error(), lim.tries)
+		fail(ctx, l, q, job.ID, worker, err.Error(), lim.tries)
 		return
 	}
 
@@ -2209,11 +2217,14 @@ func runJob(ctx context.Context, log zerolog.Logger, st *store.Store, q *jobs.Qu
 	repo := models.Repo{ID: repoID, Remote: job.Remote, Ref: job.Ref, Commit: res.Commit}
 	if err := st.PutRepo(ctx, repo, rows); err != nil {
 		l.Error().Err(err).Msg("write failed")
-		_ = q.Fail(ctx, job.ID, err.Error(), lim.tries)
+		fail(ctx, l, q, job.ID, worker, err.Error(), lim.tries)
 		return
 	}
-	if err := q.Complete(ctx, job.ID); err != nil {
-		l.Error().Err(err).Msg("complete failed")
+	if err := q.Complete(ctx, job.ID, worker); err != nil {
+		// ErrNotLeased here means this worker's lease expired and another
+		// indexer took the job. Losing the race is normal; completing someone
+		// else's job would not be.
+		l.Warn().Err(err).Msg("could not complete: lease no longer held")
 		return
 	}
 	l.Info().Str("commit", res.Commit).Int("files", len(rows)).Int64("bytes", res.Bytes).Msg("indexed")
