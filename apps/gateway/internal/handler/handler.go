@@ -72,11 +72,20 @@ const maxRefLen = 255
 // rather than at a call site that is not written yet.
 //
 // It diverges from validSegment by allowing "/", which a ref needs, and by
-// capping the length, which argv makes worth doing. Both make it looser and
-// stricter respectively; neither lets through anything git would read as an
-// option. It stays narrower than git's own rules — "+" is legal in a tag, so a
-// semver build-metadata tag is refused here. Widening that is a decision for
-// when Task 7 exists and the argv path is real.
+// capping the length, which argv makes worth doing; it refuses ".." anywhere
+// rather than only as the whole string, which is stricter.
+//
+// It is a bound on what reaches argv, not a model of git's ref syntax, and it
+// is looser than git in several ways: it accepts a leading or trailing "/", a
+// doubled "//", a ".lock" suffix, a component starting with "." (".foo",
+// "a/.b") and a component ending with "." ("foo.", "v1."). Git rejects all of
+// them, so they fail the clone rather than doing anything, and none can be read
+// as an option. Task 7 must still run git check-ref-format; this does not make
+// that redundant.
+//
+// In one direction it is narrower than git: "+" is legal in a tag, so a semver
+// build-metadata tag is refused here. Widening that is a decision for when
+// Task 7 exists and the argv path is real.
 func validRef(s string) bool {
 	if s == "" || s == "." || len(s) > maxRefLen || strings.HasPrefix(s, "-") || strings.Contains(s, "..") {
 		return false

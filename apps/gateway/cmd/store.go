@@ -19,7 +19,8 @@ type storeHandle interface {
 	Close()
 }
 
-// openStore is a seam: main calls it, tests replace it.
+// openStore is a seam: main calls it, and a test can replace it to run main
+// without a database. None does today.
 var openStore = func(ctx context.Context, dsn string) (storeHandle, error) {
 	return store.New(ctx, dsn)
 }
