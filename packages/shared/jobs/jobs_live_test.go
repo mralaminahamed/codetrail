@@ -135,6 +135,45 @@ func TestEnqueueIsIdempotentWhileActive(t *testing.T) {
 	}
 }
 
+// A finished job and an active job coexist for the same (remote, ref) as soon
+// as a repository is re-indexed. Enqueue must hand back the active one: Task 4
+// turns this into the id a submitter polls, and returning the finished job
+// would report a repository indexed that this submission never indexed.
+func TestEnqueueReturnsTheActiveJobNotAFinishedOne(t *testing.T) {
+	ctx := context.Background()
+	q := queue(t)
+
+	done, err := q.Enqueue(ctx, "https://github.com/a/b", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := q.Lease(ctx, "w", time.Minute); err != nil || !ok {
+		t.Fatalf("lease: ok=%v err=%v", ok, err)
+	}
+	if err := q.Complete(ctx, done.ID, "w"); err != nil {
+		t.Fatal(err)
+	}
+
+	active, err := q.Enqueue(ctx, "https://github.com/a/b", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.ID == done.ID {
+		t.Fatal("the re-index must be a new job")
+	}
+
+	again, err := q.Enqueue(ctx, "https://github.com/a/b", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.ID != active.ID {
+		t.Fatalf("want the active job %s, got %s with status %q", active.ID, again.ID, again.Status)
+	}
+	if again.Status != StatusPending {
+		t.Fatalf("want a pending job back, got %q", again.Status)
+	}
+}
+
 // The dedupe key is (remote, ref), not remote alone: indexing main and a tag
 // of the same repository is two jobs.
 func TestEnqueueSeparatesRefsOfTheSameRemote(t *testing.T) {
@@ -157,8 +196,11 @@ func TestEnqueueSeparatesRefsOfTheSameRemote(t *testing.T) {
 	}
 }
 
-// Two workers leasing at once must not get the same job. This is what
-// FOR UPDATE SKIP LOCKED buys, and it cannot be tested without concurrency.
+// Concurrent leases must stay disjoint. This does NOT pin SKIP LOCKED: with a
+// plain FOR UPDATE a blocked claim re-checks the predicate against the committed
+// row (EvalPlanQual), sees status='leased' with a future expiry, and drops it —
+// so the mutant cannot double-hand either and this assertion is unfalsifiable
+// against it. TestLeaseSkipsALockedRowRatherThanBlocking is what pins the clause.
 func TestLeaseHandsEachJobToOneWorker(t *testing.T) {
 	ctx := context.Background()
 	q := queue(t)
@@ -217,6 +259,32 @@ func TestLeaseTakesTheOldestFirst(t *testing.T) {
 	}
 	if got.ID != oldest.ID {
 		t.Fatalf("want the oldest job %s, got %s (%s)", oldest.ID, got.ID, got.Remote)
+	}
+}
+
+// Lease must claim exactly one row. A LIMIT that lets two through returns one
+// of them and leaves the other leased to a worker that never saw it: idle until
+// the lease expires, with an attempt already spent against its cap.
+func TestLeaseClaimsExactlyOneRow(t *testing.T) {
+	ctx := context.Background()
+	q := queue(t)
+	for i := range 4 {
+		if _, err := q.Enqueue(ctx, "https://github.com/a/r"+string(rune('a'+i)), "main"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, ok, err := q.Lease(ctx, "w", time.Minute); err != nil || !ok {
+		t.Fatalf("want a leased job, got ok=%v err=%v", ok, err)
+	}
+
+	var leased int
+	if err := q.pool.QueryRow(ctx,
+		`SELECT count(*) FROM jobs WHERE status = 'leased'`).Scan(&leased); err != nil {
+		t.Fatal(err)
+	}
+	if leased != 1 {
+		t.Fatalf("one Lease call leased %d rows", leased)
 	}
 }
 

@@ -19,5 +19,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE UNIQUE INDEX IF NOT EXISTS jobs_active_idx ON jobs (remote, ref)
     WHERE status IN ('pending', 'leased');
 
--- Lease() orders by created_at among claimable rows.
+-- Serves Lease()'s status/leased_until filter only. It does not help the
+-- ORDER BY created_at: Postgres bitmap-ors the filter, then sorts the matches
+-- to take LIMIT 1. Not worth a second index at P1 volume.
 CREATE INDEX IF NOT EXISTS jobs_claimable_idx ON jobs (status, leased_until, created_at);
