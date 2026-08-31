@@ -156,6 +156,10 @@ const recordingGit = "#!/bin/sh\n{ printf 'ARG:%s\\n' \"$@\"; env; } > \"$SHIM_R
 // Run is reading. It records the child's pid so the test can bury it.
 const hangingGit = "#!/bin/sh\nsleep 300 &\necho $! > \"$SHIM_RECORD\"\nwait\n"
 
+// escapingGit puts its child in a new session, outside the process group the
+// deadline kills, where it goes on holding the output pipe Run is reading.
+const escapingGit = "#!/bin/sh\nsetsid sleep 300 &\necho $! > \"$SHIM_RECORD\"\nwait\n"
+
 // writingGit creates the checkout it was asked for and then fails, so that the
 // clone-failure cleanup path has something to remove.
 const writingGit = "#!/bin/sh\nfor a in \"$@\"; do last=$a; done\nmkdir -p \"$last\" && echo x > \"$last/f\"\nexit 1\n"
@@ -264,6 +268,7 @@ func TestCloneEnvironmentIsPinned(t *testing.T) {
 		"GIT_TERMINAL_PROMPT": "0",
 		"GIT_ASKPASS":         "/bin/false",
 		"GIT_CONFIG_NOSYSTEM": "1",
+		"GIT_CONFIG_GLOBAL":   "/dev/null",
 		"HOME":                filepath.Dir(dst),
 	} {
 		if env[k] != want {
@@ -306,6 +311,37 @@ func TestCloneDeadlineKillsGitsChildren(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("pid %d outlived the deadline: git's children are not in the killed process group", pid)
+}
+
+// The process group is not a guarantee that nothing escapes it. If something
+// does, it still holds the output pipe, and without WaitDelay Run does not
+// return late — it does not return at all.
+func TestCloneReturnsWhenAChildEscapesTheProcessGroup(t *testing.T) {
+	if _, err := exec.LookPath("setsid"); err != nil {
+		t.Skip("setsid is needed to put a child outside the process group")
+	}
+	record := shimGit(t, escapingGit)
+	dst := filepath.Join(t.TempDir(), "checkout")
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := Run(context.Background(), "file:///src", "HEAD", dst, limits(2*time.Second))
+		done <- err
+	}()
+	pid := readPID(t, record)
+	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("want an error from the deadline")
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run never returned: a child outside the process group held the output pipe")
+	}
+	if syscall.Kill(pid, 0) != nil {
+		t.Fatal("the escaped child died anyway, so this run proves nothing about WaitDelay")
+	}
 }
 
 func readPID(t *testing.T, record string) int {
@@ -376,16 +412,49 @@ func TestCloneRemovesTheCheckoutWhenItsSizeCannotBeMeasured(t *testing.T) {
 	}
 }
 
-// An unset deadline is not an unbounded one.
-func TestCloneWithoutADeadlineFailsClosed(t *testing.T) {
-	remote := fixture(t, map[string]string{"main.go": "package main\n"})
-	dst := filepath.Join(t.TempDir(), "checkout")
+// Both caps fail closed, alike, and before git is ever started: an unset
+// deadline is not an unbounded one, and an unset size cap is not "unlimited".
+func TestCloneRefusesANonPositiveDeadline(t *testing.T) {
+	record := shimGit(t, recordingGit)
+	for _, d := range []time.Duration{0, -time.Second} {
+		dst := filepath.Join(t.TempDir(), "checkout")
 
-	if _, err := Run(context.Background(), remote, "HEAD", dst, Limits{MaxBytes: defaultLimit}); err == nil {
-		t.Fatal("a zero deadline must not mean no deadline")
+		_, err := Run(context.Background(), "file:///src", "HEAD", dst,
+			Limits{MaxBytes: defaultLimit, Deadline: d})
+		if err == nil {
+			t.Fatalf("Deadline %s: want a refusal", d)
+		}
+		if !strings.Contains(err.Error(), "Deadline") {
+			t.Errorf("Deadline %s: the refusal must name the cap: %v", d, err)
+		}
+		assertGitNeverRan(t, record, dst)
+	}
+}
+
+func TestCloneRefusesANonPositiveSizeCap(t *testing.T) {
+	record := shimGit(t, recordingGit)
+	for _, max := range []int64{0, -1} {
+		dst := filepath.Join(t.TempDir(), "checkout")
+
+		_, err := Run(context.Background(), "file:///src", "HEAD", dst,
+			Limits{MaxBytes: max, Deadline: time.Minute})
+		if err == nil {
+			t.Fatalf("MaxBytes %d: want a refusal", max)
+		}
+		if !strings.Contains(err.Error(), "MaxBytes") {
+			t.Errorf("MaxBytes %d: the refusal must name the cap: %v", max, err)
+		}
+		assertGitNeverRan(t, record, dst)
+	}
+}
+
+func assertGitNeverRan(t *testing.T, record, dst string) {
+	t.Helper()
+	if _, err := os.Stat(record); !os.IsNotExist(err) {
+		t.Error("git ran anyway: a cap that fails closed must refuse before the subprocess")
 	}
 	if _, err := os.Stat(dst); !os.IsNotExist(err) {
-		t.Fatal("nothing may be left behind")
+		t.Error("nothing may be left behind")
 	}
 }
 

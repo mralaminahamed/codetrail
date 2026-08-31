@@ -35,6 +35,17 @@ type Result struct {
 // removes it again on error, so a failed job leaves nothing behind for the
 // disk quota to trip over later.
 func Run(ctx context.Context, remote, ref, dir string, lim Limits) (Result, error) {
+	// Both caps fail closed and alike: a zero MaxBytes is a refusal, not
+	// "unlimited", and a zero Deadline is not "no deadline". Refusing before
+	// the subprocess starts is what keeps a misconfigured worker from cloning
+	// without the cap it was meant to have.
+	if lim.MaxBytes <= 0 {
+		return Result{}, fmt.Errorf("clone: MaxBytes must be positive, got %d", lim.MaxBytes)
+	}
+	if lim.Deadline <= 0 {
+		return Result{}, fmt.Errorf("clone: Deadline must be positive, got %s", lim.Deadline)
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, lim.Deadline)
 	defer cancel()
 
@@ -60,20 +71,26 @@ func Run(ctx context.Context, remote, ref, dir string, lim Limits) (Result, erro
 	args = append(args, "--", remote, dir)
 
 	cmd := exec.CommandContext(ctx, "git", args...)
-	// A private or mistyped URL must fail rather than block forever waiting
-	// for a credential nobody is there to type. The last two keep the system
-	// config and the operator's ~/.gitconfig out of a subprocess that is
-	// handling a stranger's URL.
+	// A private or mistyped URL must fail rather than block forever waiting for
+	// a credential nobody is there to type. GIT_CONFIG_NOSYSTEM closes the
+	// system file and outranks an inherited GIT_CONFIG_SYSTEM; /dev/null as the
+	// global file closes both ~/.gitconfig and XDG's copy, which rewriting HOME
+	// alone does not.
 	cmd.Env = append(os.Environ(),
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_ASKPASS=/bin/false",
 		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL=/dev/null",
 		"HOME="+filepath.Dir(dir),
 	)
 	// Its own process group, so the deadline kills git's children too — a
 	// killed parent otherwise leaves a fetch running against the cap.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	// And a bound on what the group kill misses: a descendant that escapes it
+	// can hold the output pipe open, and waiting on that pipe has no timeout of
+	// its own. Returning late beats not returning.
+	cmd.WaitDelay = 5 * time.Second
 
 	if out, err := cmd.CombinedOutput(); err != nil {
 		cleanup()
@@ -85,7 +102,10 @@ func Run(ctx context.Context, remote, ref, dir string, lim Limits) (Result, erro
 		cleanup()
 		return Result{}, err
 	}
-	if lim.MaxBytes > 0 && size > lim.MaxBytes {
+	// Checked after the fetch, because git has no byte cap to give it —
+	// blob:limit caps one blob, maxInputSize is receive-pack's — so nothing
+	// here bounds what reaches the disk while git runs except the deadline.
+	if size > lim.MaxBytes {
 		cleanup()
 		return Result{}, fmt.Errorf("%w: %d bytes > %d", ErrTooLarge, size, lim.MaxBytes)
 	}
