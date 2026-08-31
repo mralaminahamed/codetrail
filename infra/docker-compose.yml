@@ -1,0 +1,28 @@
+services:
+  # pgvector, not a separate vector database. The symbol graph is relational —
+  # "who calls this" is a recursive CTE — and putting the embeddings in the same
+  # Postgres means a retrieval and a graph hop are one query, not two round
+  # trips against two systems that can disagree about what is indexed.
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: codetrail
+      POSTGRES_PASSWORD: codetrail
+      POSTGRES_DB: codetrail
+    ports: ["55432:5432"]
+    volumes: ["pg:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U codetrail -d codetrail"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  ollama:
+    image: ollama/ollama:latest
+    ports: ["11435:11434"]
+    volumes: ["ollama:/root/.ollama"]
+    profiles: ["ai"]
+
+volumes:
+  pg:
+  ollama:

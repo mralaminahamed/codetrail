@@ -1,0 +1,23 @@
+# Env / secrets
+.env
+
+# Build output
+/bin/
+/out/
+/cmd
+
+# Web
+node_modules/
+dist/
+.vite/
+
+# Planning docs (kept untracked)
+PLAN.md
+docs/plan-*.md
+
+# Repos cloned for indexing
+/.cache/
+
+# OS / editor
+.DS_Store
+*.swp
