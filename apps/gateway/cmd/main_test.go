@@ -3,12 +3,16 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/labstack/echo/v4"
 	"github.com/rs/zerolog"
 
 	"github.com/mralaminahamed/codetrail/apps/gateway/internal/handler"
@@ -22,6 +26,23 @@ func (fakeQueue) Enqueue(context.Context, string, string) (jobs.Job, error) {
 	return jobs.Job{}, nil
 }
 func (fakeQueue) Get(context.Context, string) (jobs.Job, error) { return jobs.Job{}, nil }
+
+// deadStore is a storeHandle with a pool aimed at an address nothing answers
+// on. pgxpool.New does not dial, so the queue built from it returns an error
+// rather than panicking, and the assembly can be exercised without a database.
+type deadStore struct{ pool *pgxpool.Pool }
+
+func (deadStore) Ping(context.Context) error { return errors.New("postgres is down") }
+func (d deadStore) Pool() *pgxpool.Pool      { return d.pool }
+func (deadStore) Close()                     {}
+
+func serve(e *echo.Echo, method, path, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set("content-type", "application/json")
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	return rec
+}
 
 // The router has to carry both the probes and the API. Mounting one without
 // the other boots a binary that passes its health check and serves nothing
@@ -39,10 +60,7 @@ func TestNewRouterMountsHealthAndTheAPI(t *testing.T) {
 		{http.MethodGet, "/ready", "", http.StatusOK},
 		{http.MethodPost, "/api/repos", `{"remote":"file:///etc/passwd"}`, http.StatusBadRequest},
 	} {
-		req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
-		req.Header.Set("content-type", "application/json")
-		rec := httptest.NewRecorder()
-		e.ServeHTTP(rec, req)
+		rec := serve(e, tc.method, tc.path, tc.body)
 		if rec.Code != tc.want {
 			t.Errorf("%s %s: want %d, got %d", tc.method, tc.path, tc.want, rec.Code)
 		}
@@ -101,5 +119,50 @@ func TestNewHandlerWiresTheLoggerPolicyAndQueue(t *testing.T) {
 	}
 	if h.Jobs != q {
 		t.Errorf("queue not wired: %#v", h.Jobs)
+	}
+}
+
+// newServer is everything main assembles, and main's own body cannot be reached
+// without a Postgres to connect to. Each line of it can be dropped in silence:
+// calling server.New instead of newRouter would serve the probes and no API at
+// all, and jobs.New(nil) would panic into echo's recover rather than answer.
+func TestNewServerAssemblesWhatMainServes(t *testing.T) {
+	pool, err := pgxpool.New(context.Background(), "postgres://u:p@127.0.0.1:1/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	var logged bytes.Buffer
+	e := newServer(zerolog.New(&logged).Level(zerolog.InfoLevel), deadStore{pool})
+
+	// Readiness has to reflect the dependency, not a constant.
+	if rec := serve(e, http.MethodGet, "/health", ""); rec.Code != http.StatusOK {
+		t.Errorf("/health: want 200, got %d", rec.Code)
+	}
+	if rec := serve(e, http.MethodGet, "/ready", ""); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("/ready: want 503 with the store down, got %d", rec.Code)
+	}
+
+	// A submission the policy accepts must reach the queue and fail there. A
+	// 400 means the policy never ran, a 404 means the API is not mounted, and
+	// echo's own recover body means the queue was built from a nil pool.
+	rec := serve(e, http.MethodPost, "/api/repos", `{"remote":"https://github.com/a/b"}`)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("POST /api/repos: want 500, got %d: %s", rec.Code, rec.Body)
+	}
+	var out struct {
+		Error     string `json:"error"`
+		RequestID string `json:"request_id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Error != "internal error" || out.RequestID == "" {
+		t.Fatalf("not the handler's own 500: %s", rec.Body)
+	}
+	// And the assembled handler logs, so a 500 in production is not silent.
+	if !strings.Contains(logged.String(), out.RequestID) {
+		t.Errorf("no log line for request %s: %s", out.RequestID, logged.String())
 	}
 }
