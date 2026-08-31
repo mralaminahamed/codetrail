@@ -104,9 +104,15 @@ func newHandler(log zerolog.Logger, q handler.Enqueuer) *handler.Handler {
 }
 
 // newServer assembles what the binary serves: probes, router, policy, queue and
-// logger. A function because main's own body needs a live Postgres to reach, so
-// anything left in it is unpinnable — and the mistakes here are silent ones,
-// like serving server.New's probes with no API mounted behind them.
+// logger. A function so a test can drive the assembly, because the mistakes
+// here are silent: server.New's probes with no API mounted behind them answer
+// /health and /ready and nothing anyone asked for.
+//
+// main's own body is reachable too — openStore is replaceable, so a test can
+// run main() with no database. Pinning the one argument left uncovered there
+// costs an os.Stdout swap and a self-directed SIGTERM, heavier and flakier
+// machinery than anything else in this suite. It is uncovered by judgement,
+// not because it cannot be reached.
 func newServer(log zerolog.Logger, st storeHandle) *echo.Echo {
 	return newRouter(readinessFor(log, st).Ready, newHandler(log, jobs.New(st.Pool())))
 }

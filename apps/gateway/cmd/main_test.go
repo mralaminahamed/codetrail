@@ -122,10 +122,14 @@ func TestNewHandlerWiresTheLoggerPolicyAndQueue(t *testing.T) {
 	}
 }
 
-// newServer is everything main assembles, and main's own body cannot be reached
-// without a Postgres to connect to. Each line of it can be dropped in silence:
-// calling server.New instead of newRouter would serve the probes and no API at
-// all, and jobs.New(nil) would panic into echo's recover rather than answer.
+// newServer is everything main assembles, and each line of it can be dropped in
+// silence: calling server.New instead of newRouter would serve the probes and
+// no API at all, and jobs.New(nil) would panic into echo's recover rather than
+// answer.
+//
+// main's own call is reachable as well, through openStore. Pinning it needs an
+// os.Stdout swap and a self-directed SIGTERM for one argument, which was judged
+// not worth the flake risk — see newServer's comment.
 func TestNewServerAssemblesWhatMainServes(t *testing.T) {
 	pool, err := pgxpool.New(context.Background(), "postgres://u:p@127.0.0.1:1/x")
 	if err != nil {
