@@ -27,6 +27,10 @@ const (
 
 var ErrNotFound = errors.New("jobs: not found")
 
+// ErrNotLeased means the job is not the caller's to finish: it does not
+// exist, or its lease expired and another worker has already reclaimed it.
+var ErrNotLeased = errors.New("jobs: not leased by this worker")
+
 type Job struct {
 	ID       string `json:"id"`
 	Remote   string `json:"remote"`
@@ -105,23 +109,43 @@ func (q *Queue) Lease(ctx context.Context, worker string, d time.Duration) (Job,
 	return j, true, nil
 }
 
-func (q *Queue) Complete(ctx context.Context, id string) error {
-	_, err := q.pool.Exec(ctx,
-		`UPDATE jobs SET status='done', leased_by=NULL, leased_until=NULL, error='', updated_at=now() WHERE id=$1`, id)
-	return err
+// Complete marks the job done, but only for the worker still holding the
+// lease. A worker whose lease expired has had its job reclaimed, and finishing
+// it here would mark done a clone that another worker is still running — the
+// exact crash path leases exist to survive.
+func (q *Queue) Complete(ctx context.Context, id, worker string) error {
+	tag, err := q.pool.Exec(ctx, `
+		UPDATE jobs SET
+			status='done', leased_by=NULL, leased_until=NULL, error='', updated_at=now()
+		WHERE id=$1 AND leased_by=$2`, id, worker)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotLeased
+	}
+	return nil
 }
 
 // Fail returns the job to the queue, or marks it terminally failed once it
 // has used its attempts. The reason is kept either way: a job that retried
-// and then succeeded still explains why it retried.
-func (q *Queue) Fail(ctx context.Context, id, reason string, maxAttempts int) error {
-	_, err := q.pool.Exec(ctx, `
+// and then succeeded still explains why it retried. Lease ownership is
+// enforced as it is in Complete — a zombie requeueing a job would let a third
+// worker start it while the live one is still cloning.
+func (q *Queue) Fail(ctx context.Context, id, worker, reason string, maxAttempts int) error {
+	tag, err := q.pool.Exec(ctx, `
 		UPDATE jobs SET
-			status = CASE WHEN attempts >= $3 THEN 'failed' ELSE 'pending' END,
+			status = CASE WHEN attempts >= $4 THEN 'failed' ELSE 'pending' END,
 			leased_by = NULL, leased_until = NULL,
-			error = $2, updated_at = now()
-		WHERE id = $1`, id, reason, maxAttempts)
-	return err
+			error = $3, updated_at = now()
+		WHERE id = $1 AND leased_by = $2`, id, worker, reason, maxAttempts)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotLeased
+	}
+	return nil
 }
 
 func (q *Queue) Get(ctx context.Context, id string) (Job, error) {

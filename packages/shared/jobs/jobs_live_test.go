@@ -86,7 +86,7 @@ func TestEnqueueThenLeaseThenComplete(t *testing.T) {
 		t.Fatalf("want a lease expiring in the future, got %v", until)
 	}
 
-	if err := q.Complete(ctx, j.ID); err != nil {
+	if err := q.Complete(ctx, j.ID, "worker-1"); err != nil {
 		t.Fatal(err)
 	}
 	after, err := q.Get(ctx, j.ID)
@@ -120,7 +120,10 @@ func TestEnqueueIsIdempotentWhileActive(t *testing.T) {
 	}
 
 	// Once terminal, the same remote may be queued again — that is a re-index.
-	if err := q.Complete(ctx, first.ID); err != nil {
+	if _, ok, err := q.Lease(ctx, "w", time.Minute); err != nil || !ok {
+		t.Fatalf("lease before completing: ok=%v err=%v", ok, err)
+	}
+	if err := q.Complete(ctx, first.ID, "w"); err != nil {
 		t.Fatal(err)
 	}
 	third, err := q.Enqueue(ctx, "https://github.com/a/b", "main")
@@ -317,7 +320,7 @@ func TestFailRetriesUntilTheCap(t *testing.T) {
 	if _, _, err := q.Lease(ctx, "w", time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if err := q.Fail(ctx, j.ID, "clone failed", max); err != nil {
+	if err := q.Fail(ctx, j.ID, "w", "clone failed", max); err != nil {
 		t.Fatal(err)
 	}
 	mid, _ := q.Get(ctx, j.ID)
@@ -334,7 +337,7 @@ func TestFailRetriesUntilTheCap(t *testing.T) {
 	if _, _, err := q.Lease(ctx, "w", time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if err := q.Fail(ctx, j.ID, "clone failed again", max); err != nil {
+	if err := q.Fail(ctx, j.ID, "w", "clone failed again", max); err != nil {
 		t.Fatal(err)
 	}
 	end, _ := q.Get(ctx, j.ID)
@@ -343,6 +346,86 @@ func TestFailRetriesUntilTheCap(t *testing.T) {
 	}
 	if end.Error != "clone failed again" {
 		t.Fatalf("want the terminal reason recorded, got %q", end.Error)
+	}
+}
+
+// The lease is only worth having if it is exclusive on the way out too. A
+// worker whose lease expired has had its job reclaimed, and must not finish it
+// out from under the worker that now owns it — that is the crash path the
+// whole lease design exists to handle.
+func TestAReclaimedJobCannotBeCompletedByTheWorkerThatLostIt(t *testing.T) {
+	ctx := context.Background()
+	q := queue(t)
+	j, err := q.Enqueue(ctx, "https://github.com/a/b", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := q.Lease(ctx, "worker-a", -time.Second); err != nil || !ok {
+		t.Fatalf("first lease failed: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := q.Lease(ctx, "worker-b", time.Minute); err != nil || !ok {
+		t.Fatalf("reclaim failed: ok=%v err=%v", ok, err)
+	}
+
+	if err := q.Complete(ctx, j.ID, "worker-a"); !errors.Is(err, ErrNotLeased) {
+		t.Fatalf("want ErrNotLeased for the worker that lost the lease, got %v", err)
+	}
+	after, err := q.Get(ctx, j.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Status != StatusLeased {
+		t.Fatalf("a zombie completed the job: status is %q", after.Status)
+	}
+	if by, _ := leaseRow(t, q, j.ID); by == nil || *by != "worker-b" {
+		t.Fatalf("want the lease still held by worker-b, got %v", by)
+	}
+}
+
+// The same for Fail: a zombie must not push the job back to pending, which
+// would let a third worker start it while worker-b is still cloning.
+func TestAReclaimedJobCannotBeFailedByTheWorkerThatLostIt(t *testing.T) {
+	ctx := context.Background()
+	q := queue(t)
+	j, err := q.Enqueue(ctx, "https://github.com/a/b", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := q.Lease(ctx, "worker-a", -time.Second); err != nil || !ok {
+		t.Fatalf("first lease failed: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := q.Lease(ctx, "worker-b", time.Minute); err != nil || !ok {
+		t.Fatalf("reclaim failed: ok=%v err=%v", ok, err)
+	}
+
+	if err := q.Fail(ctx, j.ID, "worker-a", "zombie gave up", 5); !errors.Is(err, ErrNotLeased) {
+		t.Fatalf("want ErrNotLeased for the worker that lost the lease, got %v", err)
+	}
+	after, err := q.Get(ctx, j.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Status != StatusLeased {
+		t.Fatalf("a zombie requeued the job: status is %q", after.Status)
+	}
+	if after.Error != "" {
+		t.Fatalf("a zombie wrote its reason onto a live job: %q", after.Error)
+	}
+	if by, _ := leaseRow(t, q, j.ID); by == nil || *by != "worker-b" {
+		t.Fatalf("want the lease still held by worker-b, got %v", by)
+	}
+}
+
+// Exec reports no error when it updates nothing, so without a rows check these
+// would succeed silently and a worker would never learn its job was gone.
+func TestCompleteAndFailOnAnUnknownJob(t *testing.T) {
+	ctx := context.Background()
+	q := queue(t)
+	if err := q.Complete(ctx, "nope", "w"); !errors.Is(err, ErrNotLeased) {
+		t.Fatalf("want ErrNotLeased from Complete, got %v", err)
+	}
+	if err := q.Fail(ctx, "nope", "w", "reason", 3); !errors.Is(err, ErrNotLeased) {
+		t.Fatalf("want ErrNotLeased from Fail, got %v", err)
 	}
 }
 
