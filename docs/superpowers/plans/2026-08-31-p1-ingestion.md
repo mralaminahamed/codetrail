@@ -1622,6 +1622,13 @@ func TestListsRegularFilesWithRelativePaths(t *testing.T) {
 
 // THE security test. A repository can contain `link -> /etc/passwd`; a walker
 // that follows it reads and indexes the host's files.
+//
+// The file link is what discriminates: against a walker with no guard it is
+// read and indexed with its real contents. The directory link is a second
+// case, and it must be asserted SEPARATELY — a walk that follows it fails with
+// EISDIR and aborts before this test's own assertions run, so a combined
+// fixture kills the mutant on an unrelated error and reports coverage it does
+// not have.
 func TestNeverFollowsSymlinks(t *testing.T) {
 	root := tree(t, map[string]string{"main.go": "package main\n"})
 	outside := filepath.Join(t.TempDir(), "secret.txt")
