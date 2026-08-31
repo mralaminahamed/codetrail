@@ -86,10 +86,34 @@ func (p Policy) Check(raw string) (Remote, error) {
 	if name == "" {
 		return Remote{}, &Error{RuleForm, "path must be /owner/name"}
 	}
+	if !validSegment(owner) {
+		return Remote{}, &Error{RuleForm, fmt.Sprintf("owner %q is not a plain name", owner)}
+	}
+	if !validSegment(name) {
+		return Remote{}, &Error{RuleForm, fmt.Sprintf("name %q is not a plain name", name)}
+	}
 	return Remote{
 		URL:   "https://" + host + "/" + owner + "/" + name,
 		Host:  host,
 		Owner: owner,
 		Name:  name,
 	}, nil
+}
+
+// Owner and Name are exported, so anything downstream may join them into a
+// path. Allowlist the charset rather than blacklisting the escapes, and refuse
+// the two relative names the charset would otherwise let through.
+func validSegment(s string) bool {
+	if s == "" || s == "." || s == ".." {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '.', r == '_', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }

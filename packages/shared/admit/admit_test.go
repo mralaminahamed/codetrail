@@ -100,6 +100,57 @@ func TestRejectsMalformedAndIncompletePaths(t *testing.T) {
 	}
 }
 
+// Owner and Name are exported, so a later stage may join them into a path.
+// ".." is the escape; url.Parse has already decoded %2e%2e by the time we look.
+func TestRejectsPathSegmentsThatAreNotPlainNames(t *testing.T) {
+	for _, raw := range []string{
+		"https://github.com/../repo",
+		"https://github.com/%2e%2e/repo",
+		"https://github.com/owner/..",
+		"https://github.com/./repo",
+		"https://github.com/owner/.",
+		"https://github.com/a b/c d",
+		"https://github.com/own$er/repo",
+		"https://github.com/owner/re;po",
+	} {
+		_, err := policy().Check(raw)
+		var e *Error
+		if !errors.As(err, &e) || e.Rule != RuleForm {
+			t.Fatalf("%s: want a form rejection, got %v", raw, err)
+		}
+	}
+}
+
+// A validator that refuses everything kills every mutation and is worthless,
+// so pin the names real forges actually serve.
+func TestAcceptsLegalRepositoryNames(t *testing.T) {
+	for raw, want := range map[string]string{
+		"https://github.com/owner/repo.js":   "https://github.com/owner/repo.js",
+		"https://github.com/owner/my-repo_2": "https://github.com/owner/my-repo_2",
+		"https://github.com/Owner/Repo.git":  "https://github.com/Owner/Repo",
+		"https://gitlab.com/some.group/x-1":  "https://gitlab.com/some.group/x-1",
+	} {
+		got, err := policy().Check(raw)
+		if err != nil {
+			t.Fatalf("%s: want accepted, got %v", raw, err)
+		}
+		if got.URL != want {
+			t.Fatalf("%s normalised to %q, want %q", raw, got.URL, want)
+		}
+	}
+}
+
+// The operator has to see which half of the path was wrong.
+func TestSegmentErrorNamesTheOffendingSegment(t *testing.T) {
+	_, err := policy().Check("https://github.com/good/ba d")
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if !contains(err.Error(), "ba d") {
+		t.Fatalf("error %q does not name the offending segment", err.Error())
+	}
+}
+
 // Host matching is case-insensitive, and a trailing .git or slash is the same
 // repository — normalising here means the job dedupe index sees one key.
 func TestNormalises(t *testing.T) {
