@@ -62,25 +62,25 @@ func (q *Queue) Enqueue(ctx context.Context, remote, ref string) (Job, error) {
 	sum := sha256.Sum256(fmt.Appendf(nil, "%s\x00%s\x00%d", remote, ref, time.Now().UnixNano()))
 	id := hex.EncodeToString(sum[:16])
 
-	j, err := scan(q.pool.QueryRow(ctx, `
+	// One statement: DO NOTHING plus a follow-up SELECT leaves a window in which
+	// the conflicting job goes terminal and the read finds nothing, which would
+	// surface as a nonsense ErrNotFound from Enqueue. The no-op DO UPDATE is what
+	// makes RETURNING yield the existing row, and the index predicate guarantees
+	// that row is active.
+	return scan(q.pool.QueryRow(ctx, `
 		INSERT INTO jobs (id, remote, ref, status)
 		VALUES ($1, $2, $3, 'pending')
-		ON CONFLICT DO NOTHING
+		ON CONFLICT (remote, ref) WHERE status IN ('pending','leased')
+		DO UPDATE SET updated_at = jobs.updated_at
 		RETURNING `+cols, id, remote, ref))
-	if err == nil {
-		return j, nil
-	}
-	if !errors.Is(err, ErrNotFound) {
-		return Job{}, err
-	}
-	// ON CONFLICT DO NOTHING returned no row: an active job already exists.
-	return scan(q.pool.QueryRow(ctx, `
-		SELECT `+cols+` FROM jobs
-		WHERE remote = $1 AND ref = $2 AND status IN ('pending','leased')`, remote, ref))
 }
 
 // Lease claims the oldest claimable job for d. SKIP LOCKED is what lets two
 // indexers poll the same table without handing both the same row.
+//
+// worker must be unique per process. Complete and Fail authorise on it, so two
+// indexers sharing an id can silently finish each other's jobs: the ownership
+// check passes and no error is raised anywhere.
 func (q *Queue) Lease(ctx context.Context, worker string, d time.Duration) (Job, bool, error) {
 	j, err := scan(q.pool.QueryRow(ctx, `
 		WITH claimed AS (
@@ -128,8 +128,9 @@ func (q *Queue) Complete(ctx context.Context, id, worker string) error {
 }
 
 // Fail returns the job to the queue, or marks it terminally failed once it
-// has used its attempts. The reason is kept either way: a job that retried
-// and then succeeded still explains why it retried. Lease ownership is
+// has used its attempts. The reason is written on both paths, so a job waiting
+// to retry says why it is waiting; Complete clears it, so a job that ends up
+// succeeding keeps no trace of the attempts that did not. Lease ownership is
 // enforced as it is in Complete — a zombie requeueing a job would let a third
 // worker start it while the live one is still cloning.
 func (q *Queue) Fail(ctx context.Context, id, worker, reason string, maxAttempts int) error {
