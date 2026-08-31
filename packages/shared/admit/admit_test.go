@@ -125,10 +125,10 @@ func TestRejectsPathSegmentsThatAreNotPlainNames(t *testing.T) {
 // so pin the names real forges actually serve.
 func TestAcceptsLegalRepositoryNames(t *testing.T) {
 	for raw, want := range map[string]string{
-		"https://github.com/owner/repo.js":   "https://github.com/owner/repo.js",
-		"https://github.com/owner/my-repo_2": "https://github.com/owner/my-repo_2",
-		"https://github.com/Owner/Repo.git":  "https://github.com/Owner/Repo",
-		"https://gitlab.com/some.group/x-1":  "https://gitlab.com/some.group/x-1",
+		"https://github.com/owner/repo.js":    "https://github.com/owner/repo.js",
+		"https://github.com/owner/my-repo_2":  "https://github.com/owner/my-repo_2",
+		"https://github.com/Owner/Repo.git":   "https://github.com/Owner/Repo",
+		"https://codeberg.org/some.group/x-1": "https://codeberg.org/some.group/x-1",
 	} {
 		got, err := policy().Check(raw)
 		if err != nil {
@@ -148,6 +148,25 @@ func TestSegmentErrorNamesTheOffendingSegment(t *testing.T) {
 	}
 	if !contains(err.Error(), "ba d") {
 		t.Fatalf("error %q does not name the offending segment", err.Error())
+	}
+}
+
+// The default allowlist is a product decision, not an incidental default, so
+// pin its contents: a forge whose typical URL this policy refuses does not
+// belong in it, and the next person should have to change a test to add one.
+func TestDefaultHostsArePinned(t *testing.T) {
+	want := []string{"github.com", "codeberg.org"}
+	if len(DefaultHosts) != len(want) {
+		t.Fatalf("DefaultHosts = %v, want %v", DefaultHosts, want)
+	}
+	for i := range want {
+		if DefaultHosts[i] != want[i] {
+			t.Fatalf("DefaultHosts = %v, want %v", DefaultHosts, want)
+		}
+	}
+	// The reason gitlab.com is absent, stated as behaviour.
+	if _, err := policy().Check("https://gitlab.com/group/repo"); err == nil {
+		t.Fatal("gitlab.com must not be in the default allowlist")
 	}
 }
 
