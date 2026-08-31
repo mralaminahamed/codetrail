@@ -1425,8 +1425,11 @@ func Run(ctx context.Context, remote, ref, dir string, lim Limits) (Result, erro
 	}
 	cleanup := func() { _ = os.RemoveAll(dir) }
 
-	// --depth 1 and --filter=blob:none keep history and unreferenced blobs out
-	// of the fetch; --single-branch keeps every other ref out of it.
+	// --depth 1 keeps history out of the fetch and --single-branch keeps every
+	// other ref out. --filter=blob:none does NOT keep blobs out of a clone that
+	// checks out: the checkout refetches them all, and the filtered .git ends up
+	// marginally larger (measured: 29712 vs 29560 bytes). It is kept only for
+	// the partial-clone promisor metadata, not as a size control.
 	args := []string{
 		"clone", "--quiet", "--depth", "1", "--single-branch",
 		"--filter=blob:none", "--no-tags",
