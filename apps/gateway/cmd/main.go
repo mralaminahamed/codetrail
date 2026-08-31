@@ -108,7 +108,7 @@ func main() {
 	defer st.Close()
 	log.Info().Msg("postgres ready, schema up to date")
 
-	h := &handler.Handler{Policy: admit.NewPolicy(allowedHosts()), Jobs: jobs.New(st.Pool())}
+	h := &handler.Handler{Policy: admit.NewPolicy(allowedHosts()), Jobs: jobs.New(st.Pool()), Log: log}
 	e := newRouter(readinessFor(log, st).Ready, h)
 
 	addr := ":" + config.Get("PORT", "8080")
