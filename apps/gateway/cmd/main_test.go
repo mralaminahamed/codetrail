@@ -1,15 +1,27 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"strings"
 	"testing"
 
+	"github.com/rs/zerolog"
+
 	"github.com/mralaminahamed/codetrail/apps/gateway/internal/handler"
 	"github.com/mralaminahamed/codetrail/packages/shared/admit"
+	"github.com/mralaminahamed/codetrail/packages/shared/jobs"
 )
+
+type fakeQueue struct{}
+
+func (fakeQueue) Enqueue(context.Context, string, string) (jobs.Job, error) {
+	return jobs.Job{}, nil
+}
+func (fakeQueue) Get(context.Context, string) (jobs.Job, error) { return jobs.Job{}, nil }
 
 // The router has to carry both the probes and the API. Mounting one without
 // the other boots a binary that passes its health check and serves nothing
@@ -61,5 +73,33 @@ func TestAllowedHostsDefaultsAndSurvivesSpaces(t *testing.T) {
 	}
 	if _, err := p.Check("https://codeberg.org/a/b"); err == nil {
 		t.Error("a configured list must replace the default, not extend it")
+	}
+}
+
+// main builds the handler once, and a field it forgets is a field no handler
+// test can see missing. A zero-value zerolog.Logger discards silently — the
+// property that makes the handler safe without one — so a dropped Log would
+// answer every 500 with a request id and write nothing, anywhere.
+func TestNewHandlerWiresTheLoggerPolicyAndQueue(t *testing.T) {
+	t.Setenv("ALLOWED_HOSTS", "example.test")
+	var logged bytes.Buffer
+	q := fakeQueue{}
+	// logger.New pins production to InfoLevel; a test logger that accepts more
+	// would pass on a line production never writes.
+	h := newHandler(zerolog.New(&logged).Level(zerolog.InfoLevel), q)
+
+	h.Log.Error().Msg("ping")
+	if logged.Len() == 0 {
+		t.Error("the handler carries no live writer: in production a 500 would be silent")
+	}
+	// ALLOWED_HOSTS has to reach the policy, not just be parseable.
+	if _, err := h.Policy.Check("https://example.test/a/b"); err != nil {
+		t.Errorf("configured host refused: %v", err)
+	}
+	if _, err := h.Policy.Check("https://github.com/a/b"); err == nil {
+		t.Error("the default list is still in force: ALLOWED_HOSTS was ignored")
+	}
+	if h.Jobs != q {
+		t.Errorf("queue not wired: %#v", h.Jobs)
 	}
 }

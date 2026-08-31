@@ -8,9 +8,9 @@ import (
 	"github.com/mralaminahamed/codetrail/packages/shared/store"
 )
 
-// storeHandle is the store surface main needs. Named here rather than in
-// store.go so the readiness composition test can substitute a fake without a
-// Postgres to connect to.
+// storeHandle is the store surface main needs: a ping for readiness, and the
+// pool the job queue is built from. Pool returns a concrete *pgxpool.Pool, so
+// this narrows *store.Store rather than being a seam a fake can stand in for.
 type storeHandle interface {
 	Ping(context.Context) error
 	Pool() *pgxpool.Pool
