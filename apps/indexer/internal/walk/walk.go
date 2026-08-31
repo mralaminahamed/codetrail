@@ -34,10 +34,11 @@ var langByExt = map[string]string{
 
 // Files walks root and returns its regular files, repo-relative.
 //
-// It uses WalkDir, whose DirEntry comes from ReadDir and therefore describes
-// the link itself rather than its target — the same guarantee as Lstat. A
-// repository can contain `link -> /etc/passwd`, and following it would read
-// and index the host's files.
+// It uses WalkDir, which lstats root and reads every descendant out of its
+// parent's directory listing. Neither resolves a link, so the DirEntry
+// describes the link itself and never its target. A repository can contain
+// `link -> /etc/passwd`, and following it would read and index the host's
+// files.
 func Files(root string, lim Limits) ([]File, error) {
 	// Both caps fail closed, the way clone's do: zero is a refusal, not
 	// "unlimited". An int-valued config knob that parses to 0 must not arrive
@@ -64,8 +65,8 @@ func Files(root string, lim Limits) ([]File, error) {
 		// Git stores path bytes verbatim, so a checkout can hold a name that is
 		// not UTF-8. encoding/json does not reject one, it substitutes U+FFFD,
 		// so such a path would be served back naming a file that does not
-		// exist. Measured, not assumed: json.Marshal of "bad\xff\xfe.go"
-		// returns no error and a different string.
+		// exist. Measured, not assumed: marshalling a name with invalid bytes
+		// returns no error and a string that no longer round-trips.
 		if !utf8.ValidString(rel) {
 			if d.IsDir() {
 				return filepath.SkipDir
@@ -73,9 +74,9 @@ func Files(root string, lim Limits) ([]File, error) {
 			return nil
 		}
 		// As a directory .git is the object database: enormous, and meaningless
-		// to index. As a regular file it is a gitlink, whose one line is an
-		// absolute path on this host — also not the repository's content. The
-		// name is matched exactly, so .github and .gitignore are unaffected.
+		// to index. As a regular file it is a gitlink, whose one line points at
+		// a gitdir elsewhere on this host — also not the repository's content.
+		// The name is matched exactly, so .github and .gitignore are unaffected.
 		if d.Name() == ".git" {
 			if d.IsDir() {
 				return filepath.SkipDir
