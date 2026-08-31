@@ -32,8 +32,10 @@ type Result struct {
 }
 
 // Run clones remote at ref into dir. Every path that can leave dir on disk
-// removes it again on error, so a failed job leaves nothing behind for the
-// disk quota to trip over later.
+// removes it before returning — but not for good: a descendant that outlived
+// the process-group kill can write the checkout back afterwards. That is the
+// same escape WaitDelay below refuses to assume away, so the caller wants its
+// own defer os.RemoveAll(dir) behind this one.
 func Run(ctx context.Context, remote, ref, dir string, lim Limits) (Result, error) {
 	// Both caps fail closed and alike: a zero MaxBytes is a refusal, not
 	// "unlimited", and a zero Deadline is not "no deadline". Refusing before
@@ -120,9 +122,14 @@ func Run(ctx context.Context, remote, ref, dir string, lim Limits) (Result, erro
 
 func head(ctx context.Context, dir string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "HEAD")
+	// Stdout carries the sha, so the error has to carry stderr: an empty
+	// repository clones cleanly and fails only here, and "exit status 128" on
+	// its own does not say that is what happened.
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("rev-parse: %w", err)
+		return "", fmt.Errorf("rev-parse: %w: %s", err, strings.TrimSpace(stderr.String()))
 	}
 	return strings.TrimSpace(string(out)), nil
 }
