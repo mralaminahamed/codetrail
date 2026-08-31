@@ -78,10 +78,11 @@ const maxRefLen = 255
 // It is a bound on what reaches argv, not a model of git's ref syntax, and it
 // is looser than git in several ways: it accepts a leading or trailing "/", a
 // doubled "//", a ".lock" suffix, a component starting with "." (".foo",
-// "a/.b") and a component ending with "." ("foo.", "v1."). Git rejects all of
-// them, so they fail the clone rather than doing anything, and none can be read
-// as an option. Task 7 must still run git check-ref-format; this does not make
-// that redundant.
+// "a/.b") and a ref ending with "." ("foo.", "v1."). Git rejects all of them,
+// so they fail the clone rather than doing anything, and none can be read as an
+// option. The trailing-dot rule is the refname's, not each component's:
+// "foo./bar" is legal to git and accepted here. Task 7 must still run git
+// check-ref-format; this does not make that redundant.
 //
 // In one direction it is narrower than git: "+" is legal in a tag, so a semver
 // build-metadata tag is refused here. Widening that is a decision for when
