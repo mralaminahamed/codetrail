@@ -96,6 +96,13 @@ func allowedHosts() []string {
 	return strings.Split(config.Get("ALLOWED_HOSTS", strings.Join(admit.DefaultHosts, ",")), ",")
 }
 
+// newHandler builds the API handler main serves from. A function so a test can
+// pin the wiring: every field here is one main could silently forget, and a
+// zero-value logger discards without complaining.
+func newHandler(log zerolog.Logger, q handler.Enqueuer) *handler.Handler {
+	return &handler.Handler{Policy: admit.NewPolicy(allowedHosts()), Jobs: q, Log: log}
+}
+
 func main() {
 	log := logger.New("gateway")
 	ctx := context.Background()
@@ -108,7 +115,7 @@ func main() {
 	defer st.Close()
 	log.Info().Msg("postgres ready, schema up to date")
 
-	h := &handler.Handler{Policy: admit.NewPolicy(allowedHosts()), Jobs: jobs.New(st.Pool()), Log: log}
+	h := newHandler(log, jobs.New(st.Pool()))
 	e := newRouter(readinessFor(log, st).Ready, h)
 
 	addr := ":" + config.Get("PORT", "8080")
