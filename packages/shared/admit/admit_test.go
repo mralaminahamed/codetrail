@@ -170,6 +170,63 @@ func TestDefaultHostsArePinned(t *testing.T) {
 	}
 }
 
+// Task 4 renders Rule straight into the 400 body, so the two branches that can
+// fire before the host is known have to name the right rule, not merely refuse.
+// The control characters are not exotic: they are what makes url.Parse itself
+// fail, which is the only way to reach that second branch.
+func TestPreHostRefusalsAreRuleForm(t *testing.T) {
+	for _, raw := range []string{
+		"",
+		"   ",
+		"https://github.com/x/\ty",
+		"https://github.com/x/\ny",
+		"https://github.com/x/\ry",
+		"https://github.com/x/\x00y",
+		"https://github.com/x/\x7fy",
+	} {
+		_, err := policy().Check(raw)
+		var e *Error
+		if !errors.As(err, &e) || e.Rule != RuleForm {
+			t.Fatalf("%q: want a form rejection, got %v", raw, err)
+		}
+	}
+}
+
+// Task 4 builds the policy from a split env var, so "github.com, codeberg.org"
+// — the natural way to write it — hands NewPolicy a leading space to absorb.
+func TestNewPolicyNormalisesHosts(t *testing.T) {
+	for _, hosts := range [][]string{
+		{"GitHub.com"},
+		{" github.com "},
+		{"  GitHub.COM  "},
+		{"github.com", " codeberg.org"},
+	} {
+		if _, err := NewPolicy(hosts).Check("https://github.com/o/n"); err != nil {
+			t.Fatalf("%q: want accepted, got %v", hosts, err)
+		}
+	}
+}
+
+// A policy with no usable host must refuse everything rather than admit it.
+// The hostless URL is the one that matters: an empty entry kept in the map
+// would match u.Hostname() == "" and let it through.
+func TestPolicyWithoutHostsRefusesEverything(t *testing.T) {
+	for _, p := range []Policy{
+		NewPolicy([]string{""}),
+		NewPolicy([]string{"   "}),
+		NewPolicy(nil),
+		{},
+	} {
+		for _, raw := range []string{"https://github.com/o/n", "https:///o/n"} {
+			_, err := p.Check(raw)
+			var e *Error
+			if !errors.As(err, &e) || e.Rule != RuleHost {
+				t.Fatalf("%q: want a host rejection, got %v", raw, err)
+			}
+		}
+	}
+}
+
 // Host matching is case-insensitive, and a trailing .git or slash is the same
 // repository — normalising here means the job dedupe index sees one key.
 func TestNormalises(t *testing.T) {
