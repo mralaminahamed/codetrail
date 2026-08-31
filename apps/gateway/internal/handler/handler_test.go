@@ -287,14 +287,14 @@ func TestServerErrorDoesNotLeakTheUnderlyingError(t *testing.T) {
 func TestNeitherResponseServesInternalJobFields(t *testing.T) {
 	const leak = "clone failed: /srv/codetrail/work/tmp42: https://x-token:ghp_secret@github.com/a/b"
 	q := &fakeQueue{job: jobs.Job{
-		ID: "job-1", Remote: "https://github.com/a/b", Ref: "HEAD",
+		ID: "job-1", Remote: "https://github.com/a/b", Ref: "v9.9.9",
 		Status: jobs.StatusPending, Attempts: 3, Error: leak,
 	}}
 	for _, tc := range []struct {
 		name, method, path, body string
 		want                     int
 	}{
-		{"submit", http.MethodPost, "/api/repos", `{"remote":"https://github.com/a/b"}`, http.StatusAccepted},
+		{"submit", http.MethodPost, "/api/repos", `{"remote":"https://github.com/a/b","ref":"v9.9.9"}`, http.StatusAccepted},
 		{"poll", http.MethodGet, "/api/jobs/job-1", "", http.StatusOK},
 	} {
 		rec := do(router(q), tc.method, tc.path, tc.body)
@@ -315,11 +315,20 @@ func TestNeitherResponseServesInternalJobFields(t *testing.T) {
 				t.Errorf("%s: body leaks %q: %s", tc.name, leaked, rec.Body)
 			}
 		}
-		// What a poller does need is still there.
-		for _, want := range []string{"id", "remote", "ref", "status"} {
-			if v, ok := out[want].(string); !ok || v == "" {
-				t.Errorf("%s: body is missing %q: %s", tc.name, want, rec.Body)
+		// Values, not just presence: transposing remote and ref leaves both
+		// fields non-empty and every "is it there" check happy.
+		want := map[string]any{
+			"id": "job-1", "remote": "https://github.com/a/b",
+			"ref": "v9.9.9", "status": "pending",
+		}
+		for k, v := range want {
+			if out[k] != v {
+				t.Errorf("%s: %s = %v, want %v", tc.name, k, out[k], v)
 			}
+		}
+		// A field added to jobs.Job must not reach the API by default.
+		if len(out) != len(want) {
+			t.Errorf("%s: body has %d fields, want %d: %s", tc.name, len(out), len(want), rec.Body)
 		}
 	}
 }
@@ -331,6 +340,7 @@ func TestSubmitRefusesARefGitShouldNeverSee(t *testing.T) {
 		"--upload-pack=touch /tmp/pwn",
 		"-x",
 		"a..b",
+		".",
 		"refs/heads/x;rm -rf /",
 		"a b",
 		"a\nb",

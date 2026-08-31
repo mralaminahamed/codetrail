@@ -65,12 +65,20 @@ func view(j jobs.Job) jobView {
 // this is short enough to be obviously safe and long enough for any real ref.
 const maxRefLen = 255
 
-// validRef allowlists the charset a git ref needs, the way admit does for a
-// path segment. The indexer hands ref to a subprocess, so a leading "-" is an
-// option and not a name, and ".." is forbidden by git's own ref syntax. Bound
-// it at the front door rather than at a call site that is not written yet.
+// validRef allowlists the charset a git ref needs, the way admit.validSegment
+// does for a path segment, and refuses "." and ".." as that does. The indexer
+// hands ref to a subprocess, so a leading "-" is an option and not a name, and
+// ".." is forbidden by git's own ref syntax anyway. Bound it at the front door
+// rather than at a call site that is not written yet.
+//
+// It diverges from validSegment by allowing "/", which a ref needs, and by
+// capping the length, which argv makes worth doing. Both make it looser and
+// stricter respectively; neither lets through anything git would read as an
+// option. It stays narrower than git's own rules — "+" is legal in a tag, so a
+// semver build-metadata tag is refused here. Widening that is a decision for
+// when Task 7 exists and the argv path is real.
 func validRef(s string) bool {
-	if s == "" || len(s) > maxRefLen || strings.HasPrefix(s, "-") || strings.Contains(s, "..") {
+	if s == "" || s == "." || len(s) > maxRefLen || strings.HasPrefix(s, "-") || strings.Contains(s, "..") {
 		return false
 	}
 	for _, r := range s {
