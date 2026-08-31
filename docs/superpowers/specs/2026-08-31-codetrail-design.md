@@ -305,8 +305,17 @@ sandbox were not in that estimate.
 
 None blocking P0–P2. Deferred deliberately, to be decided with evidence rather than now:
 
-- **Which forges the default allowlist contains.** Decided in P1 against what actually clones
-  cleanly under the caps.
 - **The score floor's value.** Measured in P6; picking it earlier would be guessing.
 - **Whether lexical fusion helps, and by how much.** An experiment in P6/P7, not an assumption.
 - **The second language.** Not before Go is measured.
+
+### Decided since
+
+- **Which forges the default allowlist contains.** Settled in P1: `github.com` and
+  `codeberg.org`, not `gitlab.com`. Both of the first two serve exactly `/owner/name`
+  (Codeberg is Gitea), which is the shape the admission policy accepts. GitLab nests
+  namespaces arbitrarily (`group/subgroup/repo`), so the policy refuses its typical URL;
+  shipping it in the default allowlist would advertise a forge that half-works. Supporting
+  it means changing the path check's shape and validating an arbitrary number of segments,
+  which is its own task rather than a line in the allowlist. An operator can still
+  configure `gitlab.com` explicitly, with that limitation.

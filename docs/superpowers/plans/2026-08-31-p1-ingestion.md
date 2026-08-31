@@ -152,7 +152,7 @@ Pure, hermetic, and the first line of the sandbox. No network, no filesystem, no
   - `type Remote struct { URL, Host, Owner, Name string }`
   - `type Policy struct{ ... }`, `func NewPolicy(hosts []string) Policy`
   - `func (p Policy) Check(raw string) (Remote, error)`
-  - `var DefaultHosts = []string{"github.com", "gitlab.com", "codeberg.org"}`
+  - `var DefaultHosts = []string{"github.com", "codeberg.org"}`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -349,7 +349,12 @@ type Remote struct {
 }
 
 // DefaultHosts is the allowlist a deployment gets if it configures none.
-var DefaultHosts = []string{"github.com", "gitlab.com", "codeberg.org"}
+//
+// gitlab.com is deliberately absent: GitLab nests namespaces arbitrarily
+// (group/subgroup/repo), which the /owner/name path check refuses, so shipping
+// it by default would advertise a forge whose typical URL we reject. Adding it
+// back means teaching Check about nested namespaces first.
+var DefaultHosts = []string{"github.com", "codeberg.org"}
 
 type Policy struct{ hosts map[string]bool }
 
