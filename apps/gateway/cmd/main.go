@@ -103,6 +103,14 @@ func newHandler(log zerolog.Logger, q handler.Enqueuer) *handler.Handler {
 	return &handler.Handler{Policy: admit.NewPolicy(allowedHosts()), Jobs: q, Log: log}
 }
 
+// newServer assembles what the binary serves: probes, router, policy, queue and
+// logger. A function because main's own body needs a live Postgres to reach, so
+// anything left in it is unpinnable — and the mistakes here are silent ones,
+// like serving server.New's probes with no API mounted behind them.
+func newServer(log zerolog.Logger, st storeHandle) *echo.Echo {
+	return newRouter(readinessFor(log, st).Ready, newHandler(log, jobs.New(st.Pool())))
+}
+
 func main() {
 	log := logger.New("gateway")
 	ctx := context.Background()
@@ -115,8 +123,7 @@ func main() {
 	defer st.Close()
 	log.Info().Msg("postgres ready, schema up to date")
 
-	h := newHandler(log, jobs.New(st.Pool()))
-	e := newRouter(readinessFor(log, st).Ready, h)
+	e := newServer(log, st)
 
 	addr := ":" + config.Get("PORT", "8080")
 	go func() {
