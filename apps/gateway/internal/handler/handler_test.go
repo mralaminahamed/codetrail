@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,8 @@ import (
 	"testing"
 
 	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
+	"github.com/rs/zerolog"
 
 	"github.com/mralaminahamed/codetrail/packages/shared/admit"
 	"github.com/mralaminahamed/codetrail/packages/shared/jobs"
@@ -207,6 +210,52 @@ func TestMountAppliesTheMiddlewareItIsGiven(t *testing.T) {
 	} {
 		if rec := do(e, tc.method, tc.path, tc.body); rec.Code != http.StatusTeapot {
 			t.Errorf("%s %s: middleware did not run, got %d", tc.method, tc.path, rec.Code)
+		}
+	}
+}
+
+// A 500 must not hand the caller the database's own words. A pgx error carries
+// the connection host, the database name, and constraint names, and this
+// endpoint takes URLs from strangers. The operator gets the real error from the
+// log, correlated by the request id the caller is given.
+func TestServerErrorDoesNotLeakTheUnderlyingError(t *testing.T) {
+	const marker = "pgx: host=secret.internal dbname=codetrail user=codetrail"
+	for _, tc := range []struct{ name, method, path, body string }{
+		{"submit", http.MethodPost, "/api/repos", `{"remote":"https://github.com/a/b"}`},
+		{"poll", http.MethodGet, "/api/jobs/job-1", ""},
+	} {
+		var logged bytes.Buffer
+		h := &Handler{
+			Policy: admit.NewPolicy(admit.DefaultHosts),
+			Jobs:   &fakeQueue{err: errors.New(marker)},
+			Log:    zerolog.New(&logged),
+		}
+		e := echo.New()
+		Mount(e, h, middleware.RequestID())
+		rec := do(e, tc.method, tc.path, tc.body)
+
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("%s: want 500, got %d", tc.name, rec.Code)
+		}
+		body := rec.Body.String()
+		for _, leak := range []string{marker, "secret.internal", "dbname=", "host="} {
+			if strings.Contains(body, leak) {
+				t.Errorf("%s: 500 body leaks %q: %s", tc.name, leak, body)
+			}
+		}
+		var out struct {
+			Error     string `json:"error"`
+			RequestID string `json:"request_id"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if out.RequestID == "" || out.RequestID != rec.Header().Get(echo.HeaderXRequestID) {
+			t.Errorf("%s: request_id %q, header %q", tc.name, out.RequestID, rec.Header().Get(echo.HeaderXRequestID))
+		}
+		// Withheld from the caller, not from the operator, and correlatable.
+		if !strings.Contains(logged.String(), marker) || !strings.Contains(logged.String(), out.RequestID) {
+			t.Errorf("%s: log line does not carry the error and the request id: %s", tc.name, logged.String())
 		}
 	}
 }

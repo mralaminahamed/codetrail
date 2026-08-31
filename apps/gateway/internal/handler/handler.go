@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/labstack/echo/v4"
+	"github.com/rs/zerolog"
 
 	"github.com/mralaminahamed/codetrail/packages/shared/admit"
 	"github.com/mralaminahamed/codetrail/packages/shared/jobs"
@@ -23,6 +24,7 @@ type Enqueuer interface {
 type Handler struct {
 	Policy admit.Policy
 	Jobs   Enqueuer
+	Log    zerolog.Logger
 }
 
 func Mount(e *echo.Echo, h *Handler, mw ...echo.MiddlewareFunc) {
@@ -59,7 +61,7 @@ func (h *Handler) postRepo(c echo.Context) error {
 	// otherwise see three spellings of one repository as three repositories.
 	job, err := h.Jobs.Enqueue(c.Request().Context(), remote.URL, ref)
 	if err != nil {
-		return c.JSON(http.StatusInternalServerError, echo.Map{"error": err.Error()})
+		return h.fail(c, err, "enqueue")
 	}
 	return c.JSON(http.StatusAccepted, job)
 }
@@ -70,7 +72,17 @@ func (h *Handler) getJob(c echo.Context) error {
 		return c.JSON(http.StatusNotFound, echo.Map{"error": "no such job"})
 	}
 	if err != nil {
-		return c.JSON(http.StatusInternalServerError, echo.Map{"error": err.Error()})
+		return h.fail(c, err, "read job")
 	}
 	return c.JSON(http.StatusOK, job)
+}
+
+// fail answers a 500 without the underlying error. A pgx message names the
+// connection host, the database and the constraint, and this endpoint takes
+// URLs from strangers. The operator reads the real error from the log; the
+// request id is what ties a caller's report to that line.
+func (h *Handler) fail(c echo.Context, err error, op string) error {
+	rid := c.Response().Header().Get(echo.HeaderXRequestID)
+	h.Log.Error().Err(err).Str("request_id", rid).Str("op", op).Msg("request failed")
+	return c.JSON(http.StatusInternalServerError, echo.Map{"error": "internal error", "request_id": rid})
 }
