@@ -29,7 +29,10 @@ func (f *fakeQueue) Enqueue(_ context.Context, remote, ref string) (jobs.Job, er
 		return jobs.Job{}, f.err
 	}
 	f.enqueued = append(f.enqueued, remote+"@"+ref)
-	return jobs.Job{ID: "job-1", Remote: remote, Ref: ref, Status: jobs.StatusPending}, nil
+	// A duplicate Enqueue returns the existing active job, which may already
+	// carry attempts and the text of a failed one.
+	return jobs.Job{ID: "job-1", Remote: remote, Ref: ref, Status: jobs.StatusPending,
+		Attempts: f.job.Attempts, Error: f.job.Error}, nil
 }
 
 func (f *fakeQueue) Get(_ context.Context, id string) (jobs.Job, error) {
@@ -122,13 +125,20 @@ func TestSubmitMalformedBodyIs400(t *testing.T) {
 		t.Fatalf("want 400, got %d: %s", rec.Code, rec.Body)
 	}
 	var out struct {
-		Rule string `json:"rule"`
+		Error string `json:"error"`
+		Rule  string `json:"rule"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 		t.Fatal(err)
 	}
 	if out.Rule != string(admit.RuleForm) {
 		t.Fatalf("want rule %q, got %q", admit.RuleForm, out.Rule)
+	}
+	// echo's HTTPError stringifies with the bound Go type appended, which names
+	// this package rather than anything the caller sent. A fixed message is the
+	// only body that cannot be made to carry server state.
+	if out.Error != "malformed request body" {
+		t.Fatalf("want a fixed message, got %q", out.Error)
 	}
 	if len(q.enqueued) != 0 {
 		t.Fatalf("enqueued %v", q.enqueued)
@@ -228,7 +238,9 @@ func TestServerErrorDoesNotLeakTheUnderlyingError(t *testing.T) {
 		h := &Handler{
 			Policy: admit.NewPolicy(admit.DefaultHosts),
 			Jobs:   &fakeQueue{err: errors.New(marker)},
-			Log:    zerolog.New(&logged),
+			// logger.New pins production to InfoLevel; a test logger that
+			// accepts Debug would pass on a line production never writes.
+			Log: zerolog.New(&logged).Level(zerolog.InfoLevel),
 		}
 		e := echo.New()
 		Mount(e, h, middleware.RequestID())
@@ -254,8 +266,114 @@ func TestServerErrorDoesNotLeakTheUnderlyingError(t *testing.T) {
 			t.Errorf("%s: request_id %q, header %q", tc.name, out.RequestID, rec.Header().Get(echo.HeaderXRequestID))
 		}
 		// Withheld from the caller, not from the operator, and correlatable.
-		if !strings.Contains(logged.String(), marker) || !strings.Contains(logged.String(), out.RequestID) {
-			t.Errorf("%s: log line does not carry the error and the request id: %s", tc.name, logged.String())
+		var line struct {
+			Error     string `json:"error"`
+			RequestID string `json:"request_id"`
+		}
+		if err := json.Unmarshal([]byte(logged.String()), &line); err != nil {
+			t.Fatalf("%s: no log line (%v): %s", tc.name, err, logged.String())
+		}
+		if line.Error != marker || line.RequestID != out.RequestID {
+			t.Errorf("%s: log carries error %q, request_id %q; want %q and %q",
+				tc.name, line.Error, line.RequestID, marker, out.RequestID)
+		}
+	}
+}
+
+// Important 2: jobs.Job is the internal row. attempts is scheduling detail,
+// and error is written from the indexer's git stderr — a filesystem path and a
+// credential-bearing URL have both been seen in it. Serving it to an anonymous
+// poller would reopen on a 200 what the 500 path closes.
+func TestNeitherResponseServesInternalJobFields(t *testing.T) {
+	const leak = "clone failed: /srv/codetrail/work/tmp42: https://x-token:ghp_secret@github.com/a/b"
+	q := &fakeQueue{job: jobs.Job{
+		ID: "job-1", Remote: "https://github.com/a/b", Ref: "HEAD",
+		Status: jobs.StatusPending, Attempts: 3, Error: leak,
+	}}
+	for _, tc := range []struct {
+		name, method, path, body string
+		want                     int
+	}{
+		{"submit", http.MethodPost, "/api/repos", `{"remote":"https://github.com/a/b"}`, http.StatusAccepted},
+		{"poll", http.MethodGet, "/api/jobs/job-1", "", http.StatusOK},
+	} {
+		rec := do(router(q), tc.method, tc.path, tc.body)
+		if rec.Code != tc.want {
+			t.Fatalf("%s: want %d, got %d: %s", tc.name, tc.want, rec.Code, rec.Body)
+		}
+		var out map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatal(err)
+		}
+		for _, internal := range []string{"error", "attempts"} {
+			if _, ok := out[internal]; ok {
+				t.Errorf("%s: body serves %q: %s", tc.name, internal, rec.Body)
+			}
+		}
+		for _, leaked := range []string{"/srv/", "ghp_secret", "@github.com"} {
+			if strings.Contains(rec.Body.String(), leaked) {
+				t.Errorf("%s: body leaks %q: %s", tc.name, leaked, rec.Body)
+			}
+		}
+		// What a poller does need is still there.
+		for _, want := range []string{"id", "remote", "ref", "status"} {
+			if v, ok := out[want].(string); !ok || v == "" {
+				t.Errorf("%s: body is missing %q: %s", tc.name, want, rec.Body)
+			}
+		}
+	}
+}
+
+// Important 3: ref is handed to git by the indexer. The front door is where an
+// argument stops being possible, not the subprocess call site.
+func TestSubmitRefusesARefGitShouldNeverSee(t *testing.T) {
+	for _, ref := range []string{
+		"--upload-pack=touch /tmp/pwn",
+		"-x",
+		"a..b",
+		"refs/heads/x;rm -rf /",
+		"a b",
+		"a\nb",
+		"tag^{}",
+		strings.Repeat("a", 256),
+	} {
+		body, err := json.Marshal(map[string]string{"remote": "https://github.com/a/b", "ref": ref})
+		if err != nil {
+			t.Fatal(err)
+		}
+		q := &fakeQueue{}
+		rec := do(router(q), http.MethodPost, "/api/repos", string(body))
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("ref %q: want 400, got %d: %s", ref, rec.Code, rec.Body)
+		}
+		var out struct {
+			Rule string `json:"rule"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatal(err)
+		}
+		if out.Rule != string(admit.RuleForm) {
+			t.Errorf("ref %q: want rule %q, got %q", ref, admit.RuleForm, out.Rule)
+		}
+		if len(q.enqueued) != 0 {
+			t.Errorf("ref %q: refused but enqueued %v", ref, q.enqueued)
+		}
+	}
+}
+
+func TestSubmitAcceptsAnOrdinaryRef(t *testing.T) {
+	for _, ref := range []string{"HEAD", "main", "v1.2.3", "refs/heads/feature/x", "release_1", "a.b-c"} {
+		body, err := json.Marshal(map[string]string{"remote": "https://github.com/a/b", "ref": ref})
+		if err != nil {
+			t.Fatal(err)
+		}
+		q := &fakeQueue{}
+		rec := do(router(q), http.MethodPost, "/api/repos", string(body))
+		if rec.Code != http.StatusAccepted {
+			t.Errorf("ref %q: want 202, got %d: %s", ref, rec.Code, rec.Body)
+		}
+		if len(q.enqueued) != 1 || q.enqueued[0] != "https://github.com/a/b@"+ref {
+			t.Errorf("ref %q: enqueued %v", ref, q.enqueued)
 		}
 	}
 }

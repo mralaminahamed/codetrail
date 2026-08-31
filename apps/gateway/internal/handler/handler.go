@@ -38,10 +38,60 @@ type repoRequest struct {
 	Ref    string `json:"ref"`
 }
 
+// jobView is what a caller may see of a job. jobs.Job stays whole for the
+// indexer; this is the projection the API serves.
+//
+// attempts is scheduling detail. error is written from the indexer's git
+// stderr, which has carried a server filesystem path and a credential-bearing
+// URL — the same disclosure the 500 path withholds, and there is no reason for
+// a 200 to be less careful than a 500.
+//
+// Spec §10 wants a terminal failure to carry its reason into the API. That is
+// deliberately not honoured yet: no safe vocabulary for a reason exists today,
+// and git's stderr is not one. Surfacing nothing beats surfacing a path. Do
+// not close this gap by piping the raw column through.
+type jobView struct {
+	ID     string      `json:"id"`
+	Remote string      `json:"remote"`
+	Ref    string      `json:"ref"`
+	Status jobs.Status `json:"status"`
+}
+
+func view(j jobs.Job) jobView {
+	return jobView{ID: j.ID, Remote: j.Remote, Ref: j.Ref, Status: j.Status}
+}
+
+// maxRefLen bounds what reaches git's argv. Git's own limit is the filesystem's;
+// this is short enough to be obviously safe and long enough for any real ref.
+const maxRefLen = 255
+
+// validRef allowlists the charset a git ref needs, the way admit does for a
+// path segment. The indexer hands ref to a subprocess, so a leading "-" is an
+// option and not a name, and ".." is forbidden by git's own ref syntax. Bound
+// it at the front door rather than at a call site that is not written yet.
+func validRef(s string) bool {
+	if s == "" || len(s) > maxRefLen || strings.HasPrefix(s, "-") || strings.Contains(s, "..") {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '.', r == '_', r == '-', r == '/':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func (h *Handler) postRepo(c echo.Context) error {
 	var req repoRequest
 	if err := c.Bind(&req); err != nil {
-		return c.JSON(http.StatusBadRequest, echo.Map{"error": err.Error(), "rule": string(admit.RuleForm)})
+		// echo's HTTPError stringifies with the bound Go type appended, which
+		// names this package rather than anything the caller sent. A fixed
+		// message is the only body that cannot be made to carry server state.
+		h.Log.Warn().Err(err).Str("request_id", requestID(c)).Str("op", "bind").Msg("malformed request body")
+		return c.JSON(http.StatusBadRequest, echo.Map{"error": "malformed request body", "rule": string(admit.RuleForm)})
 	}
 	remote, err := h.Policy.Check(req.Remote)
 	if err != nil {
@@ -57,13 +107,19 @@ func (h *Handler) postRepo(c echo.Context) error {
 	if ref == "" {
 		ref = "HEAD"
 	}
+	if !validRef(ref) {
+		return c.JSON(http.StatusBadRequest, echo.Map{
+			"error": "ref must be a plain git ref name",
+			"rule":  string(admit.RuleForm),
+		})
+	}
 	// The normalised URL, not the caller's spelling: the dedupe index would
 	// otherwise see three spellings of one repository as three repositories.
 	job, err := h.Jobs.Enqueue(c.Request().Context(), remote.URL, ref)
 	if err != nil {
 		return h.fail(c, err, "enqueue")
 	}
-	return c.JSON(http.StatusAccepted, job)
+	return c.JSON(http.StatusAccepted, view(job))
 }
 
 func (h *Handler) getJob(c echo.Context) error {
@@ -74,7 +130,7 @@ func (h *Handler) getJob(c echo.Context) error {
 	if err != nil {
 		return h.fail(c, err, "read job")
 	}
-	return c.JSON(http.StatusOK, job)
+	return c.JSON(http.StatusOK, view(job))
 }
 
 // fail answers a 500 without the underlying error. A pgx message names the
@@ -82,7 +138,13 @@ func (h *Handler) getJob(c echo.Context) error {
 // URLs from strangers. The operator reads the real error from the log; the
 // request id is what ties a caller's report to that line.
 func (h *Handler) fail(c echo.Context, err error, op string) error {
-	rid := c.Response().Header().Get(echo.HeaderXRequestID)
+	rid := requestID(c)
 	h.Log.Error().Err(err).Str("request_id", rid).Str("op", op).Msg("request failed")
 	return c.JSON(http.StatusInternalServerError, echo.Map{"error": "internal error", "request_id": rid})
+}
+
+// requestID is the id echo's RequestID middleware stamped on the response, and
+// what a caller quotes when reporting a failure.
+func requestID(c echo.Context) string {
+	return c.Response().Header().Get(echo.HeaderXRequestID)
 }
