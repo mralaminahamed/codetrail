@@ -97,9 +97,14 @@ func TestNoWindowIsContainedInAnother(t *testing.T) {
 	}
 }
 
-// Every window is kind=file. The eval tells the two corpora apart by what the
-// rows say, and a window claiming to be a declaration would be a lie in the
-// only column that could catch it.
+// Every window is kind=file with no symbol: a window is a slice of lines, and a
+// symbol on it would name a declaration its range does not delimit.
+//
+// Not "the eval tells the two corpora apart by what the rows say" — it cannot.
+// Sub-windowed declarations and unparseable files are kind=file under the AST
+// strategy too, so which arm produced a row is a property of the run and never
+// of the row. The input is a.txt because this pins windows(); the strategy seam
+// is pinned by TestWindowStrategyIgnoresParseableGo.
 func TestWindowsAreKindFile(t *testing.T) {
 	got, _ := Chunks("a.txt", lines(9), winOpts(4, 1))
 	for _, c := range got {
