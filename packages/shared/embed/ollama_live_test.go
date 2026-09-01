@@ -18,13 +18,15 @@ func baseURL(t *testing.T) string {
 	t.Helper()
 	v := os.Getenv("OLLAMA_URL")
 	if v == "" {
-		// Building with -tags=ollama is already a statement that a server is
-		// meant to be there. A skip then prints the same "ok" as a run, so a
-		// dropped variable would look green with zero live coverage.
-		if os.Getenv("CI") != "" {
-			t.Fatal("OLLAMA_URL unset in CI — the ollama suite must never silently skip")
-		}
-		t.Skip("set OLLAMA_URL to run")
+		// A failure, not a skip, and not only under CI. A skipped suite prints
+		// the same "ok" as one that ran: measured, `go test -tags=ollama
+		// ./packages/shared/embed/` with OLLAMA_URL unset reported success with
+		// zero live coverage, and only the CI variable said otherwise. The live
+		// tag leans on that variable because `go test -tags=live ./...` is a
+		// routine command with nothing to point it at; asking for this tag
+		// never is — it is already a statement that a server is meant to be
+		// there, so the tag alone is the opt-in.
+		t.Fatal("OLLAMA_URL unset: -tags=ollama runs against a real Ollama, and a skip here is a green run with no coverage")
 	}
 	return v
 }
