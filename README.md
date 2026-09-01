@@ -30,7 +30,9 @@ this project exists to attack.
 **Code does not chunk like prose.** A paragraph window cuts a function in half and staples its
 second half to the top of the next one. codetrail chunks on the AST — one span per declaration —
 and then *measures* that against a fixed-window baseline instead of asserting it is better. Both
-arms exist and both run over real repositories as of P2; the measurement itself is
+arms exist and both index a real repository end to end as of P2 — in the production corpus **and**
+in the doc-stripped corpus the eval indexes, which is the one §9 needs and the one the baseline arm
+could not build at all until this phase's last fix. The measurement itself is
 [§9 of the spec](docs/superpowers/specs/2026-08-31-codetrail-design.md#9-the-eval), it is designed
 so the questions cannot be authored to flatter the chunker under test, and **it has not been run
 yet**.
@@ -200,6 +202,15 @@ index — 1,303 vectors insert in 33 ms without it and 1,031 ms with — which i
 at this size and would be at a hundred times it. Indexing the same commit twice produced the same
 1,303 span ids, which is what makes a retry safe.
 
+**The eval's corpus is measured, not only production's.** The same commit with doc comments
+stripped: the AST arm produces the same 1,303 spans, and the window arm produces **768** — three
+fewer than the 771 above, because blanking `log.go`'s ~100-line package comment leaves three 40-line
+windows with no word left in them. Those are dropped rather than embedded, and the job says how many
+it dropped. A blank window has nothing retrievable in it; `embed.Fake` refuses a text it can hash no
+token from, which is what CI runs on; and a zero vector would be worse than either, because
+`'[0,0,0]'::vector <=> '[1,2,3]'::vector` is `NaN` in pgvector and would rank unpredictably instead
+of failing loudly.
+
 Two limitations this phase **measured** rather than guessed:
 
 - **Package documentation is unretrievable under the AST strategy.** `f.Doc` is not a declaration,
@@ -218,7 +229,10 @@ The knobs, all validated at boot rather than per job: `CHUNK_STRATEGY`, `CHUNK_W
 `CHUNK_WINDOW_OVERLAP`, `CHUNK_MAX_DECL_LINES`, `STRIP_DOC_COMMENTS`, `EMBED_PROVIDER`,
 `EMBED_MODEL`, `EMBED_DIM`, `EMBED_BATCH`, `OLLAMA_URL`. `EMBED_DIM` is checked against the
 schema's `vector(768)` before the first job runs, because two vector spaces in one column rank
-nonsense confidently and no query would look wrong.
+nonsense confidently and no query would look wrong. For `EMBED_PROVIDER=ollama`, "validated" costs
+one embed call at startup: an address that is not one, a server that is not there and a model that
+was never pulled are each a refusal to boot naming the setting, rather than a failure on the first
+leased job that spends an attempt against its cap for something no retry can fix.
 
 ## The symbol graph, and its honesty
 
