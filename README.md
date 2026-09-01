@@ -15,10 +15,12 @@
 </div>
 
 > **Status: in development. Nothing here is deployed, and most of it is not built yet.**
-> The [design spec](docs/superpowers/specs/2026-08-31-codetrail-design.md) is written and approved,
-> and [P1](docs/superpowers/plans/2026-08-31-p1-ingestion.md) — ingestion — is merged and green in
-> CI. Everything from chunking onward is still ahead. This README says plainly which parts exist.
-> See [Status](#status).
+> The [design spec](docs/superpowers/specs/2026-08-31-codetrail-design.md) is written and approved.
+> [P1](docs/superpowers/plans/2026-08-31-p1-ingestion.md) — ingestion — and
+> [P2](docs/superpowers/plans/2026-09-01-p2-chunking.md) — chunking, embeddings and spans — are
+> merged and green in CI. A repository now goes in and citable spans come out; **nothing retrieves
+> them yet**, and the chunking experiment has not been run. This README says plainly which parts
+> exist. See [Status](#status).
 
 ## What it is
 
@@ -27,9 +29,11 @@ this project exists to attack.
 
 **Code does not chunk like prose.** A paragraph window cuts a function in half and staples its
 second half to the top of the next one. codetrail chunks on the AST — one span per declaration —
-and then *measures* that against a fixed-window baseline instead of asserting it is better. The
-measurement is [§9 of the spec](docs/superpowers/specs/2026-08-31-codetrail-design.md#9-the-eval),
-and it is designed so the questions cannot be authored to flatter the chunker under test.
+and then *measures* that against a fixed-window baseline instead of asserting it is better. Both
+arms exist and both run over real repositories as of P2; the measurement itself is
+[§9 of the spec](docs/superpowers/specs/2026-08-31-codetrail-design.md#9-the-eval), it is designed
+so the questions cannot be authored to flatter the chunker under test, and **it has not been run
+yet**.
 
 **A code citation can be checked.** A prose citation can only be quoted back at you. A code
 citation is `(commit, path, line range, digest)` — it either still holds what was claimed or it
@@ -137,7 +141,7 @@ much of that history is worth keeping is a decision that belongs with the P3 rea
 
 ### What it does today
 
-Both captures below are real terminal output from the merged ingestion phase, not mockups. There is
+All three captures below are real terminal output from the merged phases, not mockups. There is
 no console yet — that is P5 — so there is no UI to screenshot, and inventing one would break the
 rule at the bottom of this file.
 
@@ -149,6 +153,72 @@ A submitted repository is cloned in the sandbox, recorded, and evicted when the 
 
 <img src="assets/screenshots/ingest.png" alt="A repository submitted, indexed, deduplicated and evicted" width="880">
 
+And it is chunked into spans, each carrying the columns a citation is made of — path, line range,
+digest, model — so the range can be checked against the file at that commit:
+
+<img src="assets/screenshots/spans.png" alt="rs/zerolog indexed into 1303 spans, one of them checked against git show and sed" width="880">
+
+
+## Chunking, and the two corpora
+
+**One span per top-level declaration**, carrying its doc comment, with a kind (`func`, `type`,
+`const`, `var`) and a symbol — a method's is receiver-qualified, so `Logger.Info` rather than
+`Info`. A declaration longer than a threshold (200 lines, configurable) is cut into fixed windows
+instead of becoming one useless span, and a file that is not Go — or Go that will not parse — is
+windowed whole. Import declarations are dropped: an import block is not a retrievable unit, and it
+is the one declaration whose text repeats across thousands of files.
+
+**`kind=file` does not say which arm produced a row.** Sub-windowed declarations and unparseable
+files carry it under the AST strategy too, so a repository of generated code produces rows
+indistinguishable from the baseline arm's. The arm is a property of the run, not of the row.
+
+**Fixed windows are a first-class strategy, not only a fallback.** `CHUNK_STRATEGY=window` chunks
+the whole corpus into 40-line windows with 10 lines of overlap and never parses anything. It exists
+so P6 has a baseline to compare against that was not retrofitted after the fact. **No comparison
+has been run, and nothing here claims AST chunking retrieves better** — that is exactly the
+question the eval exists to settle, and asserting it in a README is the failure this design is
+built to avoid.
+
+**The two corpora differ deliberately** (spec §5). The production index **keeps** doc comments,
+because there they are the best retrieval signal a span has. The eval indexes the same repositories
+with doc comments **stripped**, because the golden set's questions *are* that prose: leaving it in
+would make every question a literal substring of its own answer and score both arms on string
+overlap. Stripping blanks the comment bytes and keeps their newlines, so no line number moves and
+both arms still chunk byte-identical input.
+
+**Measured on one real repository**, `rs/zerolog` at `dfd11cca` — 99 files, 1.0 MB, picked because
+it is not all Go and not one file:
+
+| | AST arm | window arm |
+| --- | --- | --- |
+| spans | 1,303 (1,044 `func`, 100 `type`, 73 `file`, 67 `var`, 19 `const`) | 771, all `kind=file` |
+| files with at least one span | 87 of 99 | 88 of 99 |
+
+Embedding dominated everything else: ~147 s with `nomic-embed-text` on CPU, against 18 ms to read
+and chunk the whole checkout and 1.4 s to write all 1,303 spans. Most of that write is the HNSW
+index — 1,303 vectors insert in 33 ms without it and 1,031 ms with — which is not worth acting on
+at this size and would be at a hundred times it. Indexing the same commit twice produced the same
+1,303 span ids, which is what makes a retry safe.
+
+Two limitations this phase **measured** rather than guessed:
+
+- **Package documentation is unretrievable under the AST strategy.** `f.Doc` is not a declaration,
+  so a file holding only a package comment produces no spans at all —
+  `hlog/internal/mutil/mutil.go` above is one, and the window arm covers it while the AST arm does
+  not. An import-only `tools.go` has the same shape. The arms therefore do **not** cover the same
+  set of files, and P6 has to account for that rather than assume it away.
+- **Stripping doc comments moves AST span boundaries.** It moves no *line* — that is what blanking
+  buys — but a declaration's span starts at its doc comment, and a blanked comment is no longer
+  one, so 506 of those 1,303 spans start later in the stripped corpus than in the production one.
+  Gold spans harvested from unstripped source would not name the stripped corpus's rows. A separate
+  consequence: Go that will not parse cannot be stripped, so those files are absent from the eval
+  corpus entirely rather than silently carrying their prose into it.
+
+The knobs, all validated at boot rather than per job: `CHUNK_STRATEGY`, `CHUNK_WINDOW_LINES`,
+`CHUNK_WINDOW_OVERLAP`, `CHUNK_MAX_DECL_LINES`, `STRIP_DOC_COMMENTS`, `EMBED_PROVIDER`,
+`EMBED_MODEL`, `EMBED_DIM`, `EMBED_BATCH`, `OLLAMA_URL`. `EMBED_DIM` is checked against the
+schema's `vector(768)` before the first job runs, because two vector spaces in one column rank
+nonsense confidently and no query would look wrong.
 
 ## The symbol graph, and its honesty
 
@@ -170,7 +240,7 @@ downgraded wholesale.
 | --- | --- | --- |
 | **P0** | Skeleton, schema, migrations, compose, CI with live Postgres | done; CI landed with P1 |
 | **P1** | Ingestion: admission, sandbox, job queue, caps, LRU eviction | done |
-| **P2** | AST chunking, embeddings, spans, window fallback | planned |
+| **P2** | AST chunking, embeddings, spans, window fallback | done |
 | **P3** | Retrieval, citations, extractive ask, measured floor | not started |
 | **P4** | Symbol graph, per-edge provenance, graph endpoints | not started |
 | **P5** | React console | not started |
@@ -180,7 +250,8 @@ downgraded wholesale.
 
 Nothing above is deployed. There is no live instance, no cloud account behind this repository, and
 no benchmark result to quote yet — when there is one, it will come with the numbers that produced
-it.
+it. The figures in [Chunking](#chunking-and-the-two-corpora) are what indexing one repository
+**cost**; nothing yet says which chunking retrieves better, because nothing retrieves at all.
 
 ## Running what exists
 
@@ -189,9 +260,18 @@ make up      # Postgres 17 + pgvector on :55432, migrations apply on first conne
 make test    # hermetic tests
 make lint    # gofmt + go vet
 
-# The tests that matter most: the ones that run against a real database.
+# The tests that matter most: the ones that run against a real database. A repository
+# is indexed end to end into spans here, on the deterministic fake embedder — spec §9
+# requires the mechanics to be provable with no model anywhere, so the live suite
+# defaults to it and refuses any other provider.
 DATABASE_URL='postgres://codetrail:codetrail@localhost:55432/codetrail?sslmode=disable' \
-  go test -tags=live ./packages/shared/...
+  go test -tags=live ./...
+
+# The one check a fake cannot make: that the real model returns the width the schema
+# is built for. Behind its own tag, so CI never needs a model.
+docker compose -f infra/docker-compose.yml --profile ai up -d ollama
+docker compose -f infra/docker-compose.yml exec ollama ollama pull nomic-embed-text
+OLLAMA_URL=http://localhost:11435 go test -tags=ollama ./packages/shared/embed/
 ```
 
 `make psql` opens a shell against the running database.
