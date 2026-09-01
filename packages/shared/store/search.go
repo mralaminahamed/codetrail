@@ -14,11 +14,22 @@ import (
 // rather than low.
 var ErrMixedEmbedders = errors.New("store: repo has spans from more than one embedder")
 
-// VectorSearch ranks one repo's spans by cosine similarity to q (spec §8).
+// vectorSearchSQL is a named constant so a test can EXPLAIN the statement that
+// actually ships rather than a copy of it that can drift out of agreement.
 //
 // The ORDER BY runs on the distance operator rather than on the returned
-// similarity: only that form can use spans_embedding_idx, and sorting on the
-// computed similarity is the same ordering by way of a sequential scan.
+// similarity: only that form can use spans_embedding_idx. Sorting on the
+// computed similarity gives the same ordering and no index path at all — the
+// test measures both halves of that.
+const vectorSearchSQL = `
+	SELECT id, repo_id, file_id, path, kind, symbol, start_line, end_line,
+	       text, digest, 1 - (embedding <=> $2::vector) AS score
+	FROM spans
+	WHERE repo_id = $1 AND embedding IS NOT NULL
+	ORDER BY embedding <=> $2::vector
+	LIMIT $3`
+
+// VectorSearch ranks one repo's spans by cosine similarity to q (spec §8).
 //
 // What leaves this package is the similarity, `1 - distance`. The number is
 // compared against a score floor and put in a response, and a floor on a
@@ -29,13 +40,7 @@ var ErrMixedEmbedders = errors.New("store: repo has spans from more than one emb
 // arm produced a row (P2 measured that the AST strategy emits it too), so a
 // heuristic over it is a heuristic over a label that means two things.
 func (s *Store) VectorSearch(ctx context.Context, repoID string, q []float32, limit int) ([]models.Cite, error) {
-	rows, err := s.pool.Query(ctx, `
-		SELECT id, repo_id, file_id, path, kind, symbol, start_line, end_line,
-		       text, digest, 1 - (embedding <=> $2::vector) AS score
-		FROM spans
-		WHERE repo_id = $1 AND embedding IS NOT NULL
-		ORDER BY embedding <=> $2::vector
-		LIMIT $3`, repoID, vecLiteral(q), limit)
+	rows, err := s.pool.Query(ctx, vectorSearchSQL, repoID, vecLiteral(q), limit)
 	if err != nil {
 		return nil, err
 	}
