@@ -152,3 +152,22 @@ func contains(s, sub string) bool {
 		return false
 	})()
 }
+
+// Every column in repos is written by something. status was not: 0004 added
+// it, nothing set it, and it read as a lifecycle the code does not have.
+func TestReposHasNoUnwrittenStatusColumn(t *testing.T) {
+	st, err := New(context.Background(), dsn(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	var n int
+	if err := st.Pool().QueryRow(context.Background(), `
+		SELECT count(*) FROM information_schema.columns
+		WHERE table_name = 'repos' AND column_name = 'status'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatal("repos.status is back, and nothing writes it")
+	}
+}
