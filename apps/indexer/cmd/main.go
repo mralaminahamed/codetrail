@@ -42,17 +42,21 @@ type limits struct {
 	walk  walk.Limits
 	tries int
 	poll  time.Duration
+	// keepRepos is how many repositories the corpus is allowed to hold. Anyone
+	// may submit one, so something has to bound it; see runJob.
+	keepRepos int
 }
 
-// indexer is the worker: a queue, the three steps of a job, and the caps.
-// clone, walk and put are fields rather than direct calls, so a test can drive
-// a job with no network, no git and no Postgres.
+// indexer is the worker: a queue, the steps of a job, and the caps.
+// clone, walk, put and evict are fields rather than direct calls, so a test can
+// drive a job with no network, no git and no Postgres.
 type indexer struct {
 	log   zerolog.Logger
 	q     queue
 	clone func(ctx context.Context, remote, ref, dir string, lim clone.Limits) (clone.Result, error)
 	walk  func(root string, lim walk.Limits) ([]walk.File, error)
 	put   func(ctx context.Context, r models.Repo, files []models.File) error
+	evict func(ctx context.Context, keep int) (int, error)
 	// hosts is the same allowlist the gateway admits against, applied again
 	// here; see runJob.
 	hosts admit.Policy
@@ -85,6 +89,7 @@ func main() {
 		clone:   clone.Run,
 		walk:    walk.Files,
 		put:     st.PutRepo,
+		evict:   st.Evict,
 		hosts:   admit.NewPolicy(allowedHosts()),
 		id:      workerID(),
 		scratch: config.Get("SCRATCH_DIR", filepath.Join(os.TempDir(), "codetrail")),
@@ -153,6 +158,10 @@ func workerID() string {
 // without this, MAX_REPO_FILES=0 would lease every job in the queue, fail each
 // one on its caps, and burn them all to terminal. Failing one boot is the
 // diagnosable version of that.
+//
+// KEEP_REPOS is here for the same reason and a worse consequence: Evict reads a
+// keep of 0 as "keep nothing", so the typo that means "unlimited" everywhere
+// else would delete the whole corpus after every successful index.
 func limitsFrom() (limits, error) {
 	var err error
 	get := func(key string, def int) int {
@@ -171,8 +180,9 @@ func limitsFrom() (limits, error) {
 			MaxFiles:     get("MAX_REPO_FILES", 20000),
 			MaxFileBytes: int64(get("MAX_FILE_BYTES", 1<<20)),
 		},
-		tries: get("MAX_ATTEMPTS", 3),
-		poll:  time.Duration(get("POLL_SECONDS", 2)) * time.Second,
+		tries:     get("MAX_ATTEMPTS", 3),
+		poll:      time.Duration(get("POLL_SECONDS", 2)) * time.Second,
+		keepRepos: get("KEEP_REPOS", 50),
 	}, err
 }
 
@@ -306,6 +316,19 @@ func (ix *indexer) runJob(ctx context.Context, job jobs.Job) {
 		return
 	}
 	l.Info().Str("commit", res.Commit).Int("files", len(rows)).Int64("bytes", res.Bytes).Msg("indexed")
+
+	// Here rather than on a timer: a successful index is the only thing that
+	// grows the corpus, so it is the only moment the quota can be exceeded.
+	//
+	// A failure is logged and dropped. The rows are written and the lease is
+	// released by now, so there is nothing left to retry, and the next
+	// successful index evicts down to the same bound regardless of how far
+	// over this one left it.
+	if n, err := ix.evict(ctx, ix.lim.keepRepos); err != nil {
+		l.Warn().Err(err).Msg("evict failed")
+	} else if n > 0 {
+		l.Info().Int("evicted", n).Msg("evicted least recently queried repos")
+	}
 }
 
 // fail returns the job to the queue against its attempt budget.

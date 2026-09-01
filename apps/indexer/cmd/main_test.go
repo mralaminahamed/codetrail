@@ -91,6 +91,9 @@ func testIndexer(t *testing.T, q *fakeQueue) (*indexer, *bytes.Buffer) {
 			// ix.lim.tries would otherwise be invisible here.
 			tries: 4,
 			poll:  time.Millisecond,
+			// Likewise distinct from every other number here, so a call that
+			// passes the wrong one is visible.
+			keepRepos: 7,
 		},
 		clone: func(context.Context, string, string, string, clone.Limits) (clone.Result, error) {
 			t.Error("clone ran when it should not have")
@@ -103,6 +106,10 @@ func testIndexer(t *testing.T, q *fakeQueue) (*indexer, *bytes.Buffer) {
 		put: func(context.Context, models.Repo, []models.File) error {
 			t.Error("put ran when it should not have")
 			return errors.New("unexpected put")
+		},
+		evict: func(context.Context, int) (int, error) {
+			t.Error("evict ran when it should not have")
+			return 0, errors.New("unexpected evict")
 		},
 	}
 	return ix, &logged
@@ -120,7 +127,7 @@ func aJob() jobs.Job {
 func TestLimitsRefuseANonPositiveKnob(t *testing.T) {
 	for _, key := range []string{
 		"MAX_REPO_BYTES", "JOB_DEADLINE_SECONDS", "MAX_REPO_FILES",
-		"MAX_FILE_BYTES", "MAX_ATTEMPTS", "POLL_SECONDS",
+		"MAX_FILE_BYTES", "MAX_ATTEMPTS", "POLL_SECONDS", "KEEP_REPOS",
 	} {
 		t.Run(key, func(t *testing.T) {
 			t.Setenv(key, "0")
@@ -147,15 +154,17 @@ func TestLimitsAreWiredToTheCapsTheyName(t *testing.T) {
 	t.Setenv("MAX_FILE_BYTES", "44")
 	t.Setenv("MAX_ATTEMPTS", "55")
 	t.Setenv("POLL_SECONDS", "66")
+	t.Setenv("KEEP_REPOS", "77")
 	lim, err := limitsFrom()
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := limits{
-		clone: clone.Limits{MaxBytes: 11, Deadline: 22 * time.Second},
-		walk:  walk.Limits{MaxFiles: 33, MaxFileBytes: 44},
-		tries: 55,
-		poll:  66 * time.Second,
+		clone:     clone.Limits{MaxBytes: 11, Deadline: 22 * time.Second},
+		walk:      walk.Limits{MaxFiles: 33, MaxFileBytes: 44},
+		tries:     55,
+		poll:      66 * time.Second,
+		keepRepos: 77,
 	}
 	if lim != want {
 		t.Fatalf("want %+v, got %+v", want, lim)
@@ -215,6 +224,11 @@ func TestRunJobIndexesAndCompletes(t *testing.T) {
 		gotRepo, gotFiles = r, f
 		return nil
 	}
+	var keeps []int
+	ix.evict = func(_ context.Context, keep int) (int, error) {
+		keeps = append(keeps, keep)
+		return 0, nil
+	}
 
 	ix.runJob(context.Background(), job)
 
@@ -240,6 +254,11 @@ func TestRunJobIndexesAndCompletes(t *testing.T) {
 	}
 	if len(q.failed) != 0 {
 		t.Errorf("nothing failed, yet: %v", q.failed)
+	}
+	// The corpus grew by one repo, so the quota is checked with the configured
+	// keep — not a literal, which would ignore KEEP_REPOS entirely.
+	if len(keeps) != 1 || keeps[0] != ix.lim.keepRepos {
+		t.Errorf("want one eviction keeping %d, got %v", ix.lim.keepRepos, keeps)
 	}
 }
 
@@ -279,6 +298,7 @@ func TestRunJobRemovesTheScratchTreeOnEveryPath(t *testing.T) {
 		{"everything works", func(ix *indexer) {
 			ix.clone, ix.walk = okClone, okWalk
 			ix.put = func(context.Context, models.Repo, []models.File) error { return nil }
+			ix.evict = func(context.Context, int) (int, error) { return 0, nil }
 		}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -568,5 +588,107 @@ func TestRunLeasesNothingOnceCancelled(t *testing.T) {
 	}
 	if len(q.leases) != 0 {
 		t.Fatalf("leased %d jobs after cancellation", len(q.leases))
+	}
+}
+
+// Eviction runs on a successful index and nowhere else. A successful index is
+// the only thing that grows the corpus, so it is the only moment the quota can
+// be exceeded — and a job that failed, or one whose completion did not land,
+// has no new repo of its own to account for.
+func TestEvictionRunsOnlyAfterAnIndexThatCompleted(t *testing.T) {
+	okClone := func(_ context.Context, _, _, d string, _ clone.Limits) (clone.Result, error) {
+		return clone.Result{Dir: d, Commit: testCommit}, nil
+	}
+	okWalk := func(string, walk.Limits) ([]walk.File, error) { return nil, nil }
+	okPut := func(context.Context, models.Repo, []models.File) error { return nil }
+
+	for _, tc := range []struct {
+		name string
+		q    *fakeQueue
+		set  func(ix *indexer)
+		want bool
+	}{
+		{"indexed and completed", &fakeQueue{}, func(ix *indexer) {
+			ix.clone, ix.walk, ix.put = okClone, okWalk, okPut
+		}, true},
+		{"the write failed", &fakeQueue{}, func(ix *indexer) {
+			ix.clone, ix.walk = okClone, okWalk
+			ix.put = func(context.Context, models.Repo, []models.File) error { return errors.New("write exploded") }
+		}, false},
+		{"the clone failed", &fakeQueue{}, func(ix *indexer) {
+			ix.clone = func(context.Context, string, string, string, clone.Limits) (clone.Result, error) {
+				return clone.Result{}, errors.New("clone exploded")
+			}
+		}, false},
+		// The rows are in by now, so this one is a judgement call rather than a
+		// necessity: the lease was lost, another worker is finishing the same
+		// job, and its own completion evicts. The bound is enforced at the next
+		// successful index either way.
+		{"the completion was refused", &fakeQueue{completeErr: jobs.ErrNotLeased}, func(ix *indexer) {
+			ix.clone, ix.walk, ix.put = okClone, okWalk, okPut
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ix, _ := testIndexer(t, tc.q)
+			tc.set(ix)
+			var ran bool
+			ix.evict = func(_ context.Context, keep int) (int, error) {
+				ran = true
+				if keep != ix.lim.keepRepos {
+					t.Errorf("evicted keeping %d, want %d", keep, ix.lim.keepRepos)
+				}
+				return 0, nil
+			}
+			ix.runJob(context.Background(), aJob())
+			if ran != tc.want {
+				t.Errorf("evict ran: %v, want %v", ran, tc.want)
+			}
+		})
+	}
+}
+
+// The job is done and its lease released by the time eviction runs, so there
+// is nothing left to retry or fail. An eviction that cannot run must therefore
+// say so and leave the job completed — a corpus over quota is a disk problem,
+// a job re-run for it would be a correctness one.
+func TestAFailedEvictionIsLoggedAndDoesNotUncompleteTheJob(t *testing.T) {
+	q := &fakeQueue{}
+	ix, logged := testIndexer(t, q)
+	ix.clone = func(_ context.Context, _, _, d string, _ clone.Limits) (clone.Result, error) {
+		return clone.Result{Dir: d, Commit: testCommit}, nil
+	}
+	ix.walk = func(string, walk.Limits) ([]walk.File, error) { return nil, nil }
+	ix.put = func(context.Context, models.Repo, []models.File) error { return nil }
+	ix.evict = func(context.Context, int) (int, error) { return 0, errors.New("postgres went away") }
+
+	ix.runJob(context.Background(), aJob())
+
+	if out := logged.String(); !strings.Contains(out, "evict") || !strings.Contains(out, "postgres went away") {
+		t.Errorf("a failed eviction left no usable trace: %q", out)
+	}
+	if len(q.completed) != 1 {
+		t.Errorf("the job did not stay completed: %v", q.completed)
+	}
+	if len(q.failed) != 0 {
+		t.Errorf("a failed eviction failed the job: %+v", q.failed)
+	}
+}
+
+// What was dropped is the one number an operator needs to see the corpus being
+// bounded; a silent eviction is indistinguishable from none.
+func TestAnEvictionThatDroppedReposSaysHowMany(t *testing.T) {
+	q := &fakeQueue{}
+	ix, logged := testIndexer(t, q)
+	ix.clone = func(_ context.Context, _, _, d string, _ clone.Limits) (clone.Result, error) {
+		return clone.Result{Dir: d, Commit: testCommit}, nil
+	}
+	ix.walk = func(string, walk.Limits) ([]walk.File, error) { return nil, nil }
+	ix.put = func(context.Context, models.Repo, []models.File) error { return nil }
+	ix.evict = func(context.Context, int) (int, error) { return 3, nil }
+
+	ix.runJob(context.Background(), aJob())
+
+	if out := logged.String(); !strings.Contains(out, `"evicted":3`) {
+		t.Errorf("the eviction count is not in the log: %q", out)
 	}
 }
