@@ -264,14 +264,9 @@ func TestVectorSearchOrderByCanUseTheAnnIndexLive(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	explain := func(orderBy string) string {
+	explain := func(sql string) string {
 		t.Helper()
-		rows, err := tx.Query(ctx, `
-			EXPLAIN SELECT id, 1 - (embedding <=> $2::vector) AS score
-			FROM spans
-			WHERE repo_id = $1 AND embedding IS NOT NULL
-			ORDER BY `+orderBy+`
-			LIMIT $3`, repoID, vecLiteral(query()), 10)
+		rows, err := tx.Query(ctx, "EXPLAIN "+sql, repoID, vecLiteral(query()), 10)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -290,12 +285,16 @@ func TestVectorSearchOrderByCanUseTheAnnIndexLive(t *testing.T) {
 		return strings.Join(plan, "\n")
 	}
 
-	if p := explain(`embedding <=> $2::vector`); !strings.Contains(p, "spans_embedding_idx") {
-		t.Fatalf("the shipped ORDER BY does not reach the ANN index:\n%s", p)
+	if p := explain(vectorSearchSQL); !strings.Contains(p, "spans_embedding_idx") {
+		t.Fatalf("the shipped statement does not reach the ANN index:\n%s", p)
 	}
 	// The counterfactual, run rather than asserted in a comment: the same
 	// query sorted on the similarity it returns has no index path at all.
-	if p := explain(`score DESC`); strings.Contains(p, "spans_embedding_idx") {
+	onScore := strings.Replace(vectorSearchSQL, "ORDER BY embedding <=> $2::vector", "ORDER BY score DESC", 1)
+	if onScore == vectorSearchSQL {
+		t.Fatal("the counterfactual did not rewrite anything; vectorSearchSQL's ORDER BY has changed shape")
+	}
+	if p := explain(onScore); strings.Contains(p, "spans_embedding_idx") {
 		t.Fatalf("ORDER BY score DESC reached the ANN index after all:\n%s", p)
 	}
 }
