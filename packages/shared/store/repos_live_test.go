@@ -11,23 +11,46 @@ import (
 	"github.com/mralaminahamed/codetrail/packages/shared/models"
 )
 
-func TestPutRepoIsIdempotentLive(t *testing.T) {
+// fresh connects and clears the rows this test owns, before it runs and after.
+//
+// Cleanups run LIFO and after every defer, so `defer s.Close()` with a
+// t.Cleanup delete would close the pool first and the delete would run against
+// a dead one. That was not hypothetical: written that way, the delete silently
+// failed, rows from earlier runs accumulated, and "two identical writes leave
+// two files" failed on a third file a previous run had left. Registering Close
+// first is what puts it last.
+func fresh(t *testing.T, ids ...string) *Store {
+	t.Helper()
 	ctx := context.Background()
 	s, err := New(ctx, dsn(t))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	t.Cleanup(s.Close)
+	clear := func() {
+		for _, id := range ids {
+			if _, err := s.pool.Exec(ctx, `DELETE FROM repos WHERE id = $1`, id); err != nil {
+				// Loud: a cleanup that fails quietly is what let the rows pile
+				// up in the first place.
+				t.Errorf("clearing %s: %v", id, err)
+			}
+		}
+	}
+	clear()
+	t.Cleanup(clear)
+	return s
+}
 
+func TestPutRepoIsIdempotentLive(t *testing.T) {
+	ctx := context.Background()
 	const remote, commit = "https://github.com/a/idem", "cafe1234cafe1234cafe1234cafe1234cafe1234"
 	id := RepoID(remote, commit)
+	s := fresh(t, id)
 	r := models.Repo{ID: id, Remote: remote, Ref: "main", Commit: commit}
 	files := []models.File{
 		{ID: FileID(id, "main.go"), RepoID: id, Path: "main.go", Blob: "b1", Lang: "go", Lines: 3},
 		{ID: FileID(id, "a/b.go"), RepoID: id, Path: "a/b.go", Blob: "b2", Lang: "go", Lines: 1},
 	}
-	t.Cleanup(func() { s.pool.Exec(ctx, `DELETE FROM repos WHERE id = $1`, id) })
-
 	// Twice: a retried job after a crash must converge, not duplicate.
 	for i := range 2 {
 		if err := s.PutRepo(ctx, r, files); err != nil {
@@ -79,14 +102,9 @@ func fileCount(t *testing.T, s *Store, id string) int {
 // an orphan sweep is a second system to disagree with the first.
 func TestDeletingARepoCascadesLive(t *testing.T) {
 	ctx := context.Background()
-	s, err := New(ctx, dsn(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-
 	const remote, commit = "https://github.com/a/casc", "beef1234beef1234beef1234beef1234beef1234"
 	id := RepoID(remote, commit)
+	s := fresh(t, id)
 	r := models.Repo{ID: id, Remote: remote, Ref: "main", Commit: commit}
 	if err := s.PutRepo(ctx, r, []models.File{
 		{ID: FileID(id, "x.go"), RepoID: id, Path: "x.go", Blob: "b", Lang: "go", Lines: 1},
@@ -110,19 +128,14 @@ func TestDeletingARepoCascadesLive(t *testing.T) {
 // to move the column eviction will order by.
 func TestGetRepoAndTouchRepoLive(t *testing.T) {
 	ctx := context.Background()
-	s, err := New(ctx, dsn(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
+	const remote, commit = "https://github.com/a/touch", "1234abcd1234abcd1234abcd1234abcd1234abcd"
+	id := RepoID(remote, commit)
+	s := fresh(t, id)
 
 	if _, err := s.GetRepo(ctx, "no-such-repo"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("want ErrNotFound for an unknown id, got %v", err)
 	}
 
-	const remote, commit = "https://github.com/a/touch", "1234abcd1234abcd1234abcd1234abcd1234abcd"
-	id := RepoID(remote, commit)
-	t.Cleanup(func() { s.pool.Exec(ctx, `DELETE FROM repos WHERE id = $1`, id) })
 	if err := s.PutRepo(ctx, models.Repo{ID: id, Remote: remote, Ref: "main", Commit: commit}, nil); err != nil {
 		t.Fatal(err)
 	}
