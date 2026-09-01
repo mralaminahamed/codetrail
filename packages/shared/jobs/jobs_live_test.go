@@ -5,35 +5,72 @@ package jobs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/mralaminahamed/codetrail/packages/shared/store"
+	"github.com/mralaminahamed/codetrail/packages/shared/testdb"
 )
 
-func queue(t *testing.T) *Queue {
-	t.Helper()
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
+// scratchDSN is the database these tests run against: one this suite creates
+// for itself, never the one DATABASE_URL names. Every test here empties the
+// jobs table — leases and dedupe are global properties — and the README tells
+// a reader to run this against the DSN `make up` serves.
+var scratchDSN string
+
+func TestMain(m *testing.M) {
+	base := os.Getenv("DATABASE_URL")
+	if base == "" {
 		// A skipped live suite prints the same "ok" as one that ran, so in CI a
 		// dropped DATABASE_URL would look green with zero live coverage.
 		if os.Getenv("CI") != "" {
-			t.Fatal("DATABASE_URL unset in CI — the live suite must never silently skip")
+			fmt.Fprintln(os.Stderr, "DATABASE_URL unset in CI — the live suite must never silently skip")
+			os.Exit(1)
 		}
+		os.Exit(m.Run()) // every test skips; see queue
+	}
+	code, err := testdb.Scratch(base, "codetrail_jobs", func(d string) int {
+		scratchDSN = d
+		return m.Run()
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	os.Exit(code)
+}
+
+func queue(t *testing.T) *Queue {
+	t.Helper()
+	if scratchDSN == "" {
 		t.Skip("set DATABASE_URL to run")
 	}
-	st, err := store.New(context.Background(), dsn)
+	st, err := store.New(context.Background(), scratchDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(st.Close)
-	// Each test owns the table: leases and dedupe are global properties.
+	// Each test owns the table, which is why it must be this suite's own
+	// database and not the one it was pointed at.
 	if _, err := st.Pool().Exec(context.Background(), `DELETE FROM jobs`); err != nil {
 		t.Fatal(err)
 	}
 	return New(st.Pool())
+}
+
+// The guarantee that DELETE rests on, asserted rather than assumed.
+func TestTheLiveSuiteRunsInADatabaseItCreated(t *testing.T) {
+	q := queue(t)
+	var here string
+	if err := q.pool.QueryRow(context.Background(), `SELECT current_database()`).Scan(&here); err != nil {
+		t.Fatal(err)
+	}
+	if base := testdb.Name(os.Getenv("DATABASE_URL")); here == base {
+		t.Fatalf("the suite is emptying jobs in %s, the database it was pointed at", here)
+	}
 }
 
 // leaseRow reads the bookkeeping Job does not carry. A row that still names a

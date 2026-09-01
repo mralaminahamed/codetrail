@@ -274,6 +274,13 @@ docker compose -f infra/docker-compose.yml exec ollama ollama pull nomic-embed-t
 OLLAMA_URL=http://localhost:11435 go test -tags=ollama ./packages/shared/embed/
 ```
 
+Each live suite **creates a throwaway database of its own** beside the one `DATABASE_URL` names,
+migrates it, and drops it when the suite ends. That is not tidiness: these tests clear whole tables
+— eviction is a whole-corpus operation and the queue's leases are global — and doing that to the
+database you pointed them at is how a corpus disappears while the suite still prints `ok`. The DSN
+above is therefore only ever connected to in order to `CREATE DATABASE` and `DROP DATABASE`, which
+the role it names has to be allowed to do.
+
 `make psql` opens a shell against the running database.
 
 ## How this is built
