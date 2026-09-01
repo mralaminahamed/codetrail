@@ -122,6 +122,14 @@ func TestStrippedSourceWindowsToTheSameRanges(t *testing.T) {
 // That is the one thing blanking does not preserve, and it is harmless — the
 // span still covers all of the code it did. What must not move is the end,
 // because everything below a deleted comment would shift.
+//
+// The equality below is this fixture's, not an invariant. Measured: a
+// declaration 201 lines long *including* a four-line doc comment goes from 7
+// sub-windowed kind=file chunks (3..203) to a single kind=func span (7..203),
+// because stripping drops it under MaxDeclLines. Inside the eval that cannot
+// bite — the corpus is stripped once and both arms chunk the same bytes — but
+// P6 must not harvest gold spans from unstripped source and expect them to name
+// the stripped corpus's rows.
 func TestStrippedSourceStillChunksToTheSameDeclarations(t *testing.T) {
 	src, out, _ := stripped(t, "docs.gotxt")
 	sl := strings.Split(strings.TrimSuffix(string(out), "\n"), "\n")
