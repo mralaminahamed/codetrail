@@ -13,10 +13,14 @@ import "time"
 // not replace the row: spans are keyed by commit so a stale answer can say so
 // rather than quietly citing a line that has moved.
 type Repo struct {
-	ID        string    `json:"id"`
-	Remote    string    `json:"remote"`
-	Ref       string    `json:"ref"`
-	Commit    string    `json:"commit"`
+	ID     string `json:"id"`
+	Remote string `json:"remote"`
+	Ref    string `json:"ref"`
+	Commit string `json:"commit"`
+	// SizeBytes is what the checkout weighed on disk, counting regular files
+	// only. Written at index time because that is the one moment it is known:
+	// the checkout is deleted immediately afterwards.
+	SizeBytes int64     `json:"size_bytes"`
 	IndexedAt time.Time `json:"indexed_at"`
 }
 

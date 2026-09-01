@@ -4,6 +4,7 @@
 
 **Ask a codebase a question. Get an answer that cites `file:line` — and a citation you can check.**
 
+[![CI](https://github.com/mralaminahamed/codetrail/actions/workflows/ci.yml/badge.svg)](https://github.com/mralaminahamed/codetrail/actions/workflows/ci.yml)
 [![Go](https://img.shields.io/badge/Go-1.27-00ADD8.svg?logo=go&logoColor=white)](https://go.dev/)
 [![React](https://img.shields.io/badge/React-19-61DAFB.svg?logo=react&logoColor=black)](https://react.dev/)
 [![Postgres](https://img.shields.io/badge/Postgres-17%20%2B%20pgvector-4169E1.svg?logo=postgresql&logoColor=white)](https://github.com/pgvector/pgvector)
@@ -91,6 +92,16 @@ a suffix match, so `github.com.evil.example` and `pages.github.com` are both ref
 and ports in the URL are refused outright. A rejection names **which rule** fired, because a generic
 `400` tells an operator nothing about what to change.
 
+**One repository is one queued job — including while it waits to retry.** Submitting a repository
+that is already `pending` or `leased` returns the existing job instead of queueing a second clone of
+it, matched case-insensitively so `octocat/Spoon-Knife` and `OctoCat/spoon-knife` are one job. A job
+that fails an attempt goes back to `pending` and waits out a backoff, and a waiting job is still
+`pending`, so it still holds the slot: **re-submitting during the wait returns the waiting job and
+does not start it any sooner**, and there is no way to force an earlier retry. With the default
+three attempts the waits are 30s and then 60s. That is intended — hammering a forge that is down is
+worse than waiting — but the API answers `202` with the existing job either way, so it is written
+here rather than left to be inferred from a job that does not move.
+
 **The clone is shallow, single-branch, blob-filtered**, runs in its own process group under a
 wall-clock deadline so the timeout kills `git`'s children too, and has `GIT_TERMINAL_PROMPT=0` with
 a neutered `GIT_ASKPASS` so a private URL fails immediately instead of blocking forever on a
@@ -100,17 +111,27 @@ anything.
 
 **The walker never follows a symlink.** A repository can contain `link -> /etc/passwd`, and a naive
 walk reads and indexes it. Anything that is not a regular file is skipped outright. This is a
-vulnerability, not a hardening nicety, and it has a committed fixture and a test that fails when the
-guard is removed.
+vulnerability, not a hardening nicety, and the guards are mutation-checked rather than assumed:
+removing `O_NOFOLLOW` fails two tests, and removing all three of the link, type and fstat guards
+fails ten. Every symlink, fifo and device fixture is built at runtime — nothing symlink-shaped is
+committed, because checking this repository out should not require any.
 
 **What the allowlist does not buy.** Host-allowlisting is the SSRF control. It does **not** defend
 against a hostile allowlisted forge, and codetrail claims no DNS-rebinding protection: `git` is a
 subprocess and cannot be handed a validating dialer. That is a real limitation and it is written
 here rather than left for someone to discover.
 
-**Nothing grows without bound.** Hard admission caps plus LRU eviction on last-queried time. Anyone
-may submit; a popular repository stays warm; the least recently queried one goes when the quota is
-reached, in a single `DELETE` that cascades.
+**Configuring the allowlist.** `ALLOWED_HOSTS` is a comma-separated list of exact hosts, and it
+replaces the default (`github.com`, `codeberg.org`) rather than extending it. One limitation to
+know before setting it: an accepted path is exactly `/owner/name`, so a forge that nests namespaces
+deeper is only half served — adding `gitlab.com` accepts `group/repo` and refuses
+`group/subgroup/repo`.
+
+**The corpus does not grow without bound.** Hard admission caps plus LRU eviction on last-queried
+time. Anyone may submit; a popular repository stays warm; the least recently queried one goes when
+the quota is reached, in a single `DELETE` that cascades. The `jobs` table is the exception and is
+deliberately not bounded yet: re-submitting a repository that has finished appends a row, and how
+much of that history is worth keeping is a decision that belongs with the P3 read endpoints.
 
 ## The symbol graph, and its honesty
 
@@ -130,8 +151,8 @@ downgraded wholesale.
 
 | Phase | Delivers | State |
 | --- | --- | --- |
-| **P0** | Skeleton, schema, migrations, compose, CI with live Postgres | schema and migrations done; CI is P1 Task 1 |
-| **P1** | Ingestion: admission, sandbox, job queue, caps, LRU eviction | **planned**, in progress |
+| **P0** | Skeleton, schema, migrations, compose, CI with live Postgres | done; CI landed with P1 |
+| **P1** | Ingestion: admission, sandbox, job queue, caps, LRU eviction | done |
 | **P2** | AST chunking, embeddings, spans, window fallback | not started |
 | **P3** | Retrieval, citations, extractive ask, measured floor | not started |
 | **P4** | Symbol graph, per-edge provenance, graph endpoints | not started |

@@ -149,10 +149,11 @@ Pure, hermetic, and the first line of the sandbox. No network, no filesystem, no
 - Produces:
   - `type Rule string` with `RuleForm`, `RuleScheme`, `RuleHost`
   - `type Error struct { Rule Rule; Detail string }` implementing `error`
-  - `type Remote struct { URL, Host, Owner, Name string }`
+  - `type Remote struct { URL, Key, Host, Owner, Name string }` — `Key` is the case-folded
+    identity, `URL` the submitted spelling
   - `type Policy struct{ ... }`, `func NewPolicy(hosts []string) Policy`
   - `func (p Policy) Check(raw string) (Remote, error)`
-  - `var DefaultHosts = []string{"github.com", "gitlab.com", "codeberg.org"}`
+  - `var DefaultHosts = []string{"github.com", "codeberg.org"}`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -341,15 +342,27 @@ type Error struct {
 func (e *Error) Error() string { return fmt.Sprintf("admit: %s: %s", e.Rule, e.Detail) }
 
 // Remote is an accepted, normalised repository reference.
+//
+// URL keeps the case the submitter typed, because a forge preserves the
+// display case of an owner and a repository and that is what a citation has
+// to show. Key is the identity: forges match owner and name
+// case-insensitively, so two spellings are one repository and anything that
+// keys on a repository keys on this, not on URL.
 type Remote struct {
 	URL   string
+	Key   string
 	Host  string
 	Owner string
 	Name  string
 }
 
 // DefaultHosts is the allowlist a deployment gets if it configures none.
-var DefaultHosts = []string{"github.com", "gitlab.com", "codeberg.org"}
+//
+// gitlab.com is deliberately absent: GitLab nests namespaces arbitrarily
+// (group/subgroup/repo), which the /owner/name path check refuses, so shipping
+// it by default would advertise a forge whose typical URL we reject. Adding it
+// back means teaching Check about nested namespaces first.
+var DefaultHosts = []string{"github.com", "codeberg.org"}
 
 type Policy struct{ hosts map[string]bool }
 
@@ -393,23 +406,54 @@ func (p Policy) Check(raw string) (Remote, error) {
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		return Remote{}, &Error{RuleForm, "path must be /owner/name"}
 	}
-	owner, name := parts[0], strings.TrimSuffix(parts[1], ".git")
+	// Repeatedly, not once: a forge serves /owner/foo.git and /owner/foo.git.git
+	// as the same repository, and one trim would leave "foo.git" as a second
+	// identity for it. No forge here allows a name that really ends in ".git".
+	owner, name := parts[0], parts[1]
+	for strings.HasSuffix(name, ".git") {
+		name = strings.TrimSuffix(name, ".git")
+	}
 	if name == "" {
 		return Remote{}, &Error{RuleForm, "path must be /owner/name"}
 	}
+	if !validSegment(owner) {
+		return Remote{}, &Error{RuleForm, fmt.Sprintf("owner %q is not a plain name", owner)}
+	}
+	if !validSegment(name) {
+		return Remote{}, &Error{RuleForm, fmt.Sprintf("name %q is not a plain name", name)}
+	}
 	return Remote{
 		URL:   "https://" + host + "/" + owner + "/" + name,
+		Key:   host + "/" + strings.ToLower(owner) + "/" + strings.ToLower(name),
 		Host:  host,
 		Owner: owner,
 		Name:  name,
 	}, nil
+}
+
+// Owner and Name are exported, so anything downstream may join them into a
+// path. Allowlist the charset rather than blacklisting the escapes, and refuse
+// the two relative names the charset would otherwise let through.
+func validSegment(s string) bool {
+	if s == "" || s == "." || s == ".." {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '.', r == '_', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 ```
 
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `go test ./packages/shared/admit/ -count=1 -v`
-Expected: PASS, all eight tests.
+Expected: PASS.
 
 - [ ] **Step 5: Prove the tests discriminate**
 
@@ -1420,8 +1464,11 @@ func Run(ctx context.Context, remote, ref, dir string, lim Limits) (Result, erro
 	}
 	cleanup := func() { _ = os.RemoveAll(dir) }
 
-	// --depth 1 and --filter=blob:none keep history and unreferenced blobs out
-	// of the fetch; --single-branch keeps every other ref out of it.
+	// --depth 1 keeps history out of the fetch and --single-branch keeps every
+	// other ref out. --filter=blob:none does NOT keep blobs out of a clone that
+	// checks out: the checkout refetches them all, and the filtered .git ends up
+	// marginally larger (measured: 29712 vs 29560 bytes). It is kept only for
+	// the partial-clone promisor metadata, not as a size control.
 	args := []string{
 		"clone", "--quiet", "--depth", "1", "--single-branch",
 		"--filter=blob:none", "--no-tags",
@@ -1614,6 +1661,13 @@ func TestListsRegularFilesWithRelativePaths(t *testing.T) {
 
 // THE security test. A repository can contain `link -> /etc/passwd`; a walker
 // that follows it reads and indexes the host's files.
+//
+// The file link is what discriminates: against a walker with no guard it is
+// read and indexed with its real contents. The directory link is a second
+// case, and it must be asserted SEPARATELY — a walk that follows it fails with
+// EISDIR and aborts before this test's own assertions run, so a combined
+// fixture kills the mutant on an unrelated error and reports coverage it does
+// not have.
 func TestNeverFollowsSymlinks(t *testing.T) {
 	root := tree(t, map[string]string{"main.go": "package main\n"})
 	outside := filepath.Join(t.TempDir(), "secret.txt")
@@ -2158,7 +2212,15 @@ func main() {
 			sleep(ctx, idle)
 			continue
 		}
-		runJob(ctx, log, st, q, job, lim, scratch)
+		runJob(ctx, log, st, q, job, worker, lim, scratch)
+	}
+}
+
+// fail records a job failure, logging when the lease was already lost — the
+// four call sites discarded this error before Complete and Fail could report it.
+func fail(ctx context.Context, l zerolog.Logger, q *jobs.Queue, id, worker, reason string, tries int) {
+	if err := q.Fail(ctx, id, worker, reason, tries); err != nil {
+		l.Warn().Err(err).Msg("could not record failure: lease no longer held")
 	}
 }
 
@@ -2172,7 +2234,7 @@ func sleep(ctx context.Context, d time.Duration) {
 }
 
 func runJob(ctx context.Context, log zerolog.Logger, st *store.Store, q *jobs.Queue,
-	job jobs.Job, lim limits, scratch string) {
+	job jobs.Job, worker string, lim limits, scratch string) {
 
 	l := log.With().Str("job", job.ID).Str("remote", job.Remote).Logger()
 	dir := filepath.Join(scratch, job.ID)
@@ -2183,13 +2245,13 @@ func runJob(ctx context.Context, log zerolog.Logger, st *store.Store, q *jobs.Qu
 	res, err := clone.Run(ctx, job.Remote, job.Ref, dir, lim.clone)
 	if err != nil {
 		l.Warn().Err(err).Msg("clone failed")
-		_ = q.Fail(ctx, job.ID, err.Error(), lim.tries)
+		fail(ctx, l, q, job.ID, worker, err.Error(), lim.tries)
 		return
 	}
 	files, err := walk.Files(res.Dir, lim.walk)
 	if err != nil {
 		l.Warn().Err(err).Msg("walk failed")
-		_ = q.Fail(ctx, job.ID, err.Error(), lim.tries)
+		fail(ctx, l, q, job.ID, worker, err.Error(), lim.tries)
 		return
 	}
 
@@ -2204,11 +2266,14 @@ func runJob(ctx context.Context, log zerolog.Logger, st *store.Store, q *jobs.Qu
 	repo := models.Repo{ID: repoID, Remote: job.Remote, Ref: job.Ref, Commit: res.Commit}
 	if err := st.PutRepo(ctx, repo, rows); err != nil {
 		l.Error().Err(err).Msg("write failed")
-		_ = q.Fail(ctx, job.ID, err.Error(), lim.tries)
+		fail(ctx, l, q, job.ID, worker, err.Error(), lim.tries)
 		return
 	}
-	if err := q.Complete(ctx, job.ID); err != nil {
-		l.Error().Err(err).Msg("complete failed")
+	if err := q.Complete(ctx, job.ID, worker); err != nil {
+		// ErrNotLeased here means this worker's lease expired and another
+		// indexer took the job. Losing the race is normal; completing someone
+		// else's job would not be.
+		l.Warn().Err(err).Msg("could not complete: lease no longer held")
 		return
 	}
 	l.Info().Str("commit", res.Commit).Int("files", len(rows)).Int64("bytes", res.Bytes).Msg("indexed")
