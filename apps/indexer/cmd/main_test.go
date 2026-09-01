@@ -3,18 +3,26 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/rs/zerolog"
 
 	"github.com/mralaminahamed/codetrail/apps/indexer/internal/clone"
 	"github.com/mralaminahamed/codetrail/apps/indexer/internal/walk"
 	"github.com/mralaminahamed/codetrail/packages/shared/admit"
+	"github.com/mralaminahamed/codetrail/packages/shared/chunk"
+	"github.com/mralaminahamed/codetrail/packages/shared/embed"
 	"github.com/mralaminahamed/codetrail/packages/shared/jobs"
 	"github.com/mralaminahamed/codetrail/packages/shared/models"
 	"github.com/mralaminahamed/codetrail/packages/shared/store"
@@ -34,11 +42,19 @@ type fakeQueue struct {
 	completeErr error
 	failErr     error
 	stop        func()
+	// blockUntilDone makes the two writes wait for their context, which is how
+	// a pool that has stopped answering behaves.
+	blockUntilDone bool
 
 	leases    []string
 	leaseFor  []time.Duration
 	completed []string
 	failed    []failCall
+	// The error state of the context each write was made with. A job that ran
+	// out of time is the one whose failure most needs recording, and a write on
+	// the context that just expired records nothing.
+	completedCtx []error
+	failedCtx    []error
 }
 
 func (q *fakeQueue) Lease(_ context.Context, worker string, d time.Duration) (jobs.Job, bool, error) {
@@ -58,13 +74,21 @@ func (q *fakeQueue) Lease(_ context.Context, worker string, d time.Duration) (jo
 	return j, true, nil
 }
 
-func (q *fakeQueue) Complete(_ context.Context, id, worker string) error {
+func (q *fakeQueue) Complete(ctx context.Context, id, worker string) error {
+	if q.blockUntilDone {
+		<-ctx.Done()
+	}
 	q.completed = append(q.completed, id+"@"+worker)
+	q.completedCtx = append(q.completedCtx, ctx.Err())
 	return q.completeErr
 }
 
-func (q *fakeQueue) Fail(_ context.Context, id, worker, reason string, max int) error {
+func (q *fakeQueue) Fail(ctx context.Context, id, worker, reason string, max int) error {
+	if q.blockUntilDone {
+		<-ctx.Done()
+	}
 	q.failed = append(q.failed, failCall{id, worker, reason, max})
+	q.failedCtx = append(q.failedCtx, ctx.Err())
 	return q.failErr
 }
 
@@ -94,18 +118,29 @@ func testIndexer(t *testing.T, q *fakeQueue) (*indexer, *bytes.Buffer) {
 			// Likewise distinct from every other number here, so a call that
 			// passes the wrong one is visible.
 			keepRepos: 7,
+			// Small enough that a fixture of a few spans crosses batches: a
+			// batch loop that stops after the first is invisible at 32.
+			embedBatch: 2,
 		},
+		// The embedder is a dependency, not a step: anything that reaches the
+		// chunker needs one, and spec §9 puts the fake in CI.
+		emb: embed.NewFake(store.EmbeddingDim),
+		opt: chunk.Defaults(),
 		clone: func(context.Context, string, string, string, clone.Limits) (clone.Result, error) {
 			t.Error("clone ran when it should not have")
 			return clone.Result{}, errors.New("unexpected clone")
 		},
-		walk: func(string, walk.Limits) ([]walk.File, error) {
+		walk: func(context.Context, string, walk.Limits) ([]walk.File, error) {
 			t.Error("walk ran when it should not have")
 			return nil, errors.New("unexpected walk")
 		},
 		put: func(context.Context, models.Repo, []models.File) error {
 			t.Error("put ran when it should not have")
 			return errors.New("unexpected put")
+		},
+		putSpans: func(context.Context, string, []store.EmbeddedSpan, string, int) error {
+			t.Error("putSpans ran when it should not have")
+			return errors.New("unexpected putSpans")
 		},
 		evict: func(context.Context, int) (int, error) {
 			t.Error("evict ran when it should not have")
@@ -117,6 +152,31 @@ func testIndexer(t *testing.T, q *fakeQueue) (*indexer, *bytes.Buffer) {
 
 const testCommit = "0123456789abcdef0123456789abcdef01234567"
 
+func okPutSpans(context.Context, string, []store.EmbeddedSpan, string, int) error { return nil }
+
+// writeCheckout puts the given files on disk under dir. The chunk pass reads
+// every walked file a second time, so a walk that names a file the checkout
+// does not hold is a job that fails on the missing file.
+func writeCheckout(t *testing.T, dir string, files map[string]string) {
+	t.Helper()
+	for name, body := range files {
+		p := filepath.Join(dir, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// Two files with different shapes: the Go one takes the AST arm, the markdown
+// one the window fallback, so a job that indexed only one of them is visible.
+const (
+	mainGo   = "package main\n\nfunc main() {}\n"
+	readmeMD = "# hi\n"
+)
+
 func aJob() jobs.Job {
 	return jobs.Job{ID: "job1", Remote: "https://github.com/a/b", Ref: "main", Status: jobs.StatusLeased, Attempts: 1}
 }
@@ -127,7 +187,7 @@ func aJob() jobs.Job {
 func TestLimitsRefuseANonPositiveKnob(t *testing.T) {
 	for _, key := range []string{
 		"MAX_REPO_BYTES", "JOB_DEADLINE_SECONDS", "MAX_REPO_FILES",
-		"MAX_FILE_BYTES", "MAX_ATTEMPTS", "POLL_SECONDS", "KEEP_REPOS",
+		"MAX_FILE_BYTES", "MAX_ATTEMPTS", "POLL_SECONDS", "KEEP_REPOS", "EMBED_BATCH",
 	} {
 		t.Run(key, func(t *testing.T) {
 			t.Setenv(key, "0")
@@ -155,16 +215,18 @@ func TestLimitsAreWiredToTheCapsTheyName(t *testing.T) {
 	t.Setenv("MAX_ATTEMPTS", "55")
 	t.Setenv("POLL_SECONDS", "66")
 	t.Setenv("KEEP_REPOS", "77")
+	t.Setenv("EMBED_BATCH", "88")
 	lim, err := limitsFrom()
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := limits{
-		clone:     clone.Limits{MaxBytes: 11, Deadline: 22 * time.Second},
-		walk:      walk.Limits{MaxFiles: 33, MaxFileBytes: 44},
-		tries:     55,
-		poll:      66 * time.Second,
-		keepRepos: 77,
+		clone:      clone.Limits{MaxBytes: 11, Deadline: 22 * time.Second},
+		walk:       walk.Limits{MaxFiles: 33, MaxFileBytes: 44},
+		tries:      55,
+		poll:       66 * time.Second,
+		keepRepos:  77,
+		embedBatch: 88,
 	}
 	if lim != want {
 		t.Fatalf("want %+v, got %+v", want, lim)
@@ -204,9 +266,10 @@ func TestRunJobIndexesAndCompletes(t *testing.T) {
 		if lim != ix.lim.clone {
 			t.Errorf("clone got limits %+v, want %+v", lim, ix.lim.clone)
 		}
+		writeCheckout(t, d, map[string]string{"main.go": mainGo, "a/b.md": readmeMD})
 		return clone.Result{Dir: d, Commit: testCommit, Bytes: 4096}, nil
 	}
-	ix.walk = func(root string, lim walk.Limits) ([]walk.File, error) {
+	ix.walk = func(_ context.Context, root string, lim walk.Limits) ([]walk.File, error) {
 		if root != dir {
 			t.Errorf("walk got root %q, want the clone's dir %q", root, dir)
 		}
@@ -224,6 +287,16 @@ func TestRunJobIndexesAndCompletes(t *testing.T) {
 		gotRepo, gotFiles = r, f
 		return nil
 	}
+	var gotSpans []store.EmbeddedSpan
+	var gotModel string
+	var gotDim int
+	ix.putSpans = func(_ context.Context, r string, sp []store.EmbeddedSpan, model string, dim int) error {
+		if r != store.RepoID("github.com/a/b", testCommit) {
+			t.Errorf("putSpans got repo %q", r)
+		}
+		gotSpans, gotModel, gotDim = sp, model, dim
+		return nil
+	}
 	var keeps []int
 	ix.evict = func(_ context.Context, keep int) (int, error) {
 		keeps = append(keeps, keep)
@@ -239,8 +312,10 @@ func TestRunJobIndexesAndCompletes(t *testing.T) {
 		t.Errorf("repo: want %+v, got %+v", wantRepo, gotRepo)
 	}
 	want := []models.File{
-		{ID: store.FileID(repoID, "main.go"), RepoID: repoID, Path: "main.go", Lang: "go", Lines: 3},
-		{ID: store.FileID(repoID, "a/b.md"), RepoID: repoID, Path: "a/b.md", Lang: "markdown", Lines: 1},
+		{ID: store.FileID(repoID, "main.go"), RepoID: repoID, Path: "main.go",
+			Blob: blobHash([]byte(mainGo)), Lang: "go", Lines: 3},
+		{ID: store.FileID(repoID, "a/b.md"), RepoID: repoID, Path: "a/b.md",
+			Blob: blobHash([]byte(readmeMD)), Lang: "markdown", Lines: 1},
 	}
 	if len(gotFiles) != len(want) {
 		t.Fatalf("want %d files, got %d", len(want), len(gotFiles))
@@ -249,6 +324,34 @@ func TestRunJobIndexesAndCompletes(t *testing.T) {
 		if gotFiles[i] != want[i] {
 			t.Errorf("file %d: want %+v, got %+v", i, want[i], gotFiles[i])
 		}
+	}
+	// The AST arm for the Go file, the window fallback for the markdown one —
+	// with the text, the range and the digest each row is cited by.
+	wantSpans := []models.Span{
+		{ID: store.SpanID(repoID, "main.go", 3, 3, store.Digest("func main() {}")),
+			RepoID: repoID, FileID: store.FileID(repoID, "main.go"), Path: "main.go",
+			Kind: models.KindFunc, Symbol: "main", StartLine: 3, EndLine: 3,
+			Text: "func main() {}", Digest: store.Digest("func main() {}")},
+		{ID: store.SpanID(repoID, "a/b.md", 1, 1, store.Digest("# hi")),
+			RepoID: repoID, FileID: store.FileID(repoID, "a/b.md"), Path: "a/b.md",
+			Kind: models.KindFile, StartLine: 1, EndLine: 1,
+			Text: "# hi", Digest: store.Digest("# hi")},
+	}
+	if len(gotSpans) != len(wantSpans) {
+		t.Fatalf("want %d spans, got %d: %+v", len(wantSpans), len(gotSpans), gotSpans)
+	}
+	for i := range wantSpans {
+		if gotSpans[i].Span != wantSpans[i] {
+			t.Errorf("span %d: want %+v, got %+v", i, wantSpans[i], gotSpans[i].Span)
+		}
+		if len(gotSpans[i].Embedding) != store.EmbeddingDim {
+			t.Errorf("span %d carries %d components, want %d", i, len(gotSpans[i].Embedding), store.EmbeddingDim)
+		}
+	}
+	// Written per row, so a corpus built with the fake is identifiable in the
+	// data rather than from whoever remembers how it was run.
+	if gotModel != ix.emb.Model() || gotDim != ix.emb.Dim() {
+		t.Errorf("spans recorded model %q dim %d, want %q and %d", gotModel, gotDim, ix.emb.Model(), ix.emb.Dim())
 	}
 	if len(q.completed) != 1 || q.completed[0] != job.ID+"@"+testWorker {
 		t.Errorf("want the job completed as this worker, got %v", q.completed)
@@ -271,9 +374,9 @@ func TestRunJobRemovesTheScratchTreeOnEveryPath(t *testing.T) {
 		if err := os.MkdirAll(filepath.Join(d, "sub"), 0o700); err != nil {
 			return clone.Result{}, err
 		}
-		return clone.Result{Dir: d, Commit: testCommit}, os.WriteFile(filepath.Join(d, "sub", "f.go"), []byte("x"), 0o600)
+		return clone.Result{Dir: d, Commit: testCommit}, os.WriteFile(filepath.Join(d, "sub", "f.go"), []byte("package p\n"), 0o600)
 	}
-	okWalk := func(string, walk.Limits) ([]walk.File, error) {
+	okWalk := func(context.Context, string, walk.Limits) ([]walk.File, error) {
 		return []walk.File{{Path: "sub/f.go", Lang: "go", Lines: 1}}, nil
 	}
 
@@ -290,15 +393,25 @@ func TestRunJobRemovesTheScratchTreeOnEveryPath(t *testing.T) {
 		}, true},
 		{"walk fails", func(ix *indexer) {
 			ix.clone = okClone
-			ix.walk = func(string, walk.Limits) ([]walk.File, error) { return nil, errors.New("walk exploded") }
+			ix.walk = func(context.Context, string, walk.Limits) ([]walk.File, error) {
+				return nil, errors.New("walk exploded")
+			}
 		}, true},
 		{"write fails", func(ix *indexer) {
 			ix.clone, ix.walk = okClone, okWalk
 			ix.put = func(context.Context, models.Repo, []models.File) error { return errors.New("write exploded") }
 		}, true},
+		{"the span write fails", func(ix *indexer) {
+			ix.clone, ix.walk = okClone, okWalk
+			ix.put = func(context.Context, models.Repo, []models.File) error { return nil }
+			ix.putSpans = func(context.Context, string, []store.EmbeddedSpan, string, int) error {
+				return errors.New("spans exploded")
+			}
+		}, true},
 		{"everything works", func(ix *indexer) {
 			ix.clone, ix.walk = okClone, okWalk
 			ix.put = func(context.Context, models.Repo, []models.File) error { return nil }
+			ix.putSpans = okPutSpans
 			ix.evict = func(context.Context, int) (int, error) { return 0, nil }
 		}, false},
 	} {
@@ -443,8 +556,9 @@ func TestALostLeaseIsLogged(t *testing.T) {
 			ix.clone = func(_ context.Context, _, _, d string, _ clone.Limits) (clone.Result, error) {
 				return clone.Result{Dir: d, Commit: testCommit}, nil
 			}
-			ix.walk = func(string, walk.Limits) ([]walk.File, error) { return nil, nil }
+			ix.walk = func(context.Context, string, walk.Limits) ([]walk.File, error) { return nil, nil }
 			ix.put = func(context.Context, models.Repo, []models.File) error { return nil }
+			ix.putSpans = okPutSpans
 
 			ix.runJob(context.Background(), aJob())
 			out := logged.String()
@@ -600,7 +714,7 @@ func TestEvictionRunsOnlyAfterAnIndexThatCompleted(t *testing.T) {
 	okClone := func(_ context.Context, _, _, d string, _ clone.Limits) (clone.Result, error) {
 		return clone.Result{Dir: d, Commit: testCommit}, nil
 	}
-	okWalk := func(string, walk.Limits) ([]walk.File, error) { return nil, nil }
+	okWalk := func(context.Context, string, walk.Limits) ([]walk.File, error) { return nil, nil }
 	okPut := func(context.Context, models.Repo, []models.File) error { return nil }
 
 	for _, tc := range []struct {
@@ -610,7 +724,7 @@ func TestEvictionRunsOnlyAfterAnIndexThatCompleted(t *testing.T) {
 		want bool
 	}{
 		{"indexed and completed", &fakeQueue{}, func(ix *indexer) {
-			ix.clone, ix.walk, ix.put = okClone, okWalk, okPut
+			ix.clone, ix.walk, ix.put, ix.putSpans = okClone, okWalk, okPut, okPutSpans
 		}, true},
 		{"the write failed", &fakeQueue{}, func(ix *indexer) {
 			ix.clone, ix.walk = okClone, okWalk
@@ -626,7 +740,7 @@ func TestEvictionRunsOnlyAfterAnIndexThatCompleted(t *testing.T) {
 		// job, and its own completion evicts. The bound is enforced at the next
 		// successful index either way.
 		{"the completion was refused", &fakeQueue{completeErr: jobs.ErrNotLeased}, func(ix *indexer) {
-			ix.clone, ix.walk, ix.put = okClone, okWalk, okPut
+			ix.clone, ix.walk, ix.put, ix.putSpans = okClone, okWalk, okPut, okPutSpans
 		}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -658,8 +772,9 @@ func TestAFailedEvictionIsLoggedAndDoesNotUncompleteTheJob(t *testing.T) {
 	ix.clone = func(_ context.Context, _, _, d string, _ clone.Limits) (clone.Result, error) {
 		return clone.Result{Dir: d, Commit: testCommit}, nil
 	}
-	ix.walk = func(string, walk.Limits) ([]walk.File, error) { return nil, nil }
+	ix.walk = func(context.Context, string, walk.Limits) ([]walk.File, error) { return nil, nil }
 	ix.put = func(context.Context, models.Repo, []models.File) error { return nil }
+	ix.putSpans = okPutSpans
 	ix.evict = func(context.Context, int) (int, error) { return 0, errors.New("postgres went away") }
 
 	ix.runJob(context.Background(), aJob())
@@ -683,8 +798,9 @@ func TestAnEvictionThatDroppedReposSaysHowMany(t *testing.T) {
 	ix.clone = func(_ context.Context, _, _, d string, _ clone.Limits) (clone.Result, error) {
 		return clone.Result{Dir: d, Commit: testCommit}, nil
 	}
-	ix.walk = func(string, walk.Limits) ([]walk.File, error) { return nil, nil }
+	ix.walk = func(context.Context, string, walk.Limits) ([]walk.File, error) { return nil, nil }
 	ix.put = func(context.Context, models.Repo, []models.File) error { return nil }
+	ix.putSpans = okPutSpans
 	ix.evict = func(context.Context, int) (int, error) { return 3, nil }
 
 	ix.runJob(context.Background(), aJob())
@@ -706,9 +822,10 @@ func TestCaseVariantRemotesIndexToOneRepo(t *testing.T) {
 			if r != remote {
 				t.Errorf("cloned %q, want the submitted %q", r, remote)
 			}
+			writeCheckout(t, d, map[string]string{"main.go": "package main\n"})
 			return clone.Result{Dir: d, Commit: testCommit, Bytes: 1}, nil
 		}
-		ix.walk = func(string, walk.Limits) ([]walk.File, error) {
+		ix.walk = func(context.Context, string, walk.Limits) ([]walk.File, error) {
 			return []walk.File{{Path: "main.go", Lang: "go", Lines: 1, Bytes: 1}}, nil
 		}
 		var got models.Repo
@@ -716,6 +833,7 @@ func TestCaseVariantRemotesIndexToOneRepo(t *testing.T) {
 			got = r
 			return nil
 		}
+		ix.putSpans = okPutSpans
 		ix.evict = func(context.Context, int) (int, error) { return 0, nil }
 		ix.runJob(context.Background(), jobs.Job{
 			ID: "j", Remote: remote, Ref: "main", Status: jobs.StatusLeased, Attempts: 1,
@@ -730,5 +848,727 @@ func TestCaseVariantRemotesIndexToOneRepo(t *testing.T) {
 	}
 	if a.Remote == b.Remote {
 		t.Fatalf("both rows carry %q; the submitted spelling was rewritten", a.Remote)
+	}
+}
+
+// The fixture repository the wiring tests index. Six files on purpose: one
+// file hides an ordering or a batching fault, and a repository of nothing but
+// parseable Go never takes the window fallback, so neither shape would tell a
+// wired pipeline from a half-wired one.
+var fixtureRepo = map[string]string{
+	"a.go":       "package p\n\n// F does a thing.\nfunc F() {}\n",
+	"b/util.go":  "package b\n\n// Helper explains itself.\nfunc Helper() int { return 1 }\n",
+	"broken.go":  "package p\n\nfunc (\n",
+	"README.md":  "# title\n\nsome prose\n",
+	"logo.png":   "\x89PNG\r\n\x1a\n\x00\xff",
+	"corrupt.go": "package p\n\xff\x00\n",
+}
+
+// recorder is what one hermetic job wrote: the rows, the spans, the order of
+// the two writes, and the deadline each stage was handed.
+type recorder struct {
+	*fakeQueue
+	logged    *bytes.Buffer
+	files     []models.File
+	spans     []store.EmbeddedSpan
+	model     string
+	dim       int
+	order     []string
+	deadlines map[string]time.Time
+}
+
+func (r *recorder) failReason() string {
+	if len(r.failed) == 0 {
+		return ""
+	}
+	return r.failed[0].reason
+}
+
+// spansByPath maps each path to its spans as "kind:symbol", which is what
+// distinguishes the AST arm from the window arm row by row.
+func (r *recorder) spansByPath() map[string][]string {
+	out := map[string][]string{}
+	for _, s := range r.spans {
+		out[s.Path] = append(out[s.Path], string(s.Kind)+":"+s.Symbol)
+	}
+	return out
+}
+
+// recordingEmbedder notes the deadline it was called under, and can block on
+// it: the embedder is the slowest stage, so it is where a per-stage deadline
+// would be worth the most extra time.
+type recordingEmbedder struct {
+	embed.Embedder
+	rec   *recorder
+	block bool
+}
+
+func (e recordingEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+	if d, ok := ctx.Deadline(); ok {
+		e.rec.deadlines["embed"] = d
+	}
+	if e.block {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return e.Embedder.Embed(ctx, texts)
+}
+
+type fixture struct {
+	files map[string]string
+	block bool
+}
+
+type fixtureOpt func(t *testing.T, f *fixture)
+
+func withFiles(files map[string]string) fixtureOpt {
+	return func(_ *testing.T, f *fixture) { f.files = files }
+}
+
+func stripping() fixtureOpt {
+	return func(t *testing.T, _ *fixture) { t.Setenv("STRIP_DOC_COMMENTS", "true") }
+}
+
+func windowed() fixtureOpt {
+	return func(t *testing.T, _ *fixture) { t.Setenv("CHUNK_STRATEGY", "window") }
+}
+
+func withBlockingEmbedder() fixtureOpt {
+	return func(_ *testing.T, f *fixture) { f.block = true }
+}
+
+// fakeIndexer drives a whole job with no network, no git and no Postgres: a
+// clone that writes the fixture on disk, the real walk over it, the real
+// chunker and the fake embedder, and a recorder in place of the two writes.
+//
+// The chunk knobs and the embedder come from chunkOptions, stripDocs and
+// newEmbedder rather than from literals here, so a wrong default is a failing
+// test rather than something only production would show.
+func fakeIndexer(t *testing.T, opts ...fixtureOpt) (*indexer, *recorder) {
+	t.Helper()
+	f := &fixture{files: fixtureRepo}
+	for _, o := range opts {
+		o(t, f)
+	}
+	t.Setenv("EMBED_PROVIDER", "fake")
+
+	q := &fakeQueue{}
+	ix, logged := testIndexer(t, q)
+	rec := &recorder{fakeQueue: q, logged: logged, deadlines: map[string]time.Time{}}
+
+	var err error
+	if ix.opt, err = chunkOptions(); err != nil {
+		t.Fatal(err)
+	}
+	if ix.strip, err = stripDocs(); err != nil {
+		t.Fatal(err)
+	}
+	base, err := newEmbedder(context.Background(), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ix.emb = recordingEmbedder{Embedder: base, rec: rec, block: f.block}
+
+	ix.clone = func(ctx context.Context, _, _, d string, _ clone.Limits) (clone.Result, error) {
+		if dl, ok := ctx.Deadline(); ok {
+			rec.deadlines["clone"] = dl
+		}
+		writeCheckout(t, d, f.files)
+		return clone.Result{Dir: d, Commit: testCommit, Bytes: 1}, nil
+	}
+	ix.walk = func(ctx context.Context, root string, lim walk.Limits) ([]walk.File, error) {
+		if dl, ok := ctx.Deadline(); ok {
+			rec.deadlines["walk"] = dl
+		}
+		return walk.Files(ctx, root, lim)
+	}
+	ix.put = func(ctx context.Context, _ models.Repo, files []models.File) error {
+		if dl, ok := ctx.Deadline(); ok {
+			rec.deadlines["put"] = dl
+		}
+		rec.files, rec.order = files, append(rec.order, "put")
+		return nil
+	}
+	ix.putSpans = func(ctx context.Context, _ string, spans []store.EmbeddedSpan, model string, dim int) error {
+		if dl, ok := ctx.Deadline(); ok {
+			rec.deadlines["putSpans"] = dl
+		}
+		rec.spans, rec.model, rec.dim = spans, model, dim
+		rec.order = append(rec.order, "putSpans")
+		return nil
+	}
+	ix.evict = func(context.Context, int) (int, error) { return 0, nil }
+	return ix, rec
+}
+
+// The default arm is AST, and every file that is not parseable Go still gets
+// windowed. Shipping the baseline arm as production would be a silent
+// downgrade of every answer, and nothing about the output would look wrong.
+func TestAJobIndexesEachFileWithTheArmItsContentEarns(t *testing.T) {
+	ix, rec := fakeIndexer(t)
+	ix.runJob(context.Background(), aJob())
+
+	if rec.failReason() != "" {
+		t.Fatalf("the job failed: %s", rec.failReason())
+	}
+	want := map[string][]string{
+		"a.go":      {"func:F"},
+		"b/util.go": {"func:Helper"},
+		// Neither parses as Go, so both take the window fallback — and both
+		// are kind=file, which is why nothing may read the arm off the kind.
+		"broken.go": {"file:"},
+		"README.md": {"file:"},
+	}
+	got := rec.spansByPath()
+	if len(got) != len(want) {
+		t.Fatalf("spans came from %v, want exactly %v", got, want)
+	}
+	for path, kinds := range want {
+		if strings.Join(got[path], ",") != strings.Join(kinds, ",") {
+			t.Errorf("%s produced %v, want %v", path, got[path], kinds)
+		}
+	}
+}
+
+// Files exist before spans reference them: spans.file_id is a foreign key, so
+// the wrong order is a failed insert against a real database.
+func TestFilesAreWrittenBeforeSpans(t *testing.T) {
+	ix, rec := fakeIndexer(t)
+	ix.runJob(context.Background(), aJob())
+
+	if len(rec.order) != 2 || rec.order[0] != "put" || rec.order[1] != "putSpans" {
+		t.Fatalf("call order %v, want [put putSpans]", rec.order)
+	}
+	// Every span names a file row that was in that write.
+	rows := map[string]bool{}
+	for _, f := range rec.files {
+		rows[f.ID] = true
+	}
+	for _, s := range rec.spans {
+		if !rows[s.FileID] {
+			t.Fatalf("span %s (%s) names file_id %s, which no row carries", s.ID, s.Path, s.FileID)
+		}
+	}
+}
+
+// Production keeps doc comments — they are the best signal a span has — and
+// only the eval corpus strips them (spec §9). A default that stripped would
+// quietly degrade the shipped index; one that never stripped would build an
+// eval corpus holding the prose its own questions came from.
+func TestDocCommentsAreKeptByDefaultAndStrippedWhenAsked(t *testing.T) {
+	one := map[string]string{"a.go": fixtureRepo["a.go"]}
+
+	ix, rec := fakeIndexer(t, withFiles(one))
+	ix.runJob(context.Background(), aJob())
+	if len(rec.spans) != 1 {
+		t.Fatalf("want one span, got %d", len(rec.spans))
+	}
+	if !strings.Contains(rec.spans[0].Text, "F does a thing") {
+		t.Fatalf("the production span lost its doc comment:\n%s", rec.spans[0].Text)
+	}
+	if rec.spans[0].StartLine != 3 || rec.spans[0].EndLine != 4 {
+		t.Fatalf("production range is %d..%d, want 3..4 — the doc comment is part of the span",
+			rec.spans[0].StartLine, rec.spans[0].EndLine)
+	}
+
+	ix, rec = fakeIndexer(t, withFiles(one), stripping())
+	ix.runJob(context.Background(), aJob())
+	if len(rec.spans) != 1 {
+		t.Fatalf("want one span, got %d", len(rec.spans))
+	}
+	if strings.Contains(rec.spans[0].Text, "F does a thing") {
+		t.Fatalf("the stripped span kept its doc comment:\n%s", rec.spans[0].Text)
+	}
+	if !strings.Contains(rec.spans[0].Text, "func F() {}") {
+		t.Fatalf("the stripped span lost its code:\n%s", rec.spans[0].Text)
+	}
+	// Blanked, not deleted, so no line of code moves: func F is on line 4 in
+	// both corpora. The span starts a line later only because the declaration
+	// no longer has a doc comment to start at — measured, not predicted; the
+	// first version of this assertion expected 3..4 and was wrong.
+	if rec.spans[0].StartLine != 4 || rec.spans[0].EndLine != 4 {
+		t.Fatalf("stripped range is %d..%d, want 4..4", rec.spans[0].StartLine, rec.spans[0].EndLine)
+	}
+}
+
+// Go that will not parse cannot be stripped. Windowing it unstripped would put
+// the prose the eval's questions came from into the corpus built to exclude it.
+func TestAFileThatCannotBeStrippedContributesNoSpans(t *testing.T) {
+	files := map[string]string{"broken.go": "package p\n\n// Doc prose here.\nfunc (\n"}
+
+	ix, rec := fakeIndexer(t, withFiles(files))
+	ix.runJob(context.Background(), aJob())
+	if len(rec.spans) == 0 {
+		t.Fatal("unstripped, an unparseable file is windowed and has spans")
+	}
+
+	ix, rec = fakeIndexer(t, withFiles(files), stripping())
+	ix.runJob(context.Background(), aJob())
+	for _, s := range rec.spans {
+		t.Fatalf("stripping could not run on %s, yet it was indexed:\n%s", s.Path, s.Text)
+	}
+	if len(rec.files) != 1 {
+		t.Fatalf("want the file row kept, got %d rows", len(rec.files))
+	}
+	if len(rec.completed) != 1 {
+		t.Fatalf("one unparseable file failed the job: %+v", rec.failed)
+	}
+}
+
+// A repository holding a PNG indexes. Without the guard the span insert is
+// refused by Postgres for the whole transaction and one file loses the job.
+func TestUnindexableFilesGetNoSpansButStillGetFileRows(t *testing.T) {
+	ix, rec := fakeIndexer(t)
+	ix.runJob(context.Background(), aJob())
+
+	if len(rec.files) != len(fixtureRepo) {
+		t.Fatalf("got %d file rows, want %d", len(rec.files), len(fixtureRepo))
+	}
+	for _, s := range rec.spans {
+		if s.Path == "logo.png" || s.Path == "corrupt.go" {
+			t.Fatalf("%s was chunked: %q", s.Path, s.Text)
+		}
+	}
+	// corrupt.go is the discriminating half: walk classifies it as Go, so only
+	// the content check keeps it out.
+	var sawCorrupt bool
+	for _, f := range rec.files {
+		if f.Path == "corrupt.go" {
+			sawCorrupt = f.Lang == "go"
+		}
+	}
+	if !sawCorrupt {
+		t.Fatal("corrupt.go is not classified as Go, so this fixture no longer tests the content check")
+	}
+}
+
+// Spec §3: files.blob is git's content hash, filled here because the chunk
+// pass already holds the bytes.
+func TestFileRowsCarryTheBlobHash(t *testing.T) {
+	ix, rec := fakeIndexer(t)
+	ix.runJob(context.Background(), aJob())
+
+	for _, f := range rec.files {
+		want := blobHash([]byte(fixtureRepo[f.Path]))
+		if f.Blob != want {
+			t.Errorf("%s: blob %q, want %q", f.Path, f.Blob, want)
+		}
+	}
+}
+
+// Spec §6: one deadline for the whole job, not a fresh one per stage. Each
+// stage records the instant it was handed; a per-stage budget gives the later
+// stages a later one.
+func TestEveryStageSharesTheOneJobDeadline(t *testing.T) {
+	ix, rec := fakeIndexer(t)
+	start := time.Now()
+	ix.runJob(context.Background(), aJob())
+
+	stages := []string{"clone", "walk", "embed", "put", "putSpans"}
+	for _, s := range stages {
+		if rec.deadlines[s].IsZero() {
+			t.Fatalf("%s ran with no deadline at all", s)
+		}
+		// JOB_DEADLINE_SECONDS is the budget, not some multiple of it. The
+		// second of slack is for the microseconds between start and the
+		// context being derived.
+		if got := rec.deadlines[s].Sub(start); got > ix.lim.clone.Deadline+time.Second {
+			t.Errorf("%s was given %s, more than the job's %s", s, got, ix.lim.clone.Deadline)
+		}
+	}
+	for _, s := range stages[1:] {
+		if !rec.deadlines[s].Equal(rec.deadlines["clone"]) {
+			t.Errorf("%s got deadline %s, the clone got %s: that is a fresh budget per stage",
+				s, rec.deadlines[s], rec.deadlines["clone"])
+		}
+	}
+}
+
+// And the deadline is enforced, not merely carried. Falsifiable by
+// construction: the parent outlives the job budget twentyfold, so a job that
+// ignores its own deadline fails on the elapsed time rather than hanging.
+func TestTheJobDeadlineReachesTheSlowestStage(t *testing.T) {
+	ix, rec := fakeIndexer(t, withBlockingEmbedder())
+	ix.lim.clone.Deadline = 100 * time.Millisecond
+	parent, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	ix.runJob(parent, aJob())
+	elapsed := time.Since(start)
+
+	if elapsed > time.Second {
+		t.Fatalf("the job ran for %v; the 100ms job deadline did not reach the embedder", elapsed)
+	}
+	if rec.failReason() == "" {
+		t.Fatal("a job that ran out of time was not recorded as failed")
+	}
+}
+
+// The failure of a timed-out job is written with a context that is not the one
+// that just expired, or the job stays leased until its lease runs out and the
+// reason never reaches the API (spec §10).
+func TestATimedOutJobIsRecordedFailed(t *testing.T) {
+	ix, rec := fakeIndexer(t, withBlockingEmbedder())
+	ix.lim.clone.Deadline = 50 * time.Millisecond
+	parent, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	ix.runJob(parent, aJob())
+
+	if len(rec.failedCtx) != 1 {
+		t.Fatalf("want one recorded failure, got %+v", rec.failed)
+	}
+	if rec.failedCtx[0] != nil {
+		t.Fatalf("Fail was called with an expired context (%v), so the write would not land", rec.failedCtx[0])
+	}
+	if !strings.Contains(rec.failReason(), "deadline") {
+		t.Fatalf("the failure reason does not say what happened: %q", rec.failReason())
+	}
+}
+
+// The completion is the same kind of write. A job whose work finished just
+// inside its deadline would otherwise be marked done on an expired context:
+// the rows are in, the row stays 'leased', and another worker redoes it.
+func TestACompletionIsNotWrittenOnTheJobsExpiredContext(t *testing.T) {
+	ix, rec := fakeIndexer(t)
+	ix.lim.clone.Deadline = 50 * time.Millisecond
+	slow := ix.putSpans
+	ix.putSpans = func(ctx context.Context, repo string, spans []store.EmbeddedSpan, model string, dim int) error {
+		// The write lands, and the job's budget is gone by the time it returns.
+		<-ctx.Done()
+		return slow(context.Background(), repo, spans, model, dim)
+	}
+	parent, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	ix.runJob(parent, aJob())
+
+	if len(rec.completedCtx) != 1 {
+		t.Fatalf("want one completion, got %v and failures %+v", rec.completed, rec.failed)
+	}
+	if rec.completedCtx[0] != nil {
+		t.Fatalf("Complete was called with an expired context (%v): the job stays leased", rec.completedCtx[0])
+	}
+}
+
+// Every span gets its own vector, and gets it in one piece: EMBED_BATCH splits
+// the corpus, and a batch loop that stops early or misaligns files one span's
+// text under another span's embedding.
+func TestEverySpanCarriesItsOwnEmbedding(t *testing.T) {
+	ix, rec := fakeIndexer(t)
+	ix.runJob(context.Background(), aJob())
+
+	if len(rec.spans) <= ix.lim.embedBatch {
+		t.Fatalf("%d spans at a batch of %d cannot show a batching fault", len(rec.spans), ix.lim.embedBatch)
+	}
+	fake := embed.NewFake(store.EmbeddingDim)
+	for _, s := range rec.spans {
+		want, err := fake.Embed(context.Background(), []string{s.Text})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(s.Embedding, want[0]) {
+			t.Fatalf("span %s (%s:%d-%d) does not carry the vector of its own text",
+				s.ID, s.Path, s.StartLine, s.EndLine)
+		}
+	}
+}
+
+// The chunk pass reads every file a second time. If that read does not go
+// through walk.ReadRegular, a link swapped in between the walk and the read is
+// followed — and every test in the walk package still passes, because they
+// test the function and not this caller.
+func TestTheSecondReadRefusesALinkSwappedInAfterTheWalk(t *testing.T) {
+	secret := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(secret, []byte("SECRET\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ix, rec := fakeIndexer(t, withFiles(map[string]string{"a.go": "package p\n"}))
+	ix.clone = func(_ context.Context, _, _, d string, _ clone.Limits) (clone.Result, error) {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		// What the walk saw as a regular file is a symlink by the time the
+		// chunker reads it.
+		if err := os.Symlink(secret, filepath.Join(d, "bait.go")); err != nil {
+			t.Fatal(err)
+		}
+		return clone.Result{Dir: d, Commit: testCommit, Bytes: 1}, nil
+	}
+	ix.walk = func(context.Context, string, walk.Limits) ([]walk.File, error) {
+		return []walk.File{{Path: "bait.go", Lang: "go", Lines: 1, Bytes: 7}}, nil
+	}
+
+	ix.runJob(context.Background(), aJob())
+
+	for _, s := range rec.spans {
+		if strings.Contains(s.Text, "SECRET") {
+			t.Fatalf("the link's target was indexed: %q", s.Text)
+		}
+	}
+	if len(rec.spans) != 0 {
+		t.Fatalf("a file that stopped being a regular file produced %d spans", len(rec.spans))
+	}
+	// The row stays, so the file count still describes what the walk saw, and
+	// its blob is empty because those bytes were never read.
+	if len(rec.files) != 1 || rec.files[0].Blob != "" {
+		t.Fatalf("want one row with no blob, got %+v", rec.files)
+	}
+	if len(rec.completed) != 1 {
+		t.Fatalf("one swapped file failed the whole job: %+v", rec.failed)
+	}
+}
+
+// The embedder's width is checked at boot, not discovered at the first insert
+// of the first job — by which time a clone, a walk and a whole embed pass have
+// been spent.
+func TestEmbedderConstructionRefusesTheWrongWidth(t *testing.T) {
+	t.Setenv("EMBED_PROVIDER", "fake")
+	t.Setenv("EMBED_DIM", "7")
+	if _, err := newEmbedder(context.Background(), time.Minute); !errors.Is(err, store.ErrDimMismatch) {
+		t.Fatalf("want ErrDimMismatch, got %v", err)
+	}
+}
+
+// answersOneVector is an Ollama that has the model and returns the schema's
+// width, which is what a healthy boot probe finds.
+func answersOneVector(t *testing.T) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		v := make([]float32, store.EmbeddingDim)
+		v[0] = 1
+		json.NewEncoder(w).Encode(struct {
+			Embeddings [][]float32 `json:"embeddings"`
+		}{[][]float32{v}})
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// Both providers are constructible, and nothing else is: a typo in
+// EMBED_PROVIDER must not fall back to one of them silently.
+func TestEmbedderProviders(t *testing.T) {
+	// The ollama arm needs a server now, because constructing it proves it
+	// answers; the fake arm ignores the URL entirely.
+	t.Setenv("OLLAMA_URL", answersOneVector(t))
+	for _, tc := range []struct{ provider, model string }{
+		{"fake", "fake-hashed-bow"},
+		{"ollama", "nomic-embed-text"},
+	} {
+		t.Setenv("EMBED_PROVIDER", tc.provider)
+		e, err := newEmbedder(context.Background(), time.Minute)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.provider, err)
+		}
+		if e.Model() != tc.model || e.Dim() != store.EmbeddingDim {
+			t.Errorf("%s: model %q dim %d, want %q and %d", tc.provider, e.Model(), e.Dim(), tc.model, store.EmbeddingDim)
+		}
+	}
+	t.Setenv("EMBED_PROVIDER", "olama")
+	if _, err := newEmbedder(context.Background(), time.Minute); err == nil {
+		t.Fatal("a misspelt provider was accepted")
+	}
+}
+
+// The README calls every knob boot-validated, and these two were not.
+// Measured before: `OLLAMA_URL='not a url at all' EMBED_MODEL='no-such-model-xyz'`
+// logged "indexer up" and the failure surfaced on the first leased job's embed
+// call, spending an attempt against the cap for a setting no retry can fix.
+//
+// Each case names the knob that is wrong, because "connection refused" on a
+// job is what this is replacing.
+func TestTheEmbedderAddressAndModelAreValidatedAtBoot(t *testing.T) {
+	missingModel := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The real server's answer for a model that was never pulled: a 404
+		// whose body is JSON and decodes cleanly into the success shape.
+		w.WriteHeader(http.StatusNotFound)
+		io.WriteString(w, `{"error":"model \"no-such-model-xyz\" not found"}`)
+	}))
+	defer missingModel.Close()
+	// A listener that is closed: the address is well formed and nothing is
+	// there, which is the misconfiguration a typo'd port makes.
+	gone := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	goneURL := gone.URL
+	gone.Close()
+
+	const badAddress = "is not an http:// or https:// address"
+	// Each want is the part of the message that could only have come from the
+	// check being tested: "an error happened" would pass against a client that
+	// merely failed differently later.
+	for _, tc := range []struct{ name, url, model, want string }{
+		{"not an address", "not a url at all", "nomic-embed-text", badAddress},
+		{"no scheme", "localhost:11435", "nomic-embed-text", badAddress},
+		{"no host", "http://", "nomic-embed-text", badAddress},
+		{"model never pulled", missingModel.URL, "no-such-model-xyz", `EMBED_MODEL="no-such-model-xyz"`},
+		{"nothing listening", goneURL, "nomic-embed-text", `EMBED_MODEL="nomic-embed-text" at OLLAMA_URL=`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("EMBED_PROVIDER", "ollama")
+			t.Setenv("OLLAMA_URL", tc.url)
+			t.Setenv("EMBED_MODEL", tc.model)
+			_, err := newEmbedder(context.Background(), time.Minute)
+			if err == nil {
+				t.Fatalf("%s booted", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("the error does not name %s: %v", tc.want, err)
+			}
+		})
+	}
+}
+
+// Every knob fails closed at boot, the way the caps do: config.GetInt reads a
+// literal "0" as 0, and a zero window silently drops every fallback span.
+func TestBadChunkOptionsRefuseToBoot(t *testing.T) {
+	for _, tc := range []struct{ key, value string }{
+		{"CHUNK_WINDOW_LINES", "0"},
+		{"CHUNK_WINDOW_OVERLAP", "40"},
+		{"CHUNK_WINDOW_OVERLAP", "-1"},
+		{"CHUNK_MAX_DECL_LINES", "0"},
+		{"CHUNK_STRATEGY", "asr"},
+	} {
+		t.Run(tc.key+"="+tc.value, func(t *testing.T) {
+			t.Setenv(tc.key, tc.value)
+			if _, err := chunkOptions(); err == nil {
+				t.Fatalf("%s=%s booted", tc.key, tc.value)
+			}
+		})
+	}
+	opt, err := chunkOptions()
+	if err != nil {
+		t.Fatalf("the defaults must boot: %v", err)
+	}
+	if opt != chunk.Defaults() {
+		t.Fatalf("the defaults are %+v, want the chunker's own %+v", opt, chunk.Defaults())
+	}
+	t.Setenv("CHUNK_STRATEGY", "window")
+	t.Setenv("CHUNK_WINDOW_LINES", "12")
+	t.Setenv("CHUNK_WINDOW_OVERLAP", "3")
+	t.Setenv("CHUNK_MAX_DECL_LINES", "99")
+	opt, err = chunkOptions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := chunk.Options{Strategy: chunk.StrategyWindow, WindowLines: 12, WindowOverlap: 3, MaxDeclLines: 99}
+	if opt != want {
+		t.Fatalf("want %+v, got %+v", want, opt)
+	}
+}
+
+// STRIP_DOC_COMMENTS decides which corpus is being built, so a value it cannot
+// read is a refusal rather than a false: "yes" would otherwise build an eval
+// corpus holding the prose its questions came from and look like a good run.
+func TestStripDocCommentsIsParsedNotGuessed(t *testing.T) {
+	if got, err := stripDocs(); err != nil || got {
+		t.Fatalf("production must keep doc comments: %v, %v", got, err)
+	}
+	for _, v := range []string{"true", "1", "TRUE"} {
+		t.Setenv("STRIP_DOC_COMMENTS", v)
+		if got, err := stripDocs(); err != nil || !got {
+			t.Fatalf("%s: %v, %v", v, got, err)
+		}
+	}
+	t.Setenv("STRIP_DOC_COMMENTS", "yes")
+	if _, err := stripDocs(); err == nil {
+		t.Fatal("a value that is not a boolean was read as one")
+	}
+}
+
+// One vector per text, in order, is the Embedder's whole contract. A response
+// short of the batch leaves the spans past the end with no vector at all, and
+// PutSpans then refuses them for having 0 components — a complaint about the
+// schema's width, naming a span, for a fault that belongs to the embedder.
+func TestAShortEmbeddingBatchIsRefusedNamingTheEmbedder(t *testing.T) {
+	ix, rec := fakeIndexer(t)
+	ix.emb = shortEmbedder{Embedder: ix.emb}
+	ix.runJob(context.Background(), aJob())
+
+	if len(rec.spans) != 0 {
+		t.Fatalf("spans were written from a short batch: %d", len(rec.spans))
+	}
+	if !strings.Contains(rec.failReason(), "vectors for") {
+		t.Fatalf("the failure does not name the short batch: %q", rec.failReason())
+	}
+}
+
+type shortEmbedder struct{ embed.Embedder }
+
+func (e shortEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+	v, err := e.Embedder.Embed(ctx, texts)
+	if err != nil || len(v) == 0 {
+		return v, err
+	}
+	return v[:len(v)-1], nil
+}
+
+// The queue writes are bounded as well as separate. A pool that has stopped
+// answering must not hold the worker on a write that will never return — the
+// job's context deliberately does not bound these, so if this does not,
+// nothing does.
+func TestAQueueWriteThatNeverReturnsIsBounded(t *testing.T) {
+	restore := recordDeadline
+	recordDeadline = 50 * time.Millisecond
+	t.Cleanup(func() { recordDeadline = restore })
+
+	ix, rec := fakeIndexer(t, withFiles(map[string]string{"a.go": "package p\n"}))
+	rec.blockUntilDone = true
+	// The parent outlives the bound twentyfold, so a write that is not bounded
+	// fails on the elapsed time rather than hanging the suite.
+	parent, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	start := time.Now()
+	ix.runJob(parent, aJob())
+	elapsed := time.Since(start)
+
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("the completion held the worker for %v, past its %v bound", elapsed, recordDeadline)
+	}
+	if len(rec.completedCtx) != 1 || !errors.Is(rec.completedCtx[0], context.DeadlineExceeded) {
+		t.Fatalf("want the write ended by its own bound, got %v", rec.completedCtx)
+	}
+}
+
+// The eval's baseline arm over the eval's corpus, on the file shape that broke
+// it: a package comment long enough that blanking it leaves a whole window
+// with no word left in it (rs/zerolog's log.go is ~100 lines of one).
+//
+// Measured before chunk dropped those windows, with exactly these settings on
+// the fake embedder spec §9 puts in CI: the job failed with "embedding spans
+// 576-607: embed: text 19 has no tokens to hash" and the repository wrote 0
+// rows, three attempts to terminal. The whole baseline arm of the eval was
+// unbuildable, which is what P2 exists to make possible.
+func TestTheEvalsWindowArmSurvivesAStrippedPackageComment(t *testing.T) {
+	var doc strings.Builder
+	for range 60 { // past one 40-line window, as zerolog's package comment is
+		doc.WriteString("// prose the golden set's questions are generated from.\n")
+	}
+	ix, rec := fakeIndexer(t, windowed(), stripping(), withFiles(map[string]string{
+		"log.go": doc.String() + "package p\n\nfunc F() int { return 1 }\n",
+	}))
+	// testIndexer's 1KB cap is for snippets; this fixture is a file, and one
+	// the walk skipped for size would produce no spans for the wrong reason.
+	ix.lim.walk.MaxFileBytes = 1 << 16
+	ix.runJob(context.Background(), aJob())
+
+	if r := rec.failReason(); r != "" {
+		t.Fatalf("the job failed instead of indexing: %s", r)
+	}
+	if len(rec.spans) == 0 {
+		t.Fatal("the stripped file produced no spans at all")
+	}
+	for _, s := range rec.spans {
+		if !strings.ContainsFunc(s.Text, func(r rune) bool {
+			return unicode.IsLetter(r) || unicode.IsDigit(r)
+		}) {
+			t.Errorf("span %s:%d-%d has nothing to embed:\n%q", s.Path, s.StartLine, s.EndLine, s.Text)
+		}
+	}
+	// One window is lost: lines 1-40 are all inside the blanked comment, and
+	// the next one reaches the code. Counted rather than dropped quietly — a
+	// silent drop is how a corpus shrinks with nothing to read about it.
+	if out := rec.logged.String(); !strings.Contains(out, `"tokenless":1`) {
+		t.Errorf("the dropped-chunk count is not in the log: %q", out)
 	}
 }

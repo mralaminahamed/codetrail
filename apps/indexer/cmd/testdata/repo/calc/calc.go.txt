@@ -1,0 +1,28 @@
+package calc
+
+import "fmt"
+
+// Base is the radix Render uses. CODETRAILDOC marks this as doc prose.
+const Base = 10
+
+// Add and Sub name the operations Machine understands. CODETRAILDOC.
+var (
+	Add = "add"
+	Sub = "sub"
+)
+
+// Machine accumulates a running total. CODETRAILDOC.
+type Machine struct {
+	total int
+}
+
+// Push adds n to the running total and returns it. CODETRAILDOC.
+func (m *Machine) Push(n int) int {
+	m.total += n
+	return m.total
+}
+
+// Render formats the total in Base. CODETRAILDOC.
+func Render(m *Machine) string {
+	return fmt.Sprintf("%d (base %d)", m.total, Base)
+}

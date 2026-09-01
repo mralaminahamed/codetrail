@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1030" height="896" viewBox="0 0 1030 896" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="14">
+<rect width="1030" height="896" rx="12" fill="#0f1319"/>
+<path d="M0 12 a12 12 0 0 1 12 -12 h1006 a12 12 0 0 1 12 12 v28 h-1030 z" fill="#1b212b"/>
+<circle cx="24" cy="20" r="6" fill="#ff5f57"/>
+<circle cx="44" cy="20" r="6" fill="#febc2e"/>
+<circle cx="64" cy="20" r="6" fill="#28c840"/>
+<text x="515.0" y="25" fill="#8b949e" font-size="12" text-anchor="middle">codetrail — a real repository, chunked into citable spans</text>
+<text x="28.0" y="62" fill="#7ee787" xml:space="preserve">$ </text>
+<text x="44.8" y="62" fill="#c9d1d9" xml:space="preserve">curl -s -XPOST localhost:8080/api/repos -d &#x27;{&quot;remote&quot;:&quot;https://github.com/rs/zerolog&quot;,&quot;ref&quot;:&quot;master&quot;}&#x27;</text>
+<text x="28.0" y="88" fill="#8b949e" xml:space="preserve">{&quot;id&quot;:</text>
+<text x="78.4" y="88" fill="#c9d1d9" xml:space="preserve">&quot;23247721572a75ff5592dbbe43f7f716&quot;</text>
+<text x="364.0" y="88" fill="#8b949e" xml:space="preserve">,&quot;remote&quot;:</text>
+<text x="448.0" y="88" fill="#c9d1d9" xml:space="preserve">&quot;https://github.com/rs/zerolog&quot;</text>
+<text x="708.4" y="88" fill="#8b949e" xml:space="preserve">,&quot;ref&quot;:</text>
+<text x="767.2" y="88" fill="#c9d1d9" xml:space="preserve">&quot;master&quot;</text>
+<text x="834.4" y="88" fill="#8b949e" xml:space="preserve">,&quot;status&quot;:</text>
+<text x="918.4" y="88" fill="#e8a33f" xml:space="preserve">&quot;pending&quot;</text>
+<text x="994.0" y="88" fill="#8b949e" xml:space="preserve">}</text>
+<text x="28.0" y="140" fill="#7ee787" xml:space="preserve">$ </text>
+<text x="44.8" y="140" fill="#c9d1d9" xml:space="preserve">jq -c &#x27;{files,spans,commit,message}&#x27; &lt; indexer.log | tail -1</text>
+<text x="28.0" y="166" fill="#8b949e" xml:space="preserve">{&quot;files&quot;:</text>
+<text x="103.6" y="166" fill="#e8a33f" xml:space="preserve">99</text>
+<text x="120.4" y="166" fill="#8b949e" xml:space="preserve">,&quot;spans&quot;:</text>
+<text x="196.0" y="166" fill="#e8a33f" xml:space="preserve">1303</text>
+<text x="229.6" y="166" fill="#8b949e" xml:space="preserve">,&quot;commit&quot;:</text>
+<text x="313.6" y="166" fill="#c9d1d9" xml:space="preserve">&quot;dfd11cca1143ba03ba0fc0ff14e5dbb4d61f6f0a&quot;</text>
+<text x="666.4" y="166" fill="#8b949e" xml:space="preserve">,&quot;message&quot;:</text>
+<text x="758.8" y="166" fill="#c9d1d9" xml:space="preserve">&quot;indexed&quot;</text>
+<text x="834.4" y="166" fill="#8b949e" xml:space="preserve">}</text>
+<text x="28.0" y="218" fill="#7ee787" xml:space="preserve">$ </text>
+<text x="44.8" y="218" fill="#c9d1d9" xml:space="preserve">psql -c &quot;SELECT kind, count(*) FROM spans GROUP BY kind ORDER BY 2 DESC&quot;</text>
+<text x="28.0" y="244" fill="#8b949e" xml:space="preserve"> kind  | count </text>
+<text x="28.0" y="270" fill="#8b949e" xml:space="preserve">-------+-------</text>
+<text x="28.0" y="296" fill="#8b949e" xml:space="preserve"> func  |  1044</text>
+<text x="28.0" y="322" fill="#8b949e" xml:space="preserve"> type  |   100</text>
+<text x="28.0" y="348" fill="#8b949e" xml:space="preserve"> file  |    73</text>
+<text x="28.0" y="374" fill="#8b949e" xml:space="preserve"> var   |    67</text>
+<text x="28.0" y="400" fill="#8b949e" xml:space="preserve"> const |    19</text>
+<text x="28.0" y="452" fill="#7ee787" xml:space="preserve">$ </text>
+<text x="44.8" y="452" fill="#c9d1d9" xml:space="preserve">psql -c &quot;SELECT path, symbol, start_line, end_line, left(digest,8), embed_model</text>
+<text x="28.0" y="478" fill="#c9d1d9" xml:space="preserve">        FROM spans WHERE symbol = &#x27;Logger.Info&#x27;&quot;</text>
+<text x="28.0" y="504" fill="#8b949e" xml:space="preserve">  path  |   symbol    | start_line | end_line |   left   |   embed_model    </text>
+<text x="28.0" y="530" fill="#8b949e" xml:space="preserve">--------+-------------+------------+----------+----------+------------------</text>
+<text x="28.0" y="556" fill="#8b949e" xml:space="preserve"> log.go | Logger.Info |        </text>
+<text x="288.4" y="556" fill="#e8a33f" xml:space="preserve">353</text>
+<text x="313.6" y="556" fill="#8b949e" xml:space="preserve"> |      </text>
+<text x="380.8" y="556" fill="#e8a33f" xml:space="preserve">358</text>
+<text x="406.0" y="556" fill="#8b949e" xml:space="preserve"> | 476dac18 | nomic-embed-text</text>
+<text x="28.0" y="608" fill="#7ee787" xml:space="preserve">$ </text>
+<text x="44.8" y="608" fill="#c9d1d9" xml:space="preserve">git -C zerolog show dfd11cca:log.go | sed -n &#x27;353,358p&#x27;</text>
+<text x="28.0" y="634" fill="#8b949e" xml:space="preserve">// Info starts a new message with info level.</text>
+<text x="28.0" y="660" fill="#8b949e" xml:space="preserve">//</text>
+<text x="28.0" y="686" fill="#8b949e" xml:space="preserve">// You must call Msg on the returned event in order to send the event.</text>
+<text x="28.0" y="712" fill="#8b949e" xml:space="preserve">func (l *Logger) Info() *Event {</text>
+<text x="28.0" y="738" fill="#8b949e" xml:space="preserve">        return l.newEvent(InfoLevel, nil)</text>
+<text x="28.0" y="764" fill="#8b949e" xml:space="preserve">}</text>
+<text x="28.0" y="816" fill="#8b949e" xml:space="preserve"># the span&#x27;s stored text is those bytes exactly — checked for all 1303 spans</text>
+<text x="28.0" y="842" fill="#8b949e" xml:space="preserve"># in this index, against sed over git show. The eval has not been run: P6.</text>
+</svg>

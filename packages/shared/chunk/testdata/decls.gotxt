@@ -1,0 +1,30 @@
+package sample
+
+import (
+	"errors"
+	"fmt"
+)
+
+// ErrGone is returned for a repository that was indexed and then evicted.
+var ErrGone = errors.New("gone")
+
+// Kinds are the shapes a thing can take.
+const (
+	KindA = "a"
+	KindB = "b"
+)
+
+// Counter counts.
+type Counter struct {
+	n int
+}
+
+// Add adds d and returns the new total.
+//
+// The second paragraph exists so a doc comment spans more than one line.
+func (c *Counter) Add(d int) int {
+	c.n += d
+	return c.n
+}
+
+func undocumented() error { return fmt.Errorf("no doc") }

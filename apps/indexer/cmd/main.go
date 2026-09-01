@@ -22,7 +22,9 @@ import (
 	"github.com/mralaminahamed/codetrail/apps/indexer/internal/clone"
 	"github.com/mralaminahamed/codetrail/apps/indexer/internal/walk"
 	"github.com/mralaminahamed/codetrail/packages/shared/admit"
+	"github.com/mralaminahamed/codetrail/packages/shared/chunk"
 	"github.com/mralaminahamed/codetrail/packages/shared/config"
+	"github.com/mralaminahamed/codetrail/packages/shared/embed"
 	"github.com/mralaminahamed/codetrail/packages/shared/jobs"
 	"github.com/mralaminahamed/codetrail/packages/shared/logger"
 	"github.com/mralaminahamed/codetrail/packages/shared/models"
@@ -45,18 +47,26 @@ type limits struct {
 	// keepRepos is how many repositories the corpus is allowed to hold. Anyone
 	// may submit one, so something has to bound it; see runJob.
 	keepRepos int
+	// embedBatch is how many span texts go in one Embed call.
+	embedBatch int
 }
 
 // indexer is the worker: a queue, the steps of a job, and the caps.
-// clone, walk, put and evict are fields rather than direct calls, so a test can
-// drive a job with no network, no git and no Postgres.
+// clone, walk, put, putSpans and evict are fields rather than direct calls, so
+// a test can drive a job with no network, no git and no Postgres.
 type indexer struct {
-	log   zerolog.Logger
-	q     queue
-	clone func(ctx context.Context, remote, ref, dir string, lim clone.Limits) (clone.Result, error)
-	walk  func(root string, lim walk.Limits) ([]walk.File, error)
-	put   func(ctx context.Context, r models.Repo, files []models.File) error
-	evict func(ctx context.Context, keep int) (int, error)
+	log      zerolog.Logger
+	q        queue
+	clone    func(ctx context.Context, remote, ref, dir string, lim clone.Limits) (clone.Result, error)
+	walk     func(ctx context.Context, root string, lim walk.Limits) ([]walk.File, error)
+	put      func(ctx context.Context, r models.Repo, files []models.File) error
+	putSpans func(ctx context.Context, repoID string, spans []store.EmbeddedSpan, model string, dim int) error
+	evict    func(ctx context.Context, keep int) (int, error)
+	emb      embed.Embedder
+	// opt and strip are the chunking decisions, read once at boot rather than
+	// per job: see chunkOptions and stripDocs.
+	opt   chunk.Options
+	strip bool
 	// hosts is the same allowlist the gateway admits against, applied again
 	// here; see runJob.
 	hosts admit.Policy
@@ -76,6 +86,20 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("bad limits")
 	}
+	opt, err := chunkOptions()
+	if err != nil {
+		log.Fatal().Err(err).Msg("bad chunk options")
+	}
+	strip, err := stripDocs()
+	if err != nil {
+		log.Fatal().Err(err).Msg("bad strip setting")
+	}
+	// Before the database connection, so a width that cannot be written is a
+	// refusal to boot rather than a job's worth of work discovering it.
+	emb, err := newEmbedder(ctx, lim.clone.Deadline)
+	if err != nil {
+		log.Fatal().Err(err).Msg("bad embedder")
+	}
 
 	st, err := store.New(ctx, config.Get("DATABASE_URL", "postgres://codetrail:codetrail@localhost:55432/codetrail?sslmode=disable"))
 	if err != nil {
@@ -84,16 +108,20 @@ func main() {
 	defer st.Close()
 
 	ix := &indexer{
-		log:     log,
-		q:       jobs.New(st.Pool()),
-		clone:   clone.Run,
-		walk:    walk.Files,
-		put:     st.PutRepo,
-		evict:   st.Evict,
-		hosts:   admit.NewPolicy(allowedHosts()),
-		id:      workerID(),
-		scratch: config.Get("SCRATCH_DIR", filepath.Join(os.TempDir(), "codetrail")),
-		lim:     lim,
+		log:      log,
+		q:        jobs.New(st.Pool()),
+		clone:    clone.Run,
+		walk:     walk.Files,
+		put:      st.PutRepo,
+		putSpans: st.PutSpans,
+		evict:    st.Evict,
+		emb:      emb,
+		opt:      opt,
+		strip:    strip,
+		hosts:    admit.NewPolicy(allowedHosts()),
+		id:       workerID(),
+		scratch:  config.Get("SCRATCH_DIR", filepath.Join(os.TempDir(), "codetrail")),
+		lim:      lim,
 	}
 	// At exit, so a worker asked to stop takes its checkouts with it. At boot
 	// too: with a fresh id each start that normally finds nothing, and one
@@ -180,18 +208,20 @@ func limitsFrom() (limits, error) {
 			MaxFiles:     get("MAX_REPO_FILES", 20000),
 			MaxFileBytes: int64(get("MAX_FILE_BYTES", 1<<20)),
 		},
-		tries:     get("MAX_ATTEMPTS", 3),
-		poll:      time.Duration(get("POLL_SECONDS", 2)) * time.Second,
-		keepRepos: get("KEEP_REPOS", 50),
+		tries:      get("MAX_ATTEMPTS", 3),
+		poll:       time.Duration(get("POLL_SECONDS", 2)) * time.Second,
+		keepRepos:  get("KEEP_REPOS", 50),
+		embedBatch: get("EMBED_BATCH", 32),
 	}, err
 }
 
 // run leases and executes jobs until the process is asked to stop.
 func (ix *indexer) run(ctx context.Context) {
 	for ctx.Err() == nil {
-		// A minute past the clone's own deadline, so the job is not handed to a
-		// second worker while the first is still cloning it. It does not cover
-		// the walk, which has no deadline of its own — see runJob.
+		// A minute past the deadline the whole job shares, so the job is not
+		// handed to a second worker while the first is still working it. The
+		// spare minute is for the queue writes that follow the work; see
+		// recordDeadline.
 		job, ok, err := ix.q.Lease(ctx, ix.id, ix.lim.clone.Deadline+time.Minute)
 		if err != nil {
 			ix.log.Error().Err(err).Msg("lease")
@@ -206,13 +236,14 @@ func (ix *indexer) run(ctx context.Context) {
 	}
 }
 
-// runJob clones, walks and records one leased job.
+// runJob clones, walks, chunks, embeds and records one leased job.
 //
-// The lease can expire under it: walk.Files has no deadline and clone's covers
-// only the fetch, so a slow repository can be reclaimed mid-job. That is not
-// corrected here, it is survived — PutRepo is idempotent so both workers
-// converge on the same rows, and Complete refuses for whoever no longer holds
-// the lease.
+// Every stage shares one deadline (spec §6), so a slow clone cannot buy itself
+// extra time by failing into the embedder, and the lease taken in run outlasts
+// it. The lease can still be lost — a stage that ignores its context, a process
+// paused long enough — and that is survived rather than prevented: PutRepo and
+// PutSpans are idempotent so two workers converge on the same rows, and
+// Complete refuses for whoever no longer holds the lease.
 func (ix *indexer) runJob(ctx context.Context, job jobs.Job) {
 	l := ix.log.With().Str("job", job.ID).Str("remote", job.Remote).Logger()
 
@@ -270,13 +301,21 @@ func (ix *indexer) runJob(ctx context.Context, job jobs.Job) {
 	}
 	defer os.RemoveAll(dir)
 
-	res, err := ix.clone(ctx, remote.URL, job.Ref, dir, ix.lim.clone)
+	// One deadline for the whole job (spec §6): clone, read, chunk, embed and
+	// write share it, so a slow clone cannot buy itself extra time by failing
+	// into the embedder. A budget per stage hands each stage the whole number
+	// again, and a job may then run for as many deadlines as it has stages —
+	// with embedding, the slowest of them, free to spend a full one on its own.
+	jobCtx, cancel := context.WithTimeout(ctx, ix.lim.clone.Deadline)
+	defer cancel()
+
+	res, err := ix.clone(jobCtx, remote.URL, job.Ref, dir, ix.lim.clone)
 	if err != nil {
 		l.Warn().Err(err).Msg("clone failed")
 		ix.fail(ctx, l, job.ID, err.Error())
 		return
 	}
-	files, err := ix.walk(res.Dir, ix.lim.walk)
+	files, err := ix.walk(jobCtx, res.Dir, ix.lim.walk)
 	if err != nil {
 		l.Warn().Err(err).Msg("walk failed")
 		ix.fail(ctx, l, job.ID, err.Error())
@@ -288,22 +327,33 @@ func (ix *indexer) runJob(ctx context.Context, job jobs.Job) {
 	// a different file next week. And by remote.Key rather than the row's
 	// spelling, so two case-variant submissions are one repository.
 	repoID := store.RepoID(remote.Key, res.Commit)
-	rows := make([]models.File, 0, len(files))
-	for _, f := range files {
-		rows = append(rows, models.File{
-			ID: store.FileID(repoID, f.Path), RepoID: repoID,
-			// Blob is git's content hash and stays empty in P1: nothing reads
-			// it until P2 needs it for incremental re-indexing.
-			Path: f.Path, Blob: "", Lang: f.Lang, Lines: f.Lines,
-		})
+	rows, spans, err := ix.index(jobCtx, l, repoID, res.Dir, files)
+	if err != nil {
+		l.Warn().Err(err).Msg("indexing failed")
+		ix.fail(ctx, l, job.ID, err.Error())
+		return
 	}
 	repo := models.Repo{ID: repoID, Remote: job.Remote, Ref: job.Ref, Commit: res.Commit, SizeBytes: res.Bytes}
-	if err := ix.put(ctx, repo, rows); err != nil {
+	if err := ix.put(jobCtx, repo, rows); err != nil {
 		l.Error().Err(err).Msg("write failed")
 		ix.fail(ctx, l, job.ID, err.Error())
 		return
 	}
-	if err := ix.q.Complete(ctx, job.ID, ix.id); err != nil {
+	// After the files, not before: spans.file_id references files(id), so this
+	// order is the foreign key's and not a preference.
+	if err := ix.putSpans(jobCtx, repoID, spans, ix.emb.Model(), ix.emb.Dim()); err != nil {
+		l.Error().Err(err).Msg("writing spans failed")
+		ix.fail(ctx, l, job.ID, err.Error())
+		return
+	}
+
+	// The queue writes that close the job run on their own budget, derived from
+	// the process and not from jobCtx: the job's deadline is what has just
+	// expired on a job that ran out of time, and a write on it does not land —
+	// leaving the row 'leased' with no reason on it until the lease runs out.
+	done, cancelDone := context.WithTimeout(ctx, recordDeadline)
+	defer cancelDone()
+	if err := ix.q.Complete(done, job.ID, ix.id); err != nil {
 		// ErrNotLeased means this worker's lease expired and another indexer
 		// took the job. Losing that race is normal; completing someone else's
 		// job would not be. Anything else — a cancelled context under SIGTERM,
@@ -317,7 +367,8 @@ func (ix *indexer) runJob(ctx context.Context, job jobs.Job) {
 		}
 		return
 	}
-	l.Info().Str("commit", res.Commit).Int("files", len(rows)).Int64("bytes", res.Bytes).Msg("indexed")
+	l.Info().Str("commit", res.Commit).Int("files", len(rows)).Int("spans", len(spans)).
+		Int64("bytes", res.Bytes).Msg("indexed")
 
 	// Here rather than on a timer: a successful index is the only thing that
 	// grows the corpus, so it is the only moment the quota can be exceeded.
@@ -326,12 +377,130 @@ func (ix *indexer) runJob(ctx context.Context, job jobs.Job) {
 	// released by now, so there is nothing left to retry, and the next
 	// successful index evicts down to the same bound regardless of how far
 	// over this one left it.
-	if n, err := ix.evict(ctx, ix.lim.keepRepos); err != nil {
+	if n, err := ix.evict(done, ix.lim.keepRepos); err != nil {
 		l.Warn().Err(err).Msg("evict failed")
 	} else if n > 0 {
 		l.Info().Int("evicted", n).Msg("evicted least recently queried repos")
 	}
 }
+
+// index reads every walked file a second time, chunks it and embeds the
+// chunks, returning the file rows and the spans ready to write.
+//
+// The second read goes through walk.ReadRegular rather than os.ReadFile. The
+// walk counts lines and drops the bytes, so these bytes have to be read again,
+// and a plain read would follow a symlink swapped in after the walk — the hole
+// P1 closed — while every test in the walk package still passed, because they
+// test the function and not this caller.
+func (ix *indexer) index(ctx context.Context, l zerolog.Logger, repoID, root string, files []walk.File) ([]models.File, []store.EmbeddedSpan, error) {
+	rows := make([]models.File, 0, len(files))
+	var spans []store.EmbeddedSpan
+	var vanished, unstrippable, tokenless int
+	for _, f := range files {
+		// The job's deadline reaches the read stage here. MAX_FILE_BYTES bounds
+		// one read and MAX_REPO_FILES bounds how many there are, but neither
+		// bounds how long they take, and the walk's own check is behind us.
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		row := models.File{ID: store.FileID(repoID, f.Path), RepoID: repoID, Path: f.Path, Lang: f.Lang, Lines: f.Lines}
+		body, _, err := walk.ReadRegular(filepath.Join(root, filepath.FromSlash(f.Path)), ix.lim.walk.MaxFileBytes)
+		if err != nil {
+			if !errors.Is(err, walk.ErrSkipped) {
+				return nil, nil, fmt.Errorf("reading %s: %w", f.Path, err)
+			}
+			// Between the walk and now the entry stopped being an indexable
+			// regular file — swapped for a link, or grown past the cap. The row
+			// stays, so the file count still describes what the walk saw; its
+			// blob is empty because these bytes were never read.
+			vanished++
+			rows = append(rows, row)
+			continue
+		}
+		row.Blob = blobHash(body)
+		rows = append(rows, row)
+		if !indexable(f, body) {
+			continue
+		}
+		src := body
+		if ix.strip {
+			stripped, serr := chunk.StripDocs(f.Path, body)
+			if serr != nil {
+				// Go that will not parse cannot be stripped, and the corpus
+				// this flag builds must not carry the prose its questions were
+				// generated from. Windowing it unstripped would put that prose
+				// in; failing the job would cost every other file's spans.
+				unstrippable++
+				continue
+			}
+			src = stripped
+		}
+		cs, blank, cerr := chunk.Chunks(f.Path, src, ix.opt)
+		if cerr != nil {
+			// Chunks errors only on an invalid Options, which chunkOptions
+			// refused at boot. Returned rather than ignored: it would mean the
+			// options changed under a running worker.
+			return nil, nil, fmt.Errorf("chunking %s: %w", f.Path, cerr)
+		}
+		tokenless += blank
+		for _, c := range cs {
+			digest := store.Digest(c.Text)
+			spans = append(spans, store.EmbeddedSpan{Span: models.Span{
+				ID: store.SpanID(repoID, f.Path, c.StartLine, c.EndLine, digest), RepoID: repoID,
+				FileID: row.ID, Path: f.Path, Kind: c.Kind, Symbol: c.Symbol,
+				StartLine: c.StartLine, EndLine: c.EndLine, Text: c.Text, Digest: digest,
+			}})
+		}
+	}
+	// Once per job, not once per file: a repository of generated code would
+	// otherwise write a line per file into a log nobody can then read. Counted
+	// rather than dropped quietly — tokenless in particular is how a corpus
+	// shrinks without anyone noticing, since the job still succeeds.
+	if vanished > 0 || unstrippable > 0 || tokenless > 0 {
+		l.Warn().Int("vanished", vanished).Int("unstrippable", unstrippable).Int("tokenless", tokenless).
+			Msg("some of this repository produced no spans")
+	}
+	if err := ix.embedAll(ctx, spans); err != nil {
+		return nil, nil, err
+	}
+	return rows, spans, nil
+}
+
+// embedAll fills in each span's vector, EMBED_BATCH texts per request.
+//
+// The Embedder contract is one vector per text in order, so a response of the
+// wrong length is refused here: left alone, the spans past the end keep a nil
+// embedding and PutSpans refuses them for having 0 components — a message
+// about the schema's width, naming a span, for a fault that belongs to the
+// embedder.
+func (ix *indexer) embedAll(ctx context.Context, spans []store.EmbeddedSpan) error {
+	for lo := 0; lo < len(spans); lo += ix.lim.embedBatch {
+		hi := min(lo+ix.lim.embedBatch, len(spans))
+		texts := make([]string, 0, hi-lo)
+		for _, sp := range spans[lo:hi] {
+			texts = append(texts, sp.Text)
+		}
+		vecs, err := ix.emb.Embed(ctx, texts)
+		if err != nil {
+			return fmt.Errorf("embedding spans %d-%d: %w", lo, hi-1, err)
+		}
+		if len(vecs) != len(texts) {
+			return fmt.Errorf("embedding spans %d-%d: %s returned %d vectors for %d texts",
+				lo, hi-1, ix.emb.Model(), len(vecs), len(texts))
+		}
+		for i := range vecs {
+			spans[lo+i].Embedding = vecs[i]
+		}
+	}
+	return nil
+}
+
+// recordDeadline bounds the queue writes that close a job out. A pool that has
+// stopped answering must not hold the worker on a write forever: the job's own
+// context is deliberately not what bounds these, so nothing else would.
+//
+// A var so a test can shorten it; nothing writes it in production.
+var recordDeadline = 30 * time.Second
 
 // fail returns the job to the queue against its attempt budget.
 func (ix *indexer) fail(ctx context.Context, l zerolog.Logger, id, reason string) {
@@ -347,7 +516,14 @@ func (ix *indexer) failFinally(ctx context.Context, l zerolog.Logger, id, reason
 
 // recordFailure logs when the lease was already lost, rather than discarding
 // the one signal that says this worker's verdict was not recorded.
+//
+// ctx here is the process's, never the job's. A job that ran out of time is
+// exactly the one whose failure has to be written, and writing it on the
+// context that just expired writes nothing: the row stays 'leased' with no
+// reason on it until the lease runs out (spec §10).
 func (ix *indexer) recordFailure(ctx context.Context, l zerolog.Logger, id, reason string, maxAttempts int) {
+	ctx, cancel := context.WithTimeout(ctx, recordDeadline)
+	defer cancel()
 	err := ix.q.Fail(ctx, id, ix.id, reason, maxAttempts)
 	switch {
 	case err == nil:

@@ -13,6 +13,9 @@ import (
 
 // evictFresh clears every repo, because eviction is a whole-corpus operation:
 // a row left by another test is a row this one's counts have to explain.
+//
+// Safe only because TestMain gave this suite a database of its own. Run against
+// the DSN a reader points at, this DELETE is what took their corpus.
 func evictFresh(t *testing.T) *Store {
 	t.Helper()
 	ctx := context.Background()

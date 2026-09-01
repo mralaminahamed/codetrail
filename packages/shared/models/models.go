@@ -45,9 +45,11 @@ const (
 	KindType  SpanKind = "type"
 	KindConst SpanKind = "const"
 	KindVar   SpanKind = "var"
-	// KindFile is the fallback: a fixed window over a file the AST could not
-	// be read from. It is deliberately distinguishable, because the eval
-	// harness compares AST spans against exactly this.
+	// KindFile is a fixed window: over a file the AST could not be read from,
+	// over a declaration too long to be one span, or over anything at all
+	// under the window strategy. It does not say which arm produced a row —
+	// the AST strategy emits it too — so nothing may infer the strategy from
+	// it.
 	KindFile SpanKind = "file"
 )
 

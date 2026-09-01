@@ -1,0 +1,3 @@
+service: fixture
+ports:
+  - 8080
