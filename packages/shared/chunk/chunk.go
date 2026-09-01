@@ -84,9 +84,3 @@ func Chunks(filename string, src []byte, opt Options) ([]Chunk, error) {
 	}
 	return astChunks(filename, src, ls, opt), nil
 }
-
-// astChunks is Task 2's. Until it parses anything the AST strategy is its own
-// fallback, so the seam is exercised rather than returning nothing.
-func astChunks(filename string, src []byte, ls []string, opt Options) []Chunk {
-	return windows(ls, 1, len(ls), opt)
-}
