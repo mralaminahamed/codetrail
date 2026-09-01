@@ -12,7 +12,7 @@ import (
 // with the range and would survive a text-equals-slice check.
 func TestWindowRangesAreOneBasedInclusive(t *testing.T) {
 	src := lines(10)
-	got, err := Chunks("a.txt", src, winOpts(4, 1))
+	got, _, err := Chunks("a.txt", src, winOpts(4, 1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +40,7 @@ func TestWindowRangesAreOneBasedInclusive(t *testing.T) {
 // Overlap is what stops a declaration cut in half from being unretrievable in
 // both halves. Two adjacent windows must share exactly WindowOverlap lines.
 func TestWindowsOverlapByExactlyTheConfiguredLines(t *testing.T) {
-	got, err := Chunks("a.txt", lines(20), winOpts(5, 2))
+	got, _, err := Chunks("a.txt", lines(20), winOpts(5, 2))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +59,7 @@ func TestWindowsOverlapByExactlyTheConfiguredLines(t *testing.T) {
 // everything, so a gap between windows would be a silently unindexed region.
 func TestWindowsCoverEveryLine(t *testing.T) {
 	for _, n := range []int{1, 4, 5, 6, 19, 20, 21} {
-		got, err := Chunks("a.txt", lines(n), winOpts(5, 2))
+		got, _, err := Chunks("a.txt", lines(n), winOpts(5, 2))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -84,7 +84,7 @@ func TestWindowsCoverEveryLine(t *testing.T) {
 // a different id: it costs an embedding and can outrank the span it duplicates.
 func TestNoWindowIsContainedInAnother(t *testing.T) {
 	for _, n := range []int{6, 7, 8, 11, 12} {
-		got, err := Chunks("a.txt", lines(n), winOpts(5, 3))
+		got, _, err := Chunks("a.txt", lines(n), winOpts(5, 3))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -106,7 +106,7 @@ func TestNoWindowIsContainedInAnother(t *testing.T) {
 // of the row. The input is a.txt because this pins windows(); the strategy seam
 // is pinned by TestWindowStrategyIgnoresParseableGo.
 func TestWindowsAreKindFile(t *testing.T) {
-	got, _ := Chunks("a.txt", lines(9), winOpts(4, 1))
+	got, _, _ := Chunks("a.txt", lines(9), winOpts(4, 1))
 	for _, c := range got {
 		if c.Kind != models.KindFile || c.Symbol != "" {
 			t.Fatalf("got kind=%q symbol=%q, want file/empty", c.Kind, c.Symbol)

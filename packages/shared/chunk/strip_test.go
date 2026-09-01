@@ -98,8 +98,8 @@ func TestStripDocsRemovesDocProseAndKeepsCode(t *testing.T) {
 // two arms differ in where the cuts fall and in nothing else.
 func TestStrippedSourceWindowsToTheSameRanges(t *testing.T) {
 	src, out, _ := stripped(t, "docs.gotxt")
-	before, _ := Chunks("docs.go", src, winOpts(10, 2))
-	after, err := Chunks("docs.go", out, winOpts(10, 2))
+	before, _, _ := Chunks("docs.go", src, winOpts(10, 2))
+	after, _, err := Chunks("docs.go", out, winOpts(10, 2))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,8 +133,8 @@ func TestStrippedSourceWindowsToTheSameRanges(t *testing.T) {
 func TestStrippedSourceStillChunksToTheSameDeclarations(t *testing.T) {
 	src, out, _ := stripped(t, "docs.gotxt")
 	sl := strings.Split(strings.TrimSuffix(string(out), "\n"), "\n")
-	before, _ := Chunks("docs.go", src, astOpts())
-	after, err := Chunks("docs.go", out, astOpts())
+	before, _, _ := Chunks("docs.go", src, astOpts())
+	after, _, err := Chunks("docs.go", out, astOpts())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,7 +352,7 @@ func TestStripDocsBlanksDocCommentsInCRLFSource(t *testing.T) {
 	if strings.Contains(strings.ReplaceAll(string(out), "\r\n", ""), "\n") {
 		t.Fatalf("a CRLF line ending became a bare LF:\n%q", out)
 	}
-	got, err := Chunks("crlf.go", out, astOpts())
+	got, _, err := Chunks("crlf.go", out, astOpts())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -374,7 +374,7 @@ func TestStripDocsBlanksDocCommentsHoldingABareCarriageReturn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := Chunks("cr.go", out, astOpts())
+	got, _, err := Chunks("cr.go", out, astOpts())
 	if err != nil {
 		t.Fatal(err)
 	}

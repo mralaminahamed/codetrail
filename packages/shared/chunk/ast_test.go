@@ -24,7 +24,7 @@ func astOpts() Options { o := Defaults(); o.Strategy = StrategyAST; return o }
 // parser is handed src, so nothing is read from disk.
 func TestASTChunksOneSpanPerDeclaration(t *testing.T) {
 	src, _ := fixture(t, "decls.gotxt")
-	got, err := Chunks("sample.go", src, astOpts())
+	got, _, err := Chunks("sample.go", src, astOpts())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +56,7 @@ func TestASTChunksOneSpanPerDeclaration(t *testing.T) {
 // check would move with the shift and pass.
 func TestASTLineRangesAreOneBasedInclusive(t *testing.T) {
 	src, ls := fixture(t, "decls.gotxt")
-	got, err := Chunks("sample.go", src, astOpts())
+	got, _, err := Chunks("sample.go", src, astOpts())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestASTLineRangesAreOneBasedInclusive(t *testing.T) {
 // stripped corpus of Task 3 a different corpus rather than the same one.
 func TestSpanTextCarriesTheDocComment(t *testing.T) {
 	src, _ := fixture(t, "decls.gotxt")
-	got, _ := Chunks("sample.go", src, astOpts())
+	got, _, _ := Chunks("sample.go", src, astOpts())
 	for _, c := range got {
 		if c.Symbol == "Counter.Add" {
 			if !strings.Contains(c.Text, "// Add adds d and returns the new total.") ||
@@ -119,7 +119,7 @@ func TestSpanTextCarriesTheDocComment(t *testing.T) {
 // assertion below instead of panicking on a slice bound inside Chunks.
 func TestASTChunksDoNotOverlap(t *testing.T) {
 	src := []byte("package p\n\nfunc A() {}\nfunc B() {}\ntype T struct{}\nvar V = 1\n// trailing\n")
-	got, err := Chunks("p.go", src, astOpts())
+	got, _, err := Chunks("p.go", src, astOpts())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +147,7 @@ func TestMethodSymbolsDropPointerAndTypeParameters(t *testing.T) {
 		"func (s *Stack[T]) Push(x T) {}\n\n" +
 		"func (m Pair[K, V]) Get(k K) V { var v V; return v }\n\n" +
 		"func (c Counter) N() int { return 0 }\n")
-	got, err := Chunks("g.go", src, astOpts())
+	got, _, err := Chunks("g.go", src, astOpts())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +169,7 @@ func TestMethodSymbolsDropPointerAndTypeParameters(t *testing.T) {
 // file, which is the common case in generated Go, it is a slice out of range.)
 func TestLineDirectivesDoNotMoveRanges(t *testing.T) {
 	src := []byte("package p\n\n//line sample.y:1\nfunc F() {\n\t_ = 1\n}\n")
-	got, err := Chunks("gen.go", src, astOpts())
+	got, _, err := Chunks("gen.go", src, astOpts())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,7 +192,7 @@ func TestLineDirectivesDoNotMoveRanges(t *testing.T) {
 func TestUnparseableGoFallsBackToWindows(t *testing.T) {
 	src, ls := fixture(t, "broken.gotxt")
 	o := astOpts()
-	got, err := Chunks("broken.go", src, o)
+	got, _, err := Chunks("broken.go", src, o)
 	if err != nil {
 		t.Fatalf("a file that will not parse is a fallback, not an error: %v", err)
 	}
@@ -218,7 +218,7 @@ func TestUnparseableGoFallsBackToWindows(t *testing.T) {
 // contain "func (" must not decide anything.
 func TestNonGoFileIsWindowed(t *testing.T) {
 	md := []byte("# Title\n\nfunc (c *Counter) Add(d int) int {\n\nprose\n")
-	got, err := Chunks("README.md", md, astOpts())
+	got, _, err := Chunks("README.md", md, astOpts())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,7 +238,7 @@ func TestNonGoFileIsWindowed(t *testing.T) {
 	// non-Go file whose bytes *are* valid Go — a .gotxt fixture, a vendored
 	// .go.orig — which parses cleanly and must still be windowed.
 	src, _ := fixture(t, "decls.gotxt")
-	got, err = Chunks("decls.gotxt", src, astOpts())
+	got, _, err = Chunks("decls.gotxt", src, astOpts())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -257,7 +257,7 @@ func TestNonGoFileIsWindowed(t *testing.T) {
 // this is what keeps the baseline arm from quietly becoming the AST arm.
 func TestWindowStrategyIgnoresParseableGo(t *testing.T) {
 	src, ls := fixture(t, "decls.gotxt")
-	got, err := Chunks("sample.go", src, winOpts(5, 2))
+	got, _, err := Chunks("sample.go", src, winOpts(5, 2))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -286,7 +286,7 @@ func TestOverlongDeclarationIsSubWindowed(t *testing.T) {
 	b.WriteString("}\n")
 	o := astOpts()
 	o.MaxDeclLines = 50
-	got, err := Chunks("big.go", []byte(b.String()), o)
+	got, _, err := Chunks("big.go", []byte(b.String()), o)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,7 +318,7 @@ func TestDeclarationAtTheThresholdIsOneSpan(t *testing.T) {
 		b.WriteString("\t_ = 1\n")
 	}
 	b.WriteString("}\n") // decl is lines 3..12 inclusive = 10 lines
-	got, err := Chunks("x.go", []byte(b.String()), o)
+	got, _, err := Chunks("x.go", []byte(b.String()), o)
 	if err != nil {
 		t.Fatal(err)
 	}

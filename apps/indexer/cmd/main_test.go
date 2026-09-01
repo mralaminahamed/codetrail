@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/rs/zerolog"
 
@@ -863,6 +864,7 @@ var fixtureRepo = map[string]string{
 // the two writes, and the deadline each stage was handed.
 type recorder struct {
 	*fakeQueue
+	logged    *bytes.Buffer
 	files     []models.File
 	spans     []store.EmbeddedSpan
 	model     string
@@ -923,6 +925,10 @@ func stripping() fixtureOpt {
 	return func(t *testing.T, _ *fixture) { t.Setenv("STRIP_DOC_COMMENTS", "true") }
 }
 
+func windowed() fixtureOpt {
+	return func(t *testing.T, _ *fixture) { t.Setenv("CHUNK_STRATEGY", "window") }
+}
+
 func withBlockingEmbedder() fixtureOpt {
 	return func(_ *testing.T, f *fixture) { f.block = true }
 }
@@ -943,8 +949,8 @@ func fakeIndexer(t *testing.T, opts ...fixtureOpt) (*indexer, *recorder) {
 	t.Setenv("EMBED_PROVIDER", "fake")
 
 	q := &fakeQueue{}
-	ix, _ := testIndexer(t, q)
-	rec := &recorder{fakeQueue: q, deadlines: map[string]time.Time{}}
+	ix, logged := testIndexer(t, q)
+	rec := &recorder{fakeQueue: q, logged: logged, deadlines: map[string]time.Time{}}
 
 	var err error
 	if ix.opt, err = chunkOptions(); err != nil {
@@ -1452,5 +1458,48 @@ func TestAQueueWriteThatNeverReturnsIsBounded(t *testing.T) {
 	}
 	if len(rec.completedCtx) != 1 || !errors.Is(rec.completedCtx[0], context.DeadlineExceeded) {
 		t.Fatalf("want the write ended by its own bound, got %v", rec.completedCtx)
+	}
+}
+
+// The eval's baseline arm over the eval's corpus, on the file shape that broke
+// it: a package comment long enough that blanking it leaves a whole window
+// with no word left in it (rs/zerolog's log.go is ~100 lines of one).
+//
+// Measured before chunk dropped those windows, with exactly these settings on
+// the fake embedder spec §9 puts in CI: the job failed with "embedding spans
+// 576-607: embed: text 19 has no tokens to hash" and the repository wrote 0
+// rows, three attempts to terminal. The whole baseline arm of the eval was
+// unbuildable, which is what P2 exists to make possible.
+func TestTheEvalsWindowArmSurvivesAStrippedPackageComment(t *testing.T) {
+	var doc strings.Builder
+	for range 60 { // past one 40-line window, as zerolog's package comment is
+		doc.WriteString("// prose the golden set's questions are generated from.\n")
+	}
+	ix, rec := fakeIndexer(t, windowed(), stripping(), withFiles(map[string]string{
+		"log.go": doc.String() + "package p\n\nfunc F() int { return 1 }\n",
+	}))
+	// testIndexer's 1KB cap is for snippets; this fixture is a file, and one
+	// the walk skipped for size would produce no spans for the wrong reason.
+	ix.lim.walk.MaxFileBytes = 1 << 16
+	ix.runJob(context.Background(), aJob())
+
+	if r := rec.failReason(); r != "" {
+		t.Fatalf("the job failed instead of indexing: %s", r)
+	}
+	if len(rec.spans) == 0 {
+		t.Fatal("the stripped file produced no spans at all")
+	}
+	for _, s := range rec.spans {
+		if !strings.ContainsFunc(s.Text, func(r rune) bool {
+			return unicode.IsLetter(r) || unicode.IsDigit(r)
+		}) {
+			t.Errorf("span %s:%d-%d has nothing to embed:\n%q", s.Path, s.StartLine, s.EndLine, s.Text)
+		}
+	}
+	// One window is lost: lines 1-40 are all inside the blanked comment, and
+	// the next one reaches the code. Counted rather than dropped quietly — a
+	// silent drop is how a corpus shrinks with nothing to read about it.
+	if out := rec.logged.String(); !strings.Contains(out, `"tokenless":1`) {
+		t.Errorf("the dropped-chunk count is not in the log: %q", out)
 	}
 }

@@ -395,7 +395,7 @@ func (ix *indexer) runJob(ctx context.Context, job jobs.Job) {
 func (ix *indexer) index(ctx context.Context, l zerolog.Logger, repoID, root string, files []walk.File) ([]models.File, []store.EmbeddedSpan, error) {
 	rows := make([]models.File, 0, len(files))
 	var spans []store.EmbeddedSpan
-	var vanished, unstrippable int
+	var vanished, unstrippable, tokenless int
 	for _, f := range files {
 		// The job's deadline reaches the read stage here. MAX_FILE_BYTES bounds
 		// one read and MAX_REPO_FILES bounds how many there are, but neither
@@ -435,13 +435,14 @@ func (ix *indexer) index(ctx context.Context, l zerolog.Logger, repoID, root str
 			}
 			src = stripped
 		}
-		cs, cerr := chunk.Chunks(f.Path, src, ix.opt)
+		cs, blank, cerr := chunk.Chunks(f.Path, src, ix.opt)
 		if cerr != nil {
 			// Chunks errors only on an invalid Options, which chunkOptions
 			// refused at boot. Returned rather than ignored: it would mean the
 			// options changed under a running worker.
 			return nil, nil, fmt.Errorf("chunking %s: %w", f.Path, cerr)
 		}
+		tokenless += blank
 		for _, c := range cs {
 			digest := store.Digest(c.Text)
 			spans = append(spans, store.EmbeddedSpan{Span: models.Span{
@@ -452,9 +453,12 @@ func (ix *indexer) index(ctx context.Context, l zerolog.Logger, repoID, root str
 		}
 	}
 	// Once per job, not once per file: a repository of generated code would
-	// otherwise write a line per file into a log nobody can then read.
-	if vanished > 0 || unstrippable > 0 {
-		l.Warn().Int("vanished", vanished).Int("unstrippable", unstrippable).Msg("some files produced no spans")
+	// otherwise write a line per file into a log nobody can then read. Counted
+	// rather than dropped quietly — tokenless in particular is how a corpus
+	// shrinks without anyone noticing, since the job still succeeds.
+	if vanished > 0 || unstrippable > 0 || tokenless > 0 {
+		l.Warn().Int("vanished", vanished).Int("unstrippable", unstrippable).Int("tokenless", tokenless).
+			Msg("some of this repository produced no spans")
 	}
 	if err := ix.embedAll(ctx, spans); err != nil {
 		return nil, nil, err

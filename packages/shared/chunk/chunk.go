@@ -9,6 +9,7 @@ package chunk
 
 import (
 	"fmt"
+	"unicode"
 
 	"github.com/mralaminahamed/codetrail/packages/shared/models"
 )
@@ -65,22 +66,66 @@ func (o Options) Validate() error {
 	return nil
 }
 
-// Chunks cuts src according to opt. filename is what the parser reports in an
-// error and what decides whether the AST strategy tries at all; nothing is
-// read from disk.
+// Chunks cuts src according to opt, and reports how many regions it dropped
+// for having nothing to embed. filename is what the parser reports in an error
+// and what decides whether the AST strategy tries at all; nothing is read from
+// disk.
 //
 // It returns an error only for an invalid Options. A file that will not parse
 // is not an error here — it is the window fallback, which is the whole point.
-func Chunks(filename string, src []byte, opt Options) ([]Chunk, error) {
+func Chunks(filename string, src []byte, opt Options) ([]Chunk, int, error) {
 	if err := opt.Validate(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	ls := splitLines(src)
 	if len(ls) == 0 {
-		return nil, nil
+		return nil, 0, nil
 	}
+	var cs []Chunk
 	if opt.Strategy == StrategyWindow {
-		return windows(ls, 1, len(ls), opt), nil
+		cs = windows(ls, 1, len(ls), opt)
+	} else {
+		cs = astChunks(filename, src, ls, opt)
 	}
-	return astChunks(filename, src, ls, opt), nil
+	kept, dropped := retrievable(cs)
+	return kept, dropped, nil
+}
+
+// retrievable drops the chunks with nothing to embed and says how many.
+//
+// Here rather than in either strategy, and here rather than in the indexer:
+// "a span holds something retrievable" is what this package emits, so both
+// eval arms (spec §9) drop the same regions by construction — an AST arm that
+// kept a sub-window the baseline arm dropped would bias the one comparison §9
+// exists to make — and no caller has to remember. chunk knows nothing about
+// embedders, but it does not have to: a region with no word in it is not a
+// retrievable region under anyone's definition.
+func retrievable(cs []Chunk) ([]Chunk, int) {
+	kept := cs[:0]
+	for _, c := range cs {
+		if hasTokens(c.Text) {
+			kept = append(kept, c)
+		}
+	}
+	return kept, len(cs) - len(kept)
+}
+
+// hasTokens reports whether text holds anything an embedder can turn into a
+// vector: one letter or digit anywhere is enough.
+//
+// Measured, on the eval's own configuration — CHUNK_STRATEGY=window,
+// STRIP_DOC_COMMENTS=true over rs/zerolog: blanking log.go's ~100-line package
+// comment leaves three windows that are entirely blank lines, embed.Fake
+// refuses a text it can hash no token from, and the whole job fails with 0
+// repos and 0 spans written. Dropped rather than embedded: Ollama does answer
+// a blank text with a unit vector, but '[0,0,0]'::vector <=> '[1,2,3]'::vector
+// is NaN in pgvector, so any zero-ish fallback ranks unpredictably instead of
+// failing loudly, and there is nothing in the window to retrieve either way.
+func hasTokens(text string) bool {
+	for _, r := range text {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			return true
+		}
+	}
+	return false
 }
