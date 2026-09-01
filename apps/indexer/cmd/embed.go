@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -11,16 +13,22 @@ import (
 	"github.com/mralaminahamed/codetrail/packages/shared/store"
 )
 
-// newEmbedder builds the embedder from the environment and checks its width
-// against the schema before any job runs. Discovered at the first insert
-// instead, the same mismatch costs a clone, a walk and a whole embed pass
-// first, and PutSpans's refusal names a span where this one names the setting.
+// newEmbedder builds the embedder from the environment and proves it works
+// before any job runs: the width against the schema, and — for a real server —
+// one round trip that answers with a vector of that width.
+//
+// The round trip is what makes OLLAMA_URL and EMBED_MODEL boot-validated
+// rather than job-validated. Measured before it: `OLLAMA_URL='not a url at
+// all' EMBED_MODEL='no-such-model-xyz'` logged "indexer up" and the failure
+// surfaced on the first leased job's embed call, spending an attempt against
+// its cap for a setting no retry can fix. A worker that cannot embed cannot do
+// its job, so refusing to start is the honest form of that.
 //
 // timeout is the client's own budget for one request. It is the job's deadline
 // rather than a second, shorter number: the context already carries the job's
 // deadline into every request, and a per-request timeout below it would end an
 // embed the job still had time for.
-func newEmbedder(timeout time.Duration) (embed.Embedder, error) {
+func newEmbedder(ctx context.Context, timeout time.Duration) (embed.Embedder, error) {
 	dim := config.GetInt("EMBED_DIM", store.EmbeddingDim)
 	if err := store.CheckDim(dim); err != nil {
 		return nil, fmt.Errorf("EMBED_DIM=%d: %w", dim, err)
@@ -29,14 +37,54 @@ func newEmbedder(timeout time.Duration) (embed.Embedder, error) {
 	switch provider := config.Get("EMBED_PROVIDER", "ollama"); provider {
 	case "ollama":
 		// 11435 is what infra/docker-compose.yml publishes.
-		return embed.NewOllama(config.Get("OLLAMA_URL", "http://localhost:11435"), model, dim, timeout), nil
+		raw := config.Get("OLLAMA_URL", "http://localhost:11435")
+		// Parsed rather than handed to the client as-is: url.Parse accepts
+		// "not a url at all" as a relative path, so the scheme and host are
+		// what actually decide whether this is an address.
+		u, err := url.Parse(raw)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return nil, fmt.Errorf("OLLAMA_URL=%q is not an http:// or https:// address", raw)
+		}
+		o := embed.NewOllama(raw, model, dim, timeout)
+		if err := probe(ctx, o); err != nil {
+			return nil, fmt.Errorf("EMBED_MODEL=%q at OLLAMA_URL=%s: %w", model, raw, err)
+		}
+		return o, nil
 	case "fake":
 		// Spec §9: CI runs the harness with no model. The fake names itself in
 		// embed_model, so a corpus built with it is identifiable in the data.
+		// Not probed: it has no server to be wrong about, and CheckDim above is
+		// the whole of what could be misconfigured.
 		return embed.NewFake(dim), nil
 	default:
 		return nil, fmt.Errorf("EMBED_PROVIDER must be ollama or fake, got %q", provider)
 	}
+}
+
+// probeDeadline bounds that one round trip. Not the job deadline it is called
+// with: that defaults to ten minutes, and a worker that hangs for ten minutes
+// without saying why it did not start is worse than one that refuses.
+//
+// A var so a test can shorten it; nothing writes it in production.
+var probeDeadline = 30 * time.Second
+
+// probe embeds one short text and checks the answer's shape. A model that was
+// never pulled answers 404 here, where the message can name EMBED_MODEL,
+// rather than on the first job where it names a span.
+func probe(ctx context.Context, e embed.Embedder) error {
+	ctx, cancel := context.WithTimeout(ctx, probeDeadline)
+	defer cancel()
+	v, err := e.Embed(ctx, []string{"codetrail"})
+	if err != nil {
+		return err
+	}
+	if len(v) != 1 {
+		return fmt.Errorf("answered %d vectors for 1 text", len(v))
+	}
+	if len(v[0]) != e.Dim() {
+		return fmt.Errorf("answered a %d-wide vector, want %d", len(v[0]), e.Dim())
+	}
+	return nil
 }
 
 // chunkOptions reads the chunk knobs and refuses a set the chunker would not

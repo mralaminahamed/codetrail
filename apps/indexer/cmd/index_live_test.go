@@ -213,7 +213,7 @@ func indexLive(t *testing.T, st *store.Store, j liveJob) liveRun {
 	// From the environment, through the same constructor main uses: an
 	// embedder wired by hand here would prove the pipeline works with an
 	// embedder production never builds.
-	emb, err := newEmbedder(ix.lim.clone.Deadline)
+	emb, err := newEmbedder(ctx, ix.lim.clone.Deadline)
 	if err != nil {
 		t.Fatal(err)
 	}
