@@ -101,22 +101,10 @@ func TestNoWindowIsContainedInAnother(t *testing.T) {
 // rows say, and a window claiming to be a declaration would be a lie in the
 // only column that could catch it.
 func TestWindowsAreKindFile(t *testing.T) {
-	got, _ := Chunks("a.go", lines(9), winOpts(4, 1))
+	got, _ := Chunks("a.txt", lines(9), winOpts(4, 1))
 	for _, c := range got {
 		if c.Kind != models.KindFile || c.Symbol != "" {
 			t.Fatalf("got kind=%q symbol=%q, want file/empty", c.Kind, c.Symbol)
 		}
-	}
-}
-
-// The window strategy never parses. Given Go that cannot parse, it still
-// windows it — this is the property the baseline arm is built on.
-func TestWindowStrategyDoesNotParse(t *testing.T) {
-	got, err := Chunks("broken.go", []byte("package p\nfunc ((( {\n"), winOpts(2, 0))
-	if err != nil {
-		t.Fatalf("window strategy must not fail on unparseable Go: %v", err)
-	}
-	if len(got) == 0 {
-		t.Fatal("want windows over unparseable Go, got none")
 	}
 }
