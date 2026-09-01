@@ -96,7 +96,7 @@ func main() {
 	}
 	// Before the database connection, so a width that cannot be written is a
 	// refusal to boot rather than a job's worth of work discovering it.
-	emb, err := newEmbedder(lim.clone.Deadline)
+	emb, err := newEmbedder(ctx, lim.clone.Deadline)
 	if err != nil {
 		log.Fatal().Err(err).Msg("bad embedder")
 	}
