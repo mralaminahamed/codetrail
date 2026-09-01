@@ -3,7 +3,7 @@ BIN := bin
 .PHONY: build gateway indexer lint test up down psql
 
 DATABASE_URL ?= postgres://codetrail:codetrail@localhost:55432/codetrail?sslmode=disable
-OLLAMA_URL ?= http://localhost:11434
+OLLAMA_URL ?= http://localhost:11435
 export DATABASE_URL OLLAMA_URL
 
 build: gateway indexer
