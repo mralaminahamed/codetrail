@@ -384,6 +384,8 @@ func TestFailRetriesUntilTheCap(t *testing.T) {
 		t.Fatal(err)
 	}
 	const max = 2
+	// This test is about the attempt cap; the retry delay has its own.
+	q.RetryBase, q.RetryMax = 0, 0
 
 	if _, _, err := q.Lease(ctx, "w", time.Minute); err != nil {
 		t.Fatal(err)
@@ -398,8 +400,8 @@ func TestFailRetriesUntilTheCap(t *testing.T) {
 	if mid.Error != "clone failed" {
 		t.Fatalf("want the retry reason kept, got %q", mid.Error)
 	}
-	if by, until := leaseRow(t, q, j.ID); by != nil || until != nil {
-		t.Fatalf("a requeued job still holds a lease: by=%v until=%v", by, until)
+	if by, _ := leaseRow(t, q, j.ID); by != nil {
+		t.Fatalf("a requeued job still names a worker: %v", *by)
 	}
 
 	if _, _, err := q.Lease(ctx, "w", time.Minute); err != nil {
@@ -543,5 +545,91 @@ func TestEnqueueDedupesCaseVariantSpellings(t *testing.T) {
 	}
 	if c.ID == a.ID {
 		t.Fatal("two refs collapsed into one job")
+	}
+}
+
+// spec §4 and §10 both say attempts are capped *with backoff*. Without one,
+// Fail's 'pending' was claimable on the very next poll: measured, a repository
+// that does not exist burned all three attempts in nine seconds.
+func TestFailWaitsBeforeTheJobIsClaimableAgain(t *testing.T) {
+	ctx := context.Background()
+	q := queue(t)
+	q.RetryBase, q.RetryMax = 150*time.Millisecond, time.Minute
+
+	j, err := q.Enqueue(ctx, "https://github.com/a/b", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := q.Lease(ctx, "w", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Fail(ctx, j.ID, "w", "no such repository", 5); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pending, but not yet claimable: that is the whole point.
+	if got, _ := q.Get(ctx, j.ID); got.Status != StatusPending {
+		t.Fatalf("want pending, got %q", got.Status)
+	}
+	if _, ok, err := q.Lease(ctx, "w", time.Minute); err != nil || ok {
+		t.Fatalf("a job that just failed was leased again immediately (ok=%v err=%v)", ok, err)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	got, ok, err := q.Lease(ctx, "w", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("the job never became claimable: ok=%v err=%v", ok, err)
+	}
+	if got.Attempts != 2 {
+		t.Fatalf("want the second attempt, got %d", got.Attempts)
+	}
+}
+
+// A forge that is down should not be polled at the same rate forever, and a
+// doubling delay must still stop somewhere.
+func TestRetryDelayDoublesAndIsCapped(t *testing.T) {
+	ctx := context.Background()
+	q := queue(t)
+	q.RetryBase, q.RetryMax = time.Hour, 3*time.Hour
+
+	j, err := q.Enqueue(ctx, "https://github.com/a/b", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var delays []time.Duration
+	for range 3 {
+		if _, _, err := q.Lease(ctx, "w", time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		if err := q.Fail(ctx, j.ID, "w", "down", 99); err != nil {
+			t.Fatal(err)
+		}
+		_, until := leaseRow(t, q, j.ID)
+		if until == nil {
+			t.Fatal("a job waiting to retry has no retry time")
+		}
+		delays = append(delays, time.Until(*until))
+		// Bring the retry time forward so the next Lease can claim it.
+		if _, err := q.pool.Exec(ctx, `UPDATE jobs SET leased_until = now() WHERE id = $1`, j.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !(delays[1] > delays[0]) {
+		t.Fatalf("the delay did not grow: %v", delays)
+	}
+	if delays[2] > 3*time.Hour+time.Minute {
+		t.Fatalf("the delay passed RetryMax: %v", delays)
+	}
+}
+
+// The shipped bounds, pinned: a test that only ever sets its own would pass
+// against a base of zero.
+func TestNewUsesTheShippedRetryBounds(t *testing.T) {
+	q := queue(t)
+	if q.RetryBase != DefaultRetryBase || q.RetryMax != DefaultRetryMax {
+		t.Fatalf("New gave base=%v max=%v", q.RetryBase, q.RetryMax)
+	}
+	if q.RetryBase <= 0 || q.RetryBase > q.RetryMax {
+		t.Fatalf("the bounds are not a usable range: base=%v max=%v", q.RetryBase, q.RetryMax)
 	}
 }
