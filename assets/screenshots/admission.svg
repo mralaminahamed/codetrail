@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="402" viewBox="0 0 1024 402" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="14">
+<rect width="1024" height="402" rx="12" fill="#0f1319"/>
+<path d="M0 12 a12 12 0 0 1 12 -12 h1000 a12 12 0 0 1 12 12 v28 h-1024 z" fill="#1b212b"/>
+<circle cx="24" cy="20" r="6" fill="#ff5f57"/>
+<circle cx="44" cy="20" r="6" fill="#febc2e"/>
+<circle cx="64" cy="20" r="6" fill="#28c840"/>
+<text x="512.0" y="25" fill="#8b949e" font-size="12" text-anchor="middle">codetrail — admission: every rejection names the rule that fired</text>
+<text x="28.0" y="62" fill="#7ee787" xml:space="preserve">$ </text>
+<text x="44.8" y="62" fill="#c9d1d9" xml:space="preserve">for u in &quot;${URLS[@]}&quot;; do curl -s -XPOST localhost:8080/api/repos -d &quot;{\&quot;remote\&quot;:\&quot;$u\&quot;,\&quot;ref\&quot;:\&quot;main\&quot;}&quot;; done</text>
+<text x="28.0" y="114" fill="#8b949e" xml:space="preserve">http://github.com/octocat/Hello-World    {</text>
+<text x="381.6" y="114" fill="#8b949e" xml:space="preserve">&quot;error&quot;:</text>
+<text x="449.0" y="114" fill="#ff9492" xml:space="preserve">&quot;scheme \&quot;http\&quot;; only https is accepted&quot;</text>
+<text x="794.2" y="114" fill="#8b949e" xml:space="preserve">,</text>
+<text x="802.6" y="114" fill="#8b949e" xml:space="preserve">&quot;rule&quot;:</text>
+<text x="861.6" y="114" fill="#e8a33f" xml:space="preserve">&quot;scheme&quot;</text>
+<text x="928.9" y="114" fill="#8b949e" xml:space="preserve">}</text>
+<text x="28.0" y="140" fill="#8b949e" xml:space="preserve">https://gitlab.com/a/b                   {</text>
+<text x="381.6" y="140" fill="#8b949e" xml:space="preserve">&quot;error&quot;:</text>
+<text x="449.0" y="140" fill="#ff9492" xml:space="preserve">&quot;gitlab.com is not an allowed host&quot;</text>
+<text x="743.7" y="140" fill="#8b949e" xml:space="preserve">,</text>
+<text x="752.1" y="140" fill="#8b949e" xml:space="preserve">&quot;rule&quot;:</text>
+<text x="811.1" y="140" fill="#e8a33f" xml:space="preserve">&quot;host&quot;</text>
+<text x="861.6" y="140" fill="#8b949e" xml:space="preserve">}</text>
+<text x="28.0" y="166" fill="#8b949e" xml:space="preserve">https://github.com.evil.example/a/b      {</text>
+<text x="381.6" y="166" fill="#8b949e" xml:space="preserve">&quot;error&quot;:</text>
+<text x="449.0" y="166" fill="#ff9492" xml:space="preserve">&quot;github.com.evil.example is not an allowed host&quot;</text>
+<text x="853.2" y="166" fill="#8b949e" xml:space="preserve">,</text>
+<text x="861.6" y="166" fill="#8b949e" xml:space="preserve">&quot;rule&quot;:</text>
+<text x="920.5" y="166" fill="#e8a33f" xml:space="preserve">&quot;host&quot;</text>
+<text x="971.0" y="166" fill="#8b949e" xml:space="preserve">}</text>
+<text x="28.0" y="192" fill="#8b949e" xml:space="preserve">https://user:pw@github.com/a/b           {</text>
+<text x="381.6" y="192" fill="#8b949e" xml:space="preserve">&quot;error&quot;:</text>
+<text x="449.0" y="192" fill="#ff9492" xml:space="preserve">&quot;credentials in the URL&quot;</text>
+<text x="651.1" y="192" fill="#8b949e" xml:space="preserve">,</text>
+<text x="659.5" y="192" fill="#8b949e" xml:space="preserve">&quot;rule&quot;:</text>
+<text x="718.4" y="192" fill="#e8a33f" xml:space="preserve">&quot;form&quot;</text>
+<text x="769.0" y="192" fill="#8b949e" xml:space="preserve">}</text>
+<text x="28.0" y="218" fill="#8b949e" xml:space="preserve">https://github.com:8443/a/b              {</text>
+<text x="381.6" y="218" fill="#8b949e" xml:space="preserve">&quot;error&quot;:</text>
+<text x="449.0" y="218" fill="#ff9492" xml:space="preserve">&quot;port \&quot;8443\&quot;&quot;</text>
+<text x="575.3" y="218" fill="#8b949e" xml:space="preserve">,</text>
+<text x="583.7" y="218" fill="#8b949e" xml:space="preserve">&quot;rule&quot;:</text>
+<text x="642.7" y="218" fill="#e8a33f" xml:space="preserve">&quot;form&quot;</text>
+<text x="693.2" y="218" fill="#8b949e" xml:space="preserve">}</text>
+<text x="28.0" y="244" fill="#8b949e" xml:space="preserve">https://github.com/a/b/c                 {</text>
+<text x="381.6" y="244" fill="#8b949e" xml:space="preserve">&quot;error&quot;:</text>
+<text x="449.0" y="244" fill="#ff9492" xml:space="preserve">&quot;path must be /owner/name&quot;</text>
+<text x="667.9" y="244" fill="#8b949e" xml:space="preserve">,</text>
+<text x="676.3" y="244" fill="#8b949e" xml:space="preserve">&quot;rule&quot;:</text>
+<text x="735.3" y="244" fill="#e8a33f" xml:space="preserve">&quot;form&quot;</text>
+<text x="785.8" y="244" fill="#8b949e" xml:space="preserve">}</text>
+<text x="28.0" y="270" fill="#8b949e" xml:space="preserve">https://github.com/a/../../etc           {</text>
+<text x="381.6" y="270" fill="#8b949e" xml:space="preserve">&quot;error&quot;:</text>
+<text x="449.0" y="270" fill="#ff9492" xml:space="preserve">&quot;path must be /owner/name&quot;</text>
+<text x="667.9" y="270" fill="#8b949e" xml:space="preserve">,</text>
+<text x="676.3" y="270" fill="#8b949e" xml:space="preserve">&quot;rule&quot;:</text>
+<text x="735.3" y="270" fill="#e8a33f" xml:space="preserve">&quot;form&quot;</text>
+<text x="785.8" y="270" fill="#8b949e" xml:space="preserve">}</text>
+<text x="28.0" y="322" fill="#8b949e" xml:space="preserve"># Admission runs before anything is fetched. A suffix match would accept</text>
+<text x="28.0" y="348" fill="#8b949e" xml:space="preserve"># github.com.evil.example; the allowlist is exact.</text>
+</svg>
