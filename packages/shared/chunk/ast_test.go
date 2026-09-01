@@ -111,14 +111,31 @@ func TestSpanTextCarriesTheDocComment(t *testing.T) {
 
 // Nothing spans two declarations, and no two spans overlap. An overlap would
 // mean one line answers as two documents.
+//
+// Not decls.gotxt: that fixture has a blank line between every declaration, so
+// no off-by-one on EndLine can produce an overlap and this test passed whatever
+// the chunker did. Only adjacent declarations discriminate. The trailing
+// comment keeps the last one off the last line, so an off-by-one fails the
+// assertion below instead of panicking on a slice bound inside Chunks.
 func TestASTChunksDoNotOverlap(t *testing.T) {
-	src, _ := fixture(t, "decls.gotxt")
-	got, _ := Chunks("sample.go", src, astOpts())
+	src := []byte("package p\n\nfunc A() {}\nfunc B() {}\ntype T struct{}\nvar V = 1\n// trailing\n")
+	got, err := Chunks("p.go", src, astOpts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 4 {
+		t.Fatalf("got %d chunks, want the 4 declarations", len(got))
+	}
 	for i := 1; i < len(got); i++ {
 		if got[i].StartLine <= got[i-1].EndLine {
 			t.Fatalf("%s (%d..%d) overlaps %s (%d..%d)",
 				got[i].Symbol, got[i].StartLine, got[i].EndLine,
 				got[i-1].Symbol, got[i-1].StartLine, got[i-1].EndLine)
+		}
+		if got[i].StartLine != got[i-1].EndLine+1 {
+			t.Fatalf("%s and %s are not adjacent (%d..%d, %d..%d): a gap is a blank line, and with one this test discriminates nothing",
+				got[i-1].Symbol, got[i].Symbol,
+				got[i-1].StartLine, got[i-1].EndLine, got[i].StartLine, got[i].EndLine)
 		}
 	}
 }
