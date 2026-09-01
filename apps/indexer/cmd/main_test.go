@@ -14,6 +14,7 @@ import (
 
 	"github.com/mralaminahamed/codetrail/apps/indexer/internal/clone"
 	"github.com/mralaminahamed/codetrail/apps/indexer/internal/walk"
+	"github.com/mralaminahamed/codetrail/packages/shared/admit"
 	"github.com/mralaminahamed/codetrail/packages/shared/jobs"
 	"github.com/mralaminahamed/codetrail/packages/shared/models"
 	"github.com/mralaminahamed/codetrail/packages/shared/store"
@@ -80,12 +81,15 @@ func testIndexer(t *testing.T, q *fakeQueue) (*indexer, *bytes.Buffer) {
 		// more would pass on a line production never writes.
 		log:     zerolog.New(&logged).Level(zerolog.InfoLevel),
 		q:       q,
+		hosts:   admit.NewPolicy(admit.DefaultHosts),
 		id:      testWorker,
 		scratch: t.TempDir(),
 		lim: limits{
 			clone: clone.Limits{MaxBytes: 1 << 20, Deadline: 30 * time.Second},
 			walk:  walk.Limits{MaxFiles: 10, MaxFileBytes: 1 << 10},
-			tries: 3,
+			// Not the production default of 3: a literal 3 in place of
+			// ix.lim.tries would otherwise be invisible here.
+			tries: 4,
 			poll:  time.Millisecond,
 		},
 		clone: func(context.Context, string, string, string, clone.Limits) (clone.Result, error) {
@@ -176,7 +180,10 @@ func TestRunJobIndexesAndCompletes(t *testing.T) {
 	q := &fakeQueue{}
 	ix, _ := testIndexer(t, q)
 	job := aJob()
-	dir := filepath.Join(ix.scratch, job.ID)
+	// Under the worker's own subtree, not the shared root: two indexers on one
+	// SCRATCH_DIR otherwise collide on scratch/<job>, and each one's RemoveAll
+	// destroys the other's checkout.
+	dir := filepath.Join(ix.scratch, ix.id, job.ID)
 
 	ix.clone = func(_ context.Context, remote, ref, d string, lim clone.Limits) (clone.Result, error) {
 		if remote != job.Remote || ref != job.Ref {
@@ -212,7 +219,7 @@ func TestRunJobIndexesAndCompletes(t *testing.T) {
 	ix.runJob(context.Background(), job)
 
 	repoID := store.RepoID(job.Remote, testCommit)
-	wantRepo := models.Repo{ID: repoID, Remote: job.Remote, Ref: job.Ref, Commit: testCommit}
+	wantRepo := models.Repo{ID: repoID, Remote: job.Remote, Ref: job.Ref, Commit: testCommit, SizeBytes: 4096}
 	if gotRepo != wantRepo {
 		t.Errorf("repo: want %+v, got %+v", wantRepo, gotRepo)
 	}
@@ -281,7 +288,7 @@ func TestRunJobRemovesTheScratchTreeOnEveryPath(t *testing.T) {
 			job := aJob()
 			ix.runJob(context.Background(), job)
 
-			if _, err := os.Stat(filepath.Join(ix.scratch, job.ID)); !errors.Is(err, os.ErrNotExist) {
+			if _, err := os.Stat(filepath.Join(ix.scratch, ix.id, job.ID)); !errors.Is(err, os.ErrNotExist) {
 				t.Errorf("the checkout is still on disk: %v", err)
 			}
 			if tc.fails {
@@ -302,7 +309,7 @@ func TestRunJobClearsALeftoverCheckoutBeforeCloning(t *testing.T) {
 	q := &fakeQueue{}
 	ix, _ := testIndexer(t, q)
 	job := aJob()
-	dir := filepath.Join(ix.scratch, job.ID)
+	dir := filepath.Join(ix.scratch, ix.id, job.ID)
 	if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -395,33 +402,120 @@ func TestAJobBeyondItsAttemptBudgetIsFailedPermanently(t *testing.T) {
 // Losing the lease is normal — the job was reclaimed while this worker ran.
 // Silently dropping the error is not: it is the only sign that this worker's
 // verdict was never recorded against the job it thought it held.
+//
+// And only ErrNotLeased means the lease is gone. Under SIGTERM mid-clone the
+// error is a cancelled context and the lease is still held; a line saying
+// otherwise tells an operator something the code has not established.
 func TestALostLeaseIsLogged(t *testing.T) {
-	t.Run("completing", func(t *testing.T) {
-		q := &fakeQueue{completeErr: jobs.ErrNotLeased}
-		ix, logged := testIndexer(t, q)
-		ix.clone = func(_ context.Context, _, _, d string, _ clone.Limits) (clone.Result, error) {
-			return clone.Result{Dir: d, Commit: testCommit}, nil
-		}
-		ix.walk = func(string, walk.Limits) ([]walk.File, error) { return nil, nil }
-		ix.put = func(context.Context, models.Repo, []models.File) error { return nil }
+	lost := "lease no longer held"
+	for _, tc := range []struct {
+		name     string
+		err      error
+		wantLost bool
+	}{
+		{"complete loses the lease", jobs.ErrNotLeased, true},
+		{"complete is cancelled", context.Canceled, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q := &fakeQueue{completeErr: tc.err}
+			ix, logged := testIndexer(t, q)
+			ix.clone = func(_ context.Context, _, _, d string, _ clone.Limits) (clone.Result, error) {
+				return clone.Result{Dir: d, Commit: testCommit}, nil
+			}
+			ix.walk = func(string, walk.Limits) ([]walk.File, error) { return nil, nil }
+			ix.put = func(context.Context, models.Repo, []models.File) error { return nil }
 
-		ix.runJob(context.Background(), aJob())
-		if !strings.Contains(logged.String(), "lease") {
-			t.Errorf("a lost lease left no trace in the log: %q", logged.String())
-		}
-	})
+			ix.runJob(context.Background(), aJob())
+			out := logged.String()
+			if !strings.Contains(out, "could not complete") {
+				t.Errorf("a failed completion left no trace: %q", out)
+			}
+			if got := strings.Contains(out, lost); got != tc.wantLost {
+				t.Errorf("said %q: %v, want %v — %q", lost, got, tc.wantLost, out)
+			}
+		})
+	}
 
-	t.Run("failing", func(t *testing.T) {
-		q := &fakeQueue{failErr: jobs.ErrNotLeased}
-		ix, logged := testIndexer(t, q)
-		ix.clone = func(context.Context, string, string, string, clone.Limits) (clone.Result, error) {
-			return clone.Result{}, errors.New("clone exploded")
+	for _, tc := range []struct {
+		name     string
+		err      error
+		wantLost bool
+	}{
+		{"fail loses the lease", jobs.ErrNotLeased, true},
+		{"fail is cancelled", context.Canceled, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q := &fakeQueue{failErr: tc.err}
+			ix, logged := testIndexer(t, q)
+			ix.clone = func(context.Context, string, string, string, clone.Limits) (clone.Result, error) {
+				return clone.Result{}, errors.New("clone exploded")
+			}
+			ix.runJob(context.Background(), aJob())
+			out := logged.String()
+			if !strings.Contains(out, "could not record failure") {
+				t.Errorf("a failure that was never recorded left no trace: %q", out)
+			}
+			if got := strings.Contains(out, lost); got != tc.wantLost {
+				t.Errorf("said %q: %v, want %v — %q", lost, got, tc.wantLost, out)
+			}
+		})
+	}
+}
+
+// The scratch tree is this worker's alone, and a sweep must not reach into a
+// peer's: nothing here can tell a crashed worker's directory from a live one's.
+func TestSweepHomeLeavesAPeersTreeAlone(t *testing.T) {
+	q := &fakeQueue{}
+	ix, _ := testIndexer(t, q)
+	peer := filepath.Join(ix.scratch, "another-worker", "job9")
+	if err := os.MkdirAll(peer, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mine := filepath.Join(ix.home(), "job1")
+	if err := os.MkdirAll(mine, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(ix.home(), filepath.Join(ix.scratch, ix.id)) {
+		t.Fatalf("home %q is not this worker's own subtree", ix.home())
+	}
+
+	ix.sweepHome()
+
+	if _, err := os.Stat(mine); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("this worker's tree survived its own sweep: %v", err)
+	}
+	if _, err := os.Stat(peer); err != nil {
+		t.Errorf("a peer's checkout was swept away: %v", err)
+	}
+}
+
+// The binary's doc comment claims this is the component that handles the
+// untrusted URL. A row it did not admit — an allowlist edited since, or a
+// write that did not come from the gateway — reaches git otherwise.
+func TestAnInadmissibleRemoteIsRefusedWithoutCloning(t *testing.T) {
+	for _, tc := range []struct {
+		remote  string
+		wantMax int // 0 is permanent; tries keeps the budget
+	}{
+		{"file:///etc/passwd", 0},
+		{"http://github.com/a/b", 0},
+		{"https://github.com/a/b/../../etc", 0},
+		{"https://evil.test/a/b", -1}, // -1 means "the attempt budget"
+	} {
+		q := &fakeQueue{}
+		ix, _ := testIndexer(t, q)
+		want := tc.wantMax
+		if want == -1 {
+			want = ix.lim.tries
 		}
-		ix.runJob(context.Background(), aJob())
-		if !strings.Contains(logged.String(), "lease") {
-			t.Errorf("a failure that was never recorded left no trace: %q", logged.String())
+		job := aJob()
+		job.Remote = tc.remote
+		ix.runJob(context.Background(), job)
+
+		if len(q.failed) != 1 || q.failed[0].max != want {
+			t.Errorf("%s: want one failure with max %d, got %+v", tc.remote, want, q.failed)
 		}
-	})
+	}
 }
 
 // run leases as this worker, for longer than the clone may take, and stops

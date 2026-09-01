@@ -136,7 +136,8 @@ func TestGetRepoAndTouchRepoLive(t *testing.T) {
 		t.Fatalf("want ErrNotFound for an unknown id, got %v", err)
 	}
 
-	if err := s.PutRepo(ctx, models.Repo{ID: id, Remote: remote, Ref: "main", Commit: commit}, nil); err != nil {
+	r := models.Repo{ID: id, Remote: remote, Ref: "main", Commit: commit, SizeBytes: 4242}
+	if err := s.PutRepo(ctx, r, nil); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.GetRepo(ctx, id)
@@ -145,6 +146,19 @@ func TestGetRepoAndTouchRepoLive(t *testing.T) {
 	}
 	if got.Remote != remote || got.Commit != commit || got.Ref != "main" {
 		t.Fatalf("read back %+v", got)
+	}
+	// size_bytes is known only while the checkout exists, and the checkout is
+	// deleted the moment the job ends. A column nothing writes reads 0 for
+	// every repo, which invites a size-based eviction that ranks nonsense.
+	if got.SizeBytes != 4242 {
+		t.Fatalf("want size_bytes 4242, got %d", got.SizeBytes)
+	}
+	r.SizeBytes = 8484
+	if err := s.PutRepo(ctx, r, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got, err = s.GetRepo(ctx, id); err != nil || got.SizeBytes != 8484 {
+		t.Fatalf("a re-index must update size_bytes: %d, %v", got.SizeBytes, err)
 	}
 	if got.IndexedAt.IsZero() {
 		t.Fatal("indexed_at did not come back")

@@ -47,11 +47,12 @@ func (s *Store) PutRepo(ctx context.Context, r models.Repo, files []models.File)
 	defer tx.Rollback(ctx)
 
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO repos (id, remote, ref, commit_sha, file_count)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO repos (id, remote, ref, commit_sha, file_count, size_bytes)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (id) DO UPDATE SET
-			ref = EXCLUDED.ref, file_count = EXCLUDED.file_count, indexed_at = now()`,
-		r.ID, r.Remote, r.Ref, r.Commit, len(files)); err != nil {
+			ref = EXCLUDED.ref, file_count = EXCLUDED.file_count,
+			size_bytes = EXCLUDED.size_bytes, indexed_at = now()`,
+		r.ID, r.Remote, r.Ref, r.Commit, len(files), r.SizeBytes); err != nil {
 		return fmt.Errorf("repo: %w", err)
 	}
 	for _, f := range files {
@@ -70,8 +71,8 @@ func (s *Store) PutRepo(ctx context.Context, r models.Repo, files []models.File)
 func (s *Store) GetRepo(ctx context.Context, id string) (models.Repo, error) {
 	var r models.Repo
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, remote, ref, commit_sha, indexed_at FROM repos WHERE id = $1`, id).
-		Scan(&r.ID, &r.Remote, &r.Ref, &r.Commit, &r.IndexedAt)
+		`SELECT id, remote, ref, commit_sha, size_bytes, indexed_at FROM repos WHERE id = $1`, id).
+		Scan(&r.ID, &r.Remote, &r.Ref, &r.Commit, &r.SizeBytes, &r.IndexedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return models.Repo{}, ErrNotFound
 	}
