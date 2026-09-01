@@ -1,6 +1,7 @@
 package walk
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -41,7 +42,7 @@ func TestListsRegularFilesWithRelativePaths(t *testing.T) {
 		"internal/a/b.go": "package a\n",
 		"README.md":       "# hi\n",
 	})
-	got, err := Files(root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
+	got, err := Files(context.Background(), root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +74,7 @@ func TestNeverFollowsSymlinks(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := Files(root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
+	got, err := Files(context.Background(), root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +96,7 @@ func TestSkipsDotGit(t *testing.T) {
 		".git/config":          "[core]\n",
 		".git/objects/aa/bbbb": "binary",
 	})
-	got, err := Files(root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
+	got, err := Files(context.Background(), root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +113,7 @@ func TestCountsLinesAndDetectsLanguage(t *testing.T) {
 		"b.md":  "# t\n",
 		"c.bin": "\x00\x01\x02",
 	})
-	got, err := Files(root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
+	got, err := Files(context.Background(), root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +137,7 @@ func TestCountsLinesAndDetectsLanguage(t *testing.T) {
 func TestSkipsOversizedFiles(t *testing.T) {
 	big := make([]byte, 4096)
 	root := tree(t, map[string]string{"small.go": "package a\n", "huge.go": string(big)})
-	got, err := Files(root, Limits{MaxFiles: 100, MaxFileBytes: 1024})
+	got, err := Files(context.Background(), root, Limits{MaxFiles: 100, MaxFileBytes: 1024})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +157,7 @@ func TestRefusesTooManyFiles(t *testing.T) {
 	for i := range 20 {
 		files[string(rune('a'+i))+".go"] = "package a\n"
 	}
-	_, err := Files(tree(t, files), Limits{MaxFiles: 5, MaxFileBytes: 1 << 20})
+	_, err := Files(context.Background(), tree(t, files), Limits{MaxFiles: 5, MaxFileBytes: 1 << 20})
 	if !errors.Is(err, ErrTooManyFiles) {
 		t.Fatalf("want ErrTooManyFiles, got %v", err)
 	}
@@ -183,7 +184,7 @@ func TestNeverDescendsIntoALinkedDirectory(t *testing.T) {
 	outside := tree(t, map[string]string{"leak.go": "package leak\n", "deep/er.go": "package er\n"})
 	link(t, outside, filepath.Join(root, "vendor"))
 
-	got, err := Files(root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
+	got, err := Files(context.Background(), root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +198,7 @@ func TestSurvivesASymlinkLoop(t *testing.T) {
 	link(t, filepath.Join(root, "b"), filepath.Join(root, "a"))
 	link(t, filepath.Join(root, "a"), filepath.Join(root, "b"))
 
-	got, err := Files(root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
+	got, err := Files(context.Background(), root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +211,7 @@ func TestALinkBackIntoTheTreeDoesNotRecurse(t *testing.T) {
 	root := tree(t, map[string]string{"sub/x.go": "package x\n"})
 	link(t, root, filepath.Join(root, "sub", "up"))
 
-	got, err := Files(root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
+	got, err := Files(context.Background(), root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +226,7 @@ func TestSkipsADeviceAndADanglingLink(t *testing.T) {
 	link(t, "/dev/zero", filepath.Join(root, "zero"))
 	link(t, "/nonexistent/nope", filepath.Join(root, "dangling"))
 
-	got, err := Files(root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
+	got, err := Files(context.Background(), root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,7 +245,7 @@ func TestSkipsAFifo(t *testing.T) {
 	var got []File
 	var ferr error
 	go func() {
-		got, ferr = Files(root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
+		got, ferr = Files(context.Background(), root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
 		close(done)
 	}()
 	select {
@@ -270,7 +271,7 @@ func TestSkipsADotGitThatIsASymlink(t *testing.T) {
 	real := tree(t, map[string]string{"config": "[core]\n", "objects/aa/bbbb": "binary"})
 	link(t, real, filepath.Join(root, ".git"))
 
-	got, err := Files(root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
+	got, err := Files(context.Background(), root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,7 +289,7 @@ func TestSkipsADotGitThatIsAFile(t *testing.T) {
 		".git":    "gitdir: /home/victim/private/.git\n",
 		"main.go": "package main\n",
 	})
-	got, err := Files(root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
+	got, err := Files(context.Background(), root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,7 +310,7 @@ func TestDoesNotSkipDotGitLookalikes(t *testing.T) {
 		".gitignore":               "vendor\n",
 		".github/workflows/ci.yml": "on: push\n",
 	})
-	got, err := Files(root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
+	got, err := Files(context.Background(), root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -330,7 +331,7 @@ func TestSkipsPathsThatAreNotUTF8(t *testing.T) {
 		"bad\xff\xfename.go": "package bad\n",
 		"d\xffir/inner.go":   "package inner\n",
 	})
-	got, err := Files(root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
+	got, err := Files(context.Background(), root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,7 +356,7 @@ func TestRefusesNonPositiveCaps(t *testing.T) {
 		{MaxFiles: 100, MaxFileBytes: 0},
 		{MaxFiles: 100, MaxFileBytes: -1},
 	} {
-		_, err := Files(root, lim)
+		_, err := Files(context.Background(), root, lim)
 		if err == nil {
 			t.Fatalf("%+v was accepted", lim)
 		}
@@ -374,7 +375,7 @@ func TestSizeCapIsExclusive(t *testing.T) {
 		"at.go":   string(make([]byte, 1024)),
 		"over.go": string(make([]byte, 1025)),
 	})
-	got, err := Files(root, Limits{MaxFiles: 100, MaxFileBytes: 1024})
+	got, err := Files(context.Background(), root, Limits{MaxFiles: 100, MaxFileBytes: 1024})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -393,7 +394,7 @@ func TestFileCapIsReachableButNotExceedable(t *testing.T) {
 	for i := range 5 {
 		five[string(rune('a'+i))+".go"] = "package a\n"
 	}
-	got, err := Files(tree(t, five), Limits{MaxFiles: 5, MaxFileBytes: 1 << 20})
+	got, err := Files(context.Background(), tree(t, five), Limits{MaxFiles: 5, MaxFileBytes: 1 << 20})
 	if err != nil {
 		t.Fatalf("exactly MaxFiles must be accepted, got %v", err)
 	}
@@ -404,14 +405,14 @@ func TestFileCapIsReachableButNotExceedable(t *testing.T) {
 	for i := range 6 {
 		six[string(rune('a'+i))+".go"] = "package a\n"
 	}
-	if _, err := Files(tree(t, six), Limits{MaxFiles: 5, MaxFileBytes: 1 << 20}); !errors.Is(err, ErrTooManyFiles) {
+	if _, err := Files(context.Background(), tree(t, six), Limits{MaxFiles: 5, MaxFileBytes: 1 << 20}); !errors.Is(err, ErrTooManyFiles) {
 		t.Fatalf("MaxFiles+1 must be fatal, got %v", err)
 	}
 }
 
 func TestRecordsByteSizeAndLowercasesTheExtension(t *testing.T) {
 	root := tree(t, map[string]string{"MAIN.GO": "package main\n", "s.md": "ab"})
-	got, err := Files(root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
+	got, err := Files(context.Background(), root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -443,7 +444,7 @@ func TestAnUnreadableDirectoryIsFatal(t *testing.T) {
 	}
 	t.Cleanup(func() { os.Chmod(locked, 0o755) })
 
-	if _, err := Files(root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20}); err == nil {
+	if _, err := Files(context.Background(), root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20}); err == nil {
 		t.Fatal("an unreadable directory must fail the walk")
 	}
 }
@@ -452,7 +453,7 @@ func TestAnUnreadableDirectoryIsFatal(t *testing.T) {
 // and still name a file outside the checkout.
 func TestPathsStayInsideTheCheckout(t *testing.T) {
 	root := tree(t, map[string]string{"main.go": "package main\n", "a/b/c.go": "package c\n"})
-	got, err := Files(root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
+	got, err := Files(context.Background(), root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -476,7 +477,7 @@ func TestALinkToAFileOutsideTheTreeIsNotIndexed(t *testing.T) {
 	}
 	link(t, outside, filepath.Join(root, "escape.txt"))
 
-	got, err := Files(root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
+	got, err := Files(context.Background(), root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -487,7 +488,7 @@ func TestALinkToAFileOutsideTheTreeIsNotIndexed(t *testing.T) {
 
 // The DirEntry's "regular file" came from the parent directory's listing, and
 // nothing holds an attacker-controlled checkout still afterwards. These pin
-// what readRegular re-decides on the file itself, deterministically; the two
+// what ReadRegular re-decides on the file itself, deterministically; the two
 // racing tests below show the same swaps happening for real.
 func TestReadRegularRefusesALinkAndReadsNothingThroughIt(t *testing.T) {
 	outside := filepath.Join(t.TempDir(), "secret.txt")
@@ -497,9 +498,16 @@ func TestReadRegularRefusesALinkAndReadsNothingThroughIt(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "bait.txt")
 	link(t, outside, p)
 
-	body, size, err := readRegular(p, 1<<20)
-	if !errors.Is(err, errSkipFile) {
-		t.Fatalf("want errSkipFile, got body=%q size=%d err=%v", body, size, err)
+	body, size, err := ReadRegular(p, 1<<20)
+	if !errors.Is(err, ErrSkipped) {
+		t.Fatalf("want ErrSkipped, got body=%q size=%d err=%v", body, size, err)
+	}
+	// The name of this test claims two things and the check above is only one
+	// of them. A read that returned the target's bytes *alongside* ErrSkipped
+	// would satisfy that check, and the indexer — which chunks whatever body
+	// it is handed — would index the secret anyway.
+	if strings.Contains(string(body), "SECRET") {
+		t.Fatalf("the link's target was read: %q", body)
 	}
 }
 
@@ -511,13 +519,13 @@ func TestReadRegularRefusesAFifoWithoutBlocking(t *testing.T) {
 	type res struct{ err error }
 	ch := make(chan res, 1)
 	go func() {
-		_, _, err := readRegular(p, 1<<20)
+		_, _, err := ReadRegular(p, 1<<20)
 		ch <- res{err}
 	}()
 	select {
 	case r := <-ch:
-		if !errors.Is(r.err, errSkipFile) {
-			t.Fatalf("want errSkipFile, got %v", r.err)
+		if !errors.Is(r.err, ErrSkipped) {
+			t.Fatalf("want ErrSkipped, got %v", r.err)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("readRegular blocked on a fifo")
@@ -529,8 +537,8 @@ func TestReadRegularRefusesADevice(t *testing.T) {
 	if _, err := os.Stat("/dev/zero"); err != nil {
 		t.Skip("/dev/zero unavailable")
 	}
-	if _, _, err := readRegular("/dev/zero", 1<<20); !errors.Is(err, errSkipFile) {
-		t.Fatalf("want errSkipFile, got %v", err)
+	if _, _, err := ReadRegular("/dev/zero", 1<<20); !errors.Is(err, ErrSkipped) {
+		t.Fatalf("want ErrSkipped, got %v", err)
 	}
 }
 
@@ -540,11 +548,11 @@ func TestReadRegularRefusesADevice(t *testing.T) {
 // success — so it stays fatal, as an unreadable directory already does.
 func TestReadRegularTreatsAVanishedFileAsFatal(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "gone.go")
-	_, _, err := readRegular(p, 1<<20)
+	_, _, err := ReadRegular(p, 1<<20)
 	if err == nil {
 		t.Fatal("want an error for a file that is not there")
 	}
-	if errors.Is(err, errSkipFile) {
+	if errors.Is(err, ErrSkipped) {
 		t.Fatalf("a vanished file must not be silently skipped, got %v", err)
 	}
 	if !errors.Is(err, os.ErrNotExist) {
@@ -603,7 +611,7 @@ func TestAFileSwappedForALinkMidWalkIsNotRead(t *testing.T) {
 
 	deadline := time.Now().Add(3 * time.Second)
 	for i := 0; time.Now().Before(deadline); i++ {
-		got, err := Files(root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
+		got, err := Files(context.Background(), root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
 		if err != nil {
 			continue // a swap can legitimately race the walk into an error
 		}
@@ -634,7 +642,7 @@ func TestAFileSwappedForAFifoMidWalkDoesNotHang(t *testing.T) {
 		defer close(walks)
 		deadline := time.Now().Add(3 * time.Second)
 		for time.Now().Before(deadline) {
-			Files(root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
+			Files(context.Background(), root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
 		}
 	}()
 	select {
@@ -656,7 +664,7 @@ func TestReadIsBoundedByTheCapNotByTheStatSize(t *testing.T) {
 	if err != nil || !info.Mode().IsRegular() || info.Size() != 0 {
 		t.Skip("no size-0 regular file with content available here")
 	}
-	body, size, err := readRegular(proc, 8)
+	body, size, err := ReadRegular(proc, 8)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -665,5 +673,24 @@ func TestReadIsBoundedByTheCapNotByTheStatSize(t *testing.T) {
 	}
 	if len(body) > 8 {
 		t.Fatalf("read %d bytes past a cap of 8", len(body))
+	}
+}
+
+// The walk shares the job's one deadline (spec §6). Without a check of its own
+// it reads a large tree to the end after the job that owns it has expired, and
+// the lease is handed to a second worker while this one is still reading.
+func TestFilesStopsOnceItsContextIsDone(t *testing.T) {
+	root := tree(t, map[string]string{
+		"a.go": "package a\n", "b/c.md": "# hi\n", "d.json": "{}\n",
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	got, err := Files(ctx, root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("want context.Canceled, got %d files and err %v", len(got), err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("a cancelled walk still returned %d files", len(got))
 	}
 }

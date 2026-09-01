@@ -1,0 +1,54 @@
+//go:build linux
+
+// Package docs is the fixture the doc-comment pre-pass is pinned against.
+//
+// Its package doc runs to several lines on purpose: in a well-documented
+// repository the package doc is the largest single block of prose there is.
+package docs
+
+import (
+	// Errors is the standard one.
+	"errors"
+	"fmt"
+)
+
+// ErrGone is returned for a repository that was indexed and then evicted.
+var ErrGone = errors.New("gone")
+
+/*
+Kinds are the shapes a thing can take.
+
+This doc comment is a block comment on purpose: its interior newlines are
+the only newlines a stripper can swallow by accident, and one that swallows
+them moves every line number below this point.
+*/
+const (
+	// KindA is the first shape.
+	KindA = "a"
+	KindB = "b"
+)
+
+// Counter counts.
+type Counter struct {
+	// N is the running total.
+	N int
+}
+
+// Add adds d and returns the new total.
+//
+// The second paragraph exists so a doc comment spans more than one line.
+//go:noinline
+func (c *Counter) Add(d int) int {
+	// This comment is inside the body and stays: it is context a reader of
+	// the span wants, and no golden question is generated from it.
+	c.N += d
+	return c.N
+}
+
+func undocumented() error { return fmt.Errorf("no doc") }
+
+type (
+	// Shape is documented on the spec: inside a type ( … ) group the doc
+	// attaches to the TypeSpec, and nothing above it sees the prose.
+	Shape struct{ N int }
+)

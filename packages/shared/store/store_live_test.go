@@ -13,22 +13,64 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/mralaminahamed/codetrail/packages/shared/models"
+	"github.com/mralaminahamed/codetrail/packages/shared/testdb"
 )
 
-// dsn is the database these tests run against. They create and drop their own
-// schema objects, so point them at a throwaway database.
-func dsn(t *testing.T) string {
-	t.Helper()
-	v := os.Getenv("DATABASE_URL")
-	if v == "" {
+// scratchDSN is the database these tests run against: one this suite creates
+// for itself, never the one DATABASE_URL names.
+//
+// These tests clear whole tables — eviction is a whole-corpus operation — and
+// the README tells a reader to run them against the DSN `make up` serves.
+// Measured before this: a seeded repo, its 51 spans and a job all vanished
+// from that database while the suite went green.
+var scratchDSN string
+
+func TestMain(m *testing.M) {
+	base := os.Getenv("DATABASE_URL")
+	if base == "" {
 		// A skipped live suite prints the same "ok" as one that ran, so in CI a
 		// dropped DATABASE_URL would look green with zero live coverage.
 		if os.Getenv("CI") != "" {
-			t.Fatal("DATABASE_URL unset in CI — the live suite must never silently skip")
+			fmt.Fprintln(os.Stderr, "DATABASE_URL unset in CI — the live suite must never silently skip")
+			os.Exit(1)
 		}
+		os.Exit(m.Run()) // every test skips; see dsn
+	}
+	code, err := testdb.Scratch(base, "codetrail_store", func(d string) int {
+		scratchDSN = d
+		return m.Run()
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	os.Exit(code)
+}
+
+func dsn(t *testing.T) string {
+	t.Helper()
+	if scratchDSN == "" {
 		t.Skip("set DATABASE_URL to run")
 	}
-	return v
+	return scratchDSN
+}
+
+// The guarantee the suite rests on, asserted rather than assumed: nothing here
+// runs in the database a reader pointed it at.
+func TestTheLiveSuiteRunsInADatabaseItCreatedLive(t *testing.T) {
+	ctx := context.Background()
+	s, err := New(ctx, dsn(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var here string
+	if err := s.pool.QueryRow(ctx, `SELECT current_database()`).Scan(&here); err != nil {
+		t.Fatal(err)
+	}
+	if base := testdb.Name(os.Getenv("DATABASE_URL")); here == base {
+		t.Fatalf("the suite is clearing tables in %s, the database it was pointed at", here)
+	}
 }
 
 // Migrations have to be safe to run against a database that already has them.

@@ -3,6 +3,7 @@ package walk
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -16,11 +17,14 @@ import (
 
 var ErrTooManyFiles = errors.New("walk: file count exceeds the cap")
 
-// errSkipFile: this entry is not one to index, and the walk carries on. It
-// covers both reasons readRegular declines, because the caller treats them
+// ErrSkipped: this entry is not one to index, and the walk carries on. It
+// covers both reasons ReadRegular declines, because the caller treats them
 // alike — a file over the cap and a file that stopped being a file are each
 // one entry missing from the index, not a reason to fail the repository.
-var errSkipFile = errors.New("walk: skip this entry")
+//
+// Exported with ReadRegular: the indexer reads each file a second time to
+// chunk it, and has to tell "skip this one" from "the tree moved under us".
+var ErrSkipped = errors.New("walk: skip this entry")
 
 type Limits struct {
 	MaxFiles     int
@@ -47,7 +51,7 @@ var langByExt = map[string]string{
 // describes the link itself and never its target. A repository can contain
 // `link -> /etc/passwd`, and following it would read and index the host's
 // files.
-func Files(root string, lim Limits) ([]File, error) {
+func Files(ctx context.Context, root string, lim Limits) ([]File, error) {
 	// Both caps fail closed, the way clone's do: zero is a refusal, not
 	// "unlimited". An int-valued config knob that parses to 0 must not arrive
 	// here as permission to index a repository of any size.
@@ -61,6 +65,13 @@ func Files(root string, lim Limits) ([]File, error) {
 	var out []File
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
+			return err
+		}
+		// The job's one deadline (spec §6) reaches the walk here. Without it a
+		// walk of a large tree runs to the end after the job that owns it has
+		// expired, and the only thing that ends it is the lease being handed
+		// to a second worker while this one is still reading.
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 		rel, rerr := filepath.Rel(root, p)
@@ -99,10 +110,10 @@ func Files(root string, lim Limits) ([]File, error) {
 		// fifo, and whatever else the filesystem reports — without having to
 		// enumerate them.
 		//
-		// readRegular re-decides all of this on the open file descriptor, so
+		// ReadRegular re-decides all of this on the open file descriptor, so
 		// the two overlap — but only one way, measured: delete this check and
 		// the whole suite still passes, so no test pins this line by itself;
-		// delete readRegular's fstat instead and two fail. Keep it anyway — it
+		// delete ReadRegular's fstat instead and two fail. Keep it anyway — it
 		// is the cheap path, and a device or fifo in the checkout is then never
 		// opened at all.
 		if !d.Type().IsRegular() {
@@ -112,8 +123,8 @@ func Files(root string, lim Limits) ([]File, error) {
 		// lose the repository. Over the file count is a failure, because it
 		// means the caps were wrong for this repository — so the size check
 		// has to come first, or an oversized file would spend cap budget.
-		body, size, rerr := readRegular(p, lim.MaxFileBytes)
-		if errors.Is(rerr, errSkipFile) {
+		body, size, rerr := ReadRegular(p, lim.MaxFileBytes)
+		if errors.Is(rerr, ErrSkipped) {
 			return nil
 		}
 		if rerr != nil {
@@ -136,8 +147,8 @@ func Files(root string, lim Limits) ([]File, error) {
 	return out, nil
 }
 
-// readRegular reads p, re-deciding on the file itself what the listing only
-// claimed. It returns errSkipFile when p is over max or is no longer a plain
+// ReadRegular reads p, re-deciding on the file itself what the listing only
+// claimed. It returns ErrSkipped when p is over max or is no longer a plain
 // file, and any other error verbatim.
 //
 // The DirEntry above said "regular file", but that answer came out of the
@@ -149,7 +160,8 @@ func Files(root string, lim Limits) ([]File, error) {
 //     a link. Measured: without it, a racing swapper leaks the contents of a
 //     file outside the checkout.
 //   - a regular file replaced by a fifo. os.ReadFile on one blocks until
-//     someone writes, and Files has no deadline, so that is a worker hung for
+//     someone writes, and the walk's context check fires between entries and
+//     cannot interrupt a read already blocked, so that is a worker hung for
 //     good. O_NONBLOCK returns instead of waiting, and the fstat then rejects
 //     it for what it is.
 //
@@ -160,11 +172,11 @@ func Files(root string, lim Limits) ([]File, error) {
 // swapped for a symlink is a wider hole and is still open: closing it needs
 // the whole descent to open each component relative to a pinned root, which
 // this does not do. Do not read these flags as closing it.
-func readRegular(p string, max int64) ([]byte, int64, error) {
+func ReadRegular(p string, max int64) ([]byte, int64, error) {
 	f, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) {
-			return nil, 0, errSkipFile
+			return nil, 0, ErrSkipped
 		}
 		// Every other open failure stays fatal, deliberately. A file that
 		// vanished mid-walk means the tree moved under us, and an index that
@@ -179,10 +191,10 @@ func readRegular(p string, max int64) ([]byte, int64, error) {
 		return nil, 0, err
 	}
 	if !info.Mode().IsRegular() {
-		return nil, 0, errSkipFile
+		return nil, 0, ErrSkipped
 	}
 	if info.Size() > max {
-		return nil, 0, errSkipFile
+		return nil, 0, ErrSkipped
 	}
 	// Bounded by the cap the size was just checked against, so a file that
 	// grows after the fstat cannot make this read unbounded.
