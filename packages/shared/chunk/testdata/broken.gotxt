@@ -1,0 +1,47 @@
+package broken
+
+// Half is truncated: the parser cannot finish this expression.
+func Half(a int) int {
+	return a +
+}
+
+// The padding below only exists so the file is longer than one default
+// window, so the fallback tiles it rather than emitting a single chunk.
+
+func PadOne(a int) int {
+	return a + 1
+}
+
+func PadTwo(a int) int {
+	return a + 2
+}
+
+func PadThree(a int) int {
+	return a + 3
+}
+
+func PadFour(a int) int {
+	return a + 4
+}
+
+func PadFive(a int) int {
+	return a + 5
+}
+
+func PadSix(a int) int {
+	return a + 6
+}
+
+func PadSeven(a int) int {
+	return a + 7
+}
+
+func PadEight(a int) int {
+	return a + 8
+}
+
+func PadNine(a int) int {
+	return a + 9
+}
+
+type ( struct
