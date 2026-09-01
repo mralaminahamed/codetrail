@@ -8,10 +8,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -19,6 +21,7 @@ import (
 
 	"github.com/mralaminahamed/codetrail/apps/indexer/internal/clone"
 	"github.com/mralaminahamed/codetrail/apps/indexer/internal/walk"
+	"github.com/mralaminahamed/codetrail/packages/shared/admit"
 	"github.com/mralaminahamed/codetrail/packages/shared/config"
 	"github.com/mralaminahamed/codetrail/packages/shared/jobs"
 	"github.com/mralaminahamed/codetrail/packages/shared/logger"
@@ -50,6 +53,9 @@ type indexer struct {
 	clone func(ctx context.Context, remote, ref, dir string, lim clone.Limits) (clone.Result, error)
 	walk  func(root string, lim walk.Limits) ([]walk.File, error)
 	put   func(ctx context.Context, r models.Repo, files []models.File) error
+	// hosts is the same allowlist the gateway admits against, applied again
+	// here; see runJob.
+	hosts admit.Policy
 
 	// id is this process's name in the jobs table; see workerID.
 	id      string
@@ -79,12 +85,45 @@ func main() {
 		clone:   clone.Run,
 		walk:    walk.Files,
 		put:     st.PutRepo,
+		hosts:   admit.NewPolicy(allowedHosts()),
 		id:      workerID(),
 		scratch: config.Get("SCRATCH_DIR", filepath.Join(os.TempDir(), "codetrail")),
 		lim:     lim,
 	}
+	// At exit, so a worker asked to stop takes its checkouts with it. At boot
+	// too: with a fresh id each start that normally finds nothing, and one
+	// syscall is cheaper than depending on it having found nothing.
+	ix.sweepHome()
+	defer ix.sweepHome()
+
 	log.Info().Str("worker", ix.id).Msg("indexer up")
 	ix.run(ctx)
+}
+
+// allowedHosts reads the exact-host allowlist the same way the gateway does:
+// ALLOWED_HOSTS, comma-separated, replacing the default rather than extending
+// it. Duplicated rather than shared because the two binaries are separate
+// packages; if a third reader appears, this belongs in admit.
+func allowedHosts() []string {
+	return strings.Split(config.Get("ALLOWED_HOSTS", strings.Join(admit.DefaultHosts, ",")), ",")
+}
+
+// home is this worker's own scratch subtree. Per worker, because two indexers
+// sharing one SCRATCH_DIR otherwise collide on the same job directory after a
+// lease expiry: measured, the second worker's pre-clone RemoveAll destroyed the
+// first's in-flight clone ("Unable to read current working directory") and the
+// first's deferred RemoveAll then destroyed the second's, failing both on a
+// healthy repository.
+func (ix *indexer) home() string { return filepath.Join(ix.scratch, ix.id) }
+
+// sweepHome removes this worker's subtree and nothing else. A peer's tree is
+// left alone deliberately: nothing here distinguishes a crashed worker's
+// directory from a live one's, and removing the wrong one is the collision
+// above with extra steps. A worker killed hard therefore still leaks its tree.
+func (ix *indexer) sweepHome() {
+	if err := os.RemoveAll(ix.home()); err != nil {
+		ix.log.Warn().Err(err).Str("dir", ix.home()).Msg("could not clear the worker's scratch tree")
+	}
 }
 
 // workerID names this process in the jobs table. Complete and Fail authorise
@@ -187,7 +226,26 @@ func (ix *indexer) runJob(ctx context.Context, job jobs.Job) {
 		return
 	}
 
-	dir := filepath.Join(ix.scratch, job.ID)
+	// This binary's doc comment claims it is the component that handles the
+	// untrusted URL. Checking the row rather than trusting it is what makes
+	// that true: the gateway admits before enqueueing, but a row it did not
+	// write, or an allowlist edited since it did, reaches git otherwise.
+	if _, err := ix.hosts.Check(job.Remote); err != nil {
+		l.Warn().Err(err).Msg("remote refused")
+		// A malformed URL or a non-https scheme is a property of the string
+		// and no retry or setting can make it clonable. An unlisted host can
+		// become listed, by an operator editing ALLOWED_HOSTS, so that one
+		// keeps its attempts.
+		var ae *admit.Error
+		if errors.As(err, &ae) && ae.Rule == admit.RuleHost {
+			ix.fail(ctx, l, job.ID, err.Error())
+		} else {
+			ix.failFinally(ctx, l, job.ID, err.Error())
+		}
+		return
+	}
+
+	dir := filepath.Join(ix.home(), job.ID)
 	// Removed before and after, and both are load-bearing. Before: git clone
 	// refuses a non-empty destination, so a checkout left by a crash would fail
 	// every retry of this job on the leftover rather than on the repository.
@@ -227,17 +285,24 @@ func (ix *indexer) runJob(ctx context.Context, job jobs.Job) {
 			Path: f.Path, Blob: "", Lang: f.Lang, Lines: f.Lines,
 		})
 	}
-	repo := models.Repo{ID: repoID, Remote: job.Remote, Ref: job.Ref, Commit: res.Commit}
+	repo := models.Repo{ID: repoID, Remote: job.Remote, Ref: job.Ref, Commit: res.Commit, SizeBytes: res.Bytes}
 	if err := ix.put(ctx, repo, rows); err != nil {
 		l.Error().Err(err).Msg("write failed")
 		ix.fail(ctx, l, job.ID, err.Error())
 		return
 	}
 	if err := ix.q.Complete(ctx, job.ID, ix.id); err != nil {
-		// ErrNotLeased here means this worker's lease expired and another
-		// indexer took the job. Losing the race is normal; completing someone
-		// else's job would not be.
-		l.Warn().Err(err).Msg("could not complete: lease no longer held")
+		// ErrNotLeased means this worker's lease expired and another indexer
+		// took the job. Losing that race is normal; completing someone else's
+		// job would not be. Anything else — a cancelled context under SIGTERM,
+		// a dead connection — is a write that did not happen with the lease
+		// still held, and saying "lease no longer held" there tells an operator
+		// something the code has not established.
+		if errors.Is(err, jobs.ErrNotLeased) {
+			l.Warn().Err(err).Msg("could not complete: lease no longer held")
+		} else {
+			l.Warn().Err(err).Msg("could not complete: the job stays leased until it expires")
+		}
 		return
 	}
 	l.Info().Str("commit", res.Commit).Int("files", len(rows)).Int64("bytes", res.Bytes).Msg("indexed")
@@ -258,8 +323,14 @@ func (ix *indexer) failFinally(ctx context.Context, l zerolog.Logger, id, reason
 // recordFailure logs when the lease was already lost, rather than discarding
 // the one signal that says this worker's verdict was not recorded.
 func (ix *indexer) recordFailure(ctx context.Context, l zerolog.Logger, id, reason string, maxAttempts int) {
-	if err := ix.q.Fail(ctx, id, ix.id, reason, maxAttempts); err != nil {
+	err := ix.q.Fail(ctx, id, ix.id, reason, maxAttempts)
+	switch {
+	case err == nil:
+	case errors.Is(err, jobs.ErrNotLeased):
 		l.Warn().Err(err).Msg("could not record failure: lease no longer held")
+	default:
+		// See Complete: this one is a failed write, not a lost lease.
+		l.Warn().Err(err).Msg("could not record failure: the job stays leased until it expires")
 	}
 }
 
