@@ -100,11 +100,11 @@ func Files(root string, lim Limits) ([]File, error) {
 		// enumerate them.
 		//
 		// readRegular re-decides all of this on the open file descriptor, so
-		// deleting either check on its own leaves the other and the whole test
-		// suite still passes. That redundancy is deliberate, and it means no
-		// test pins this line by itself: only removing both is caught. Keep it
-		// anyway — it is the cheap path, and it means a device or fifo in the
-		// checkout is never opened at all.
+		// the two overlap — but only one way, measured: delete this check and
+		// the whole suite still passes, so no test pins this line by itself;
+		// delete readRegular's fstat instead and two fail. Keep it anyway — it
+		// is the cheap path, and a device or fifo in the checkout is then never
+		// opened at all.
 		if !d.Type().IsRegular() {
 			return nil
 		}
@@ -157,8 +157,9 @@ func Files(root string, lim Limits) ([]File, error) {
 // descriptor, so unlike an lstat on the path it cannot be raced.
 //
 // This closes the race on p's *final* component only. A parent directory
-// swapped for a symlink is a wider hole and is still open; see the package
-// limitations in the task report. Do not read these flags as closing it.
+// swapped for a symlink is a wider hole and is still open: closing it needs
+// the whole descent to open each component relative to a pinned root, which
+// this does not do. Do not read these flags as closing it.
 func readRegular(p string, max int64) ([]byte, int64, error) {
 	f, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {

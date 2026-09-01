@@ -136,8 +136,8 @@ func TestEnqueueIsIdempotentWhileActive(t *testing.T) {
 }
 
 // A finished job and an active job coexist for the same (remote, ref) as soon
-// as a repository is re-indexed. Enqueue must hand back the active one: Task 4
-// turns this into the id a submitter polls, and returning the finished job
+// as a repository is re-indexed. Enqueue must hand back the active one: the
+// gateway turns this into the id a submitter polls, and returning the finished job
 // would report a repository indexed that this submission never indexed.
 func TestEnqueueReturnsTheActiveJobNotAFinishedOne(t *testing.T) {
 	ctx := context.Background()

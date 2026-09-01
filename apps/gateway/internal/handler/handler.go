@@ -67,9 +67,8 @@ const maxRefLen = 255
 
 // validRef allowlists the charset a git ref needs, the way admit.validSegment
 // does for a path segment, and refuses "." and ".." as that does. The indexer
-// hands ref to a subprocess, so a leading "-" is an option and not a name, and
-// ".." is forbidden by git's own ref syntax anyway. Bound it at the front door
-// rather than at a call site that is not written yet.
+// hands ref to `git clone --branch`, so a leading "-" is an option and not a
+// name, and ".." is forbidden by git's own ref syntax anyway.
 //
 // It diverges from validSegment by allowing "/", which a ref needs, and by
 // capping the length, which argv makes worth doing; it refuses ".." anywhere
@@ -78,15 +77,16 @@ const maxRefLen = 255
 // It is a bound on what reaches argv, not a model of git's ref syntax, and it
 // is looser than git in several ways: it accepts a leading or trailing "/", a
 // doubled "//", a ".lock" suffix, a component starting with "." (".foo",
-// "a/.b") and a ref ending with "." ("foo.", "v1."). Git rejects all of them,
-// so they fail the clone rather than doing anything, and none can be read as an
-// option. The trailing-dot rule is the refname's, not each component's:
-// "foo./bar" is legal to git and accepted here. Task 7 must still run git
-// check-ref-format; this does not make that redundant.
+// "a/.b") and a ref ending with "." ("foo.", "v1."). Nothing downstream makes
+// up the difference — no code runs check-ref-format — so each of those reaches
+// git, fails the clone, and spends the job's attempts. That is the whole cost:
+// none can be read as an option, and the clone is the only place a ref goes.
+// The trailing-dot rule is the refname's, not each component's: "foo./bar" is
+// legal to git and accepted here.
 //
 // In one direction it is narrower than git: "+" is legal in a tag, so a semver
-// build-metadata tag is refused here. Widening that is a decision for when
-// Task 7 exists and the argv path is real.
+// build-metadata tag is refused here. Widening it is cheap and nobody has
+// asked; the charset is the thing worth being conservative about.
 func validRef(s string) bool {
 	if s == "" || s == "." || len(s) > maxRefLen || strings.HasPrefix(s, "-") || strings.Contains(s, "..") {
 		return false

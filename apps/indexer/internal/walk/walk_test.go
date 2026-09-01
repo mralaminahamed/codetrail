@@ -171,11 +171,12 @@ func link(t *testing.T, target, name string) {
 
 // Not a guard in this file: filepath.WalkDir reads each directory's own
 // listing and never resolves a link, so nothing here can be mutated to make
-// this test fail for the reason it states — under the realistic follow-links
-// mutant (d.Type/d.Info -> os.Stat) it passes outright, and under the
-// IsRegular mutant it dies on EISDIR from reading `vendor`, not on its own
-// assertion. It is a regression pin on that stdlib property, which the whole
-// package rests on. The target is populated so that a regression leaks
+// this test fail for the reason it states. Measured: under the realistic
+// follow-links mutant (the listing check re-taken with os.Stat) it passes
+// outright, and under either IsRegular mutant it passes too — the EISDIR from
+// reading `vendor` needs O_NOFOLLOW gone as well, and then nine other tests
+// fail with it. It is a regression pin on that stdlib property, which the
+// whole package rests on. The target is populated so that a regression leaks
 // something visible rather than nothing.
 func TestNeverDescendsIntoALinkedDirectory(t *testing.T) {
 	root := tree(t, map[string]string{"main.go": "package main\n"})
