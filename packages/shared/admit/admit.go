@@ -30,8 +30,15 @@ type Error struct {
 func (e *Error) Error() string { return fmt.Sprintf("admit: %s: %s", e.Rule, e.Detail) }
 
 // Remote is an accepted, normalised repository reference.
+//
+// URL keeps the case the submitter typed, because a forge preserves the
+// display case of an owner and a repository and that is what a citation has
+// to show. Key is the identity: forges match owner and name
+// case-insensitively, so two spellings are one repository and anything that
+// keys on a repository keys on this, not on URL.
 type Remote struct {
 	URL   string
+	Key   string
 	Host  string
 	Owner string
 	Name  string
@@ -87,7 +94,13 @@ func (p Policy) Check(raw string) (Remote, error) {
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		return Remote{}, &Error{RuleForm, "path must be /owner/name"}
 	}
-	owner, name := parts[0], strings.TrimSuffix(parts[1], ".git")
+	// Repeatedly, not once: a forge serves /owner/foo.git and /owner/foo.git.git
+	// as the same repository, and one trim would leave "foo.git" as a second
+	// identity for it. No forge here allows a name that really ends in ".git".
+	owner, name := parts[0], parts[1]
+	for strings.HasSuffix(name, ".git") {
+		name = strings.TrimSuffix(name, ".git")
+	}
 	if name == "" {
 		return Remote{}, &Error{RuleForm, "path must be /owner/name"}
 	}
@@ -99,6 +112,7 @@ func (p Policy) Check(raw string) (Remote, error) {
 	}
 	return Remote{
 		URL:   "https://" + host + "/" + owner + "/" + name,
+		Key:   host + "/" + strings.ToLower(owner) + "/" + strings.ToLower(name),
 		Host:  host,
 		Owner: owner,
 		Name:  name,
