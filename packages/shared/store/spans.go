@@ -98,9 +98,9 @@ func (s *Store) PutSpans(ctx context.Context, repoID string, spans []EmbeddedSpa
 		hi := min(lo+spanBatchSize, len(spans))
 		var b pgx.Batch
 		for _, sp := range spans[lo:hi] {
-			// The upsert is not reachable through the DELETE above; it is what
-			// makes a duplicate inside one call converge instead of aborting a
-			// job at its last step.
+			// The DELETE above means a retry never conflicts. The upsert is for
+			// a duplicate inside one call, which has to converge rather than
+			// abort a job at its last step.
 			b.Queue(`
 				INSERT INTO spans (id, repo_id, file_id, path, kind, symbol,
 					start_line, end_line, text, digest, embed_model, embed_dim, embedding)
@@ -129,9 +129,15 @@ func (s *Store) CountSpans(ctx context.Context, repoID string) (int, error) {
 }
 
 // vecLiteral renders a vector in pgvector's text form, "[1,-0.5]". There is no
-// pgvector binding in this build, so the value crosses as text and the INSERT
-// casts it; 'f' with precision -1 is the shortest decimal that parses back to
-// the same float32, which is what makes that crossing lossless.
+// pgvector binding in this build, so the value crosses as a Go string; 'f' with
+// precision -1 is the shortest decimal that parses back to the same float32,
+// which is what makes that crossing lossless.
+//
+// The INSERT's $13::vector is documentation, not machinery. Measured: without
+// it every test here still passes, because Postgres infers the parameter's type
+// from the column it is being written to. The cast is kept so a reader does not
+// have to know that, and so moving the parameter somewhere with nothing to
+// infer from does not quietly become a text comparison.
 func vecLiteral(v []float32) string {
 	var b strings.Builder
 	b.Grow(len(v)*10 + 2)

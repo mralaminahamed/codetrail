@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -123,13 +124,36 @@ func TestPutSpansRoundTripLive(t *testing.T) {
 		if got != w.Span {
 			t.Errorf("read back %+v, want %+v", got, w.Span)
 		}
-		// The literal has to have been understood as a vector, not stored as
-		// the text it travelled as. Postgres renders a vector back without the
-		// spaces a text column would have kept verbatim.
-		if wantVec := strings.ReplaceAll(vecLiteral(w.Embedding), " ", ""); vec != wantVec {
-			t.Errorf("%s: embedding came back as %.40s…, want %.40s…", w.Path, vec, wantVec)
+		// Parsed here rather than compared against vecLiteral's own output: a
+		// format that lost precision would agree with itself on both sides of
+		// that comparison. These floats are the ones the fixture built.
+		back := parseVector(t, vec)
+		if len(back) != len(w.Embedding) {
+			t.Fatalf("%s: %d components came back, want %d", w.Path, len(back), len(w.Embedding))
+		}
+		for i := range back {
+			if back[i] != w.Embedding[i] {
+				t.Fatalf("%s: component %d came back as %v, want %v", w.Path, i, back[i], w.Embedding[i])
+			}
 		}
 	}
+}
+
+func parseVector(t *testing.T, s string) []float32 {
+	t.Helper()
+	if !strings.HasPrefix(s, "[") || !strings.HasSuffix(s, "]") {
+		t.Fatalf("not a pgvector value: %.40s…", s)
+	}
+	fields := strings.Split(s[1:len(s)-1], ",")
+	out := make([]float32, len(fields))
+	for i, f := range fields {
+		v, err := strconv.ParseFloat(strings.TrimSpace(f), 32)
+		if err != nil {
+			t.Fatalf("component %d: %v", i, err)
+		}
+		out[i] = float32(v)
+	}
+	return out
 }
 
 // embed_model and embed_dim are written per row (spec §3), so a corpus built
