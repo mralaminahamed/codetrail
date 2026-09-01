@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="assets/icon-256.png" alt="codetrail icon" width="96" height="96">
+
 # codetrail
 
 **Ask a codebase a question. Get an answer that cites `file:line` — and a citation you can check.**
@@ -12,11 +14,11 @@
 
 </div>
 
-> **Status: in development. Nothing here is deployed and most of it is not built yet.**
-> The [design spec](docs/superpowers/specs/2026-08-31-codetrail-design.md) is written and approved;
-> [P1](docs/superpowers/plans/2026-08-31-p1-ingestion.md) is the plan currently being implemented.
-> This README describes what is being built, and says plainly which parts exist. See
-> [Status](#status).
+> **Status: in development. Nothing here is deployed, and most of it is not built yet.**
+> The [design spec](docs/superpowers/specs/2026-08-31-codetrail-design.md) is written and approved,
+> and [P1](docs/superpowers/plans/2026-08-31-p1-ingestion.md) — ingestion — is merged and green in
+> CI. Everything from chunking onward is still ahead. This README says plainly which parts exist.
+> See [Status](#status).
 
 ## What it is
 
@@ -133,6 +135,21 @@ the quota is reached, in a single `DELETE` that cascades. The `jobs` table is th
 deliberately not bounded yet: re-submitting a repository that has finished appends a row, and how
 much of that history is worth keeping is a decision that belongs with the P3 read endpoints.
 
+### What it does today
+
+Both captures below are real terminal output from the merged ingestion phase, not mockups. There is
+no console yet — that is P5 — so there is no UI to screenshot, and inventing one would break the
+rule at the bottom of this file.
+
+Admission runs before anything is fetched, and a rejection names **which rule** fired:
+
+<img src="assets/screenshots/admission.png" alt="Seven rejected URLs, each with the rule that refused it" width="880">
+
+A submitted repository is cloned in the sandbox, recorded, and evicted when the quota is reached:
+
+<img src="assets/screenshots/ingest.png" alt="A repository submitted, indexed, deduplicated and evicted" width="880">
+
+
 ## The symbol graph, and its honesty
 
 A precise Go call graph needs type information, which needs the repository to actually compile —
@@ -153,7 +170,7 @@ downgraded wholesale.
 | --- | --- | --- |
 | **P0** | Skeleton, schema, migrations, compose, CI with live Postgres | done; CI landed with P1 |
 | **P1** | Ingestion: admission, sandbox, job queue, caps, LRU eviction | done |
-| **P2** | AST chunking, embeddings, spans, window fallback | not started |
+| **P2** | AST chunking, embeddings, spans, window fallback | planned |
 | **P3** | Retrieval, citations, extractive ask, measured floor | not started |
 | **P4** | Symbol graph, per-edge provenance, graph endpoints | not started |
 | **P5** | React console | not started |
