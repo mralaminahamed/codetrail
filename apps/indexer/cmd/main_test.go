@@ -37,6 +37,9 @@ type fakeQueue struct {
 	completeErr error
 	failErr     error
 	stop        func()
+	// blockUntilDone makes the two writes wait for their context, which is how
+	// a pool that has stopped answering behaves.
+	blockUntilDone bool
 
 	leases    []string
 	leaseFor  []time.Duration
@@ -67,12 +70,18 @@ func (q *fakeQueue) Lease(_ context.Context, worker string, d time.Duration) (jo
 }
 
 func (q *fakeQueue) Complete(ctx context.Context, id, worker string) error {
+	if q.blockUntilDone {
+		<-ctx.Done()
+	}
 	q.completed = append(q.completed, id+"@"+worker)
 	q.completedCtx = append(q.completedCtx, ctx.Err())
 	return q.completeErr
 }
 
 func (q *fakeQueue) Fail(ctx context.Context, id, worker, reason string, max int) error {
+	if q.blockUntilDone {
+		<-ctx.Done()
+	}
 	q.failed = append(q.failed, failCall{id, worker, reason, max})
 	q.failedCtx = append(q.failedCtx, ctx.Err())
 	return q.failErr
@@ -1416,4 +1425,32 @@ func (e shortEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, 
 		return v, err
 	}
 	return v[:len(v)-1], nil
+}
+
+// The queue writes are bounded as well as separate. A pool that has stopped
+// answering must not hold the worker on a write that will never return — the
+// job's context deliberately does not bound these, so if this does not,
+// nothing does.
+func TestAQueueWriteThatNeverReturnsIsBounded(t *testing.T) {
+	restore := recordDeadline
+	recordDeadline = 50 * time.Millisecond
+	t.Cleanup(func() { recordDeadline = restore })
+
+	ix, rec := fakeIndexer(t, withFiles(map[string]string{"a.go": "package p\n"}))
+	rec.blockUntilDone = true
+	// The parent outlives the bound twentyfold, so a write that is not bounded
+	// fails on the elapsed time rather than hanging the suite.
+	parent, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	start := time.Now()
+	ix.runJob(parent, aJob())
+	elapsed := time.Since(start)
+
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("the completion held the worker for %v, past its %v bound", elapsed, recordDeadline)
+	}
+	if len(rec.completedCtx) != 1 || !errors.Is(rec.completedCtx[0], context.DeadlineExceeded) {
+		t.Fatalf("want the write ended by its own bound, got %v", rec.completedCtx)
+	}
 }
