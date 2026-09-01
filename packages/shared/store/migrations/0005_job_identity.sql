@@ -9,6 +9,12 @@
 -- active jobs, and the index below cannot be created over them. Retire the
 -- later ones: the oldest is the job that will run, and its duplicate would
 -- only have cloned the same repository a second time.
+--
+-- A duplicate that is leased right now is retired mid-clone and loses its
+-- leased_by, so that worker's Complete matches no row and returns ErrNotLeased
+-- — measured. Accepted rather than avoided: this runs once at startup, the
+-- cost is one clone thrown away and one "lease no longer held" warning, and
+-- the job that survives indexes the same repository anyway.
 UPDATE jobs SET
     status = 'failed', leased_by = NULL, leased_until = NULL,
     error = 'superseded by an earlier job for the same repository', updated_at = now()
