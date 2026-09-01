@@ -1390,3 +1390,30 @@ func TestStripDocCommentsIsParsedNotGuessed(t *testing.T) {
 		t.Fatal("a value that is not a boolean was read as one")
 	}
 }
+
+// One vector per text, in order, is the Embedder's whole contract. A response
+// short of the batch leaves the spans past the end with no vector at all, and
+// PutSpans then refuses them for having 0 components — a complaint about the
+// schema's width, naming a span, for a fault that belongs to the embedder.
+func TestAShortEmbeddingBatchIsRefusedNamingTheEmbedder(t *testing.T) {
+	ix, rec := fakeIndexer(t)
+	ix.emb = shortEmbedder{Embedder: ix.emb}
+	ix.runJob(context.Background(), aJob())
+
+	if len(rec.spans) != 0 {
+		t.Fatalf("spans were written from a short batch: %d", len(rec.spans))
+	}
+	if !strings.Contains(rec.failReason(), "vectors for") {
+		t.Fatalf("the failure does not name the short batch: %q", rec.failReason())
+	}
+}
+
+type shortEmbedder struct{ embed.Embedder }
+
+func (e shortEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+	v, err := e.Embedder.Embed(ctx, texts)
+	if err != nil || len(v) == 0 {
+		return v, err
+	}
+	return v[:len(v)-1], nil
+}
