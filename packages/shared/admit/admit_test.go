@@ -268,3 +268,52 @@ func contains(s, sub string) bool {
 	}
 	return false
 }
+
+// The measured duplication: github.com/octocat/Spoon-Knife and
+// github.com/OctoCat/spoon-knife are one repository on the forge, and were two
+// rows in the corpus. Key is what makes them one; URL is what keeps each
+// submitter's spelling.
+func TestKeyFoldsOwnerAndNameCase(t *testing.T) {
+	a, err := policy().Check("https://github.com/octocat/Spoon-Knife")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := policy().Check("https://GitHub.com/OctoCat/spoon-knife.git/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Key != b.Key {
+		t.Fatalf("case variants got two keys: %q and %q", a.Key, b.Key)
+	}
+	if a.Key != "github.com/octocat/spoon-knife" {
+		t.Fatalf("key is %q", a.Key)
+	}
+	if a.URL == b.URL {
+		t.Fatalf("both spellings collapsed to one URL %q; display case is lost", a.URL)
+	}
+	if a.URL != "https://github.com/octocat/Spoon-Knife" {
+		t.Fatalf("URL is %q", a.URL)
+	}
+}
+
+// A forge serves foo, foo.git and foo.git.git as one repository. One trim left
+// the third as a second identity.
+func TestStripsEveryGitSuffix(t *testing.T) {
+	for _, raw := range []string{
+		"https://github.com/Owner/Repo.git",
+		"https://github.com/Owner/Repo.git.git",
+		"https://github.com/Owner/Repo.git.git.git",
+	} {
+		got, err := policy().Check(raw)
+		if err != nil {
+			t.Fatalf("%s: %v", raw, err)
+		}
+		if got.Name != "Repo" || got.URL != "https://github.com/Owner/Repo" {
+			t.Fatalf("%s normalised to %+v", raw, got)
+		}
+	}
+	// Trimming to nothing is still a refusal, not an empty name.
+	if _, err := policy().Check("https://github.com/Owner/.git.git"); err == nil {
+		t.Fatal("want a refusal for a name that is only suffixes")
+	}
+}
