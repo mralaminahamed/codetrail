@@ -62,15 +62,16 @@ func TestStripDocsPreservesEveryLineNumber(t *testing.T) {
 func TestStripDocsRemovesDocProseAndKeepsCode(t *testing.T) {
 	_, out, _ := stripped(t, "docs.gotxt")
 	for _, gone := range []string{
-		"Package docs is the fixture", // file doc
-		"Errors is the standard one",  // import spec doc
-		"ErrGone is returned",         // var decl doc
-		"Kinds are the shapes",        // block comment on a const decl
-		"KindA is the first shape",    // value spec doc inside the block
-		"Counter counts",              // type decl doc
-		"N is the running total",      // struct field doc
-		"Add adds d and returns",      // method doc
-		"spans more than one line",    // its second paragraph
+		"Package docs is the fixture",     // file doc
+		"Errors is the standard one",      // import spec doc
+		"ErrGone is returned",             // var decl doc
+		"Kinds are the shapes",            // block comment on a const decl
+		"KindA is the first shape",        // value spec doc inside the block
+		"Counter counts",                  // type decl doc
+		"N is the running total",          // struct field doc
+		"Add adds d and returns",          // method doc
+		"spans more than one line",        // its second paragraph
+		"Shape is documented on the spec", // type spec doc inside a type ( … ) group
 	} {
 		if strings.Contains(string(out), gone) {
 			t.Fatalf("doc prose %q survived stripping", gone)
@@ -84,6 +85,7 @@ func TestStripDocsRemovesDocProseAndKeepsCode(t *testing.T) {
 		"func (c *Counter) Add(d int) int {",
 		"c.N += d",
 		`func undocumented() error { return fmt.Errorf("no doc") }`,
+		"Shape struct{ N int }",
 	} {
 		if !strings.Contains(string(out), kept) {
 			t.Fatalf("code %q was removed", kept)
@@ -226,18 +228,34 @@ func TestStripDocsKeepsDirectives(t *testing.T) {
 	if strings.Contains(string(out), "The second paragraph exists") {
 		t.Fatalf("doc prose survived alongside the directive:\n%s", out)
 	}
-	// Prose that only looks like a directive is prose: the name before the
-	// colon has to be lowercase alphanumeric.
-	src := []byte("package p\n\n// TODO: explain this.\n//go:generate stringer -type=K\nfunc F() {}\n")
-	got, err := StripDocs("p.go", src)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(got), "TODO: explain") {
-		t.Fatalf("a comment with a colon in it was kept as a directive:\n%s", got)
-	}
-	if !strings.Contains(string(got), "//go:generate stringer -type=K") {
-		t.Fatalf("//go:generate was stripped:\n%s", got)
+}
+
+// One row per decision isDirective makes. Without them four of its branches
+// were decided only by the other half of the rule and could be deleted with
+// every test still passing: "// TODO: explain this." is refused twice over —
+// by the name loop and by the character after the colon — so it discriminates
+// neither. Each row below is refused, or kept, by exactly one check.
+func TestStripDocsTellsDirectivesFromProseShapedLikeThem(t *testing.T) {
+	for _, tc := range []struct {
+		doc  string
+		kept bool
+	}{
+		{"//go:generate stringer -type=K", true},
+		{"// TODO: explain this.", false},      // space in the name, and after the colon
+		{"// todo:fix this", false},            // the name segment holds a space
+		{"//todo: explain this.", false},       // lowercase name, but no value after the colon
+		{"//go:", false},                       // a name with no value; the guard refusing it also keeps c[colon+1] in range
+		{"//:x", false},                        // and a value with no name
+		{"/* Kinds are the shapes. */", false}, // only // comments can be directives
+	} {
+		src := []byte("package p\n\n" + tc.doc + "\nfunc F() {}\n")
+		out, err := StripDocs("p.go", src)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.doc, err)
+		}
+		if got := strings.Contains(string(out), tc.doc); got != tc.kept {
+			t.Errorf("%q: kept=%v, want %v:\n%s", tc.doc, got, tc.kept, out)
+		}
 	}
 }
 
