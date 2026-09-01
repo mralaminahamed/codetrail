@@ -4,8 +4,13 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/mralaminahamed/codetrail/packages/shared/models"
 )
@@ -39,7 +44,7 @@ func TestMigrationsAreIdempotentLive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	applied, err := first.appliedMigrations(ctx)
+	applied, err := appliedMigrations(ctx, first.pool)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +63,7 @@ func TestMigrationsAreIdempotentLive(t *testing.T) {
 	}
 	defer second.Close()
 
-	after, err := second.appliedMigrations(ctx)
+	after, err := appliedMigrations(ctx, second.pool)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,4 +264,125 @@ func TestMigration0007ClearsTheCorpusAndSparesJobsLive(t *testing.T) {
 			}
 		}
 	}
+}
+
+// freshDatabase creates an empty database beside the one dsn points at and
+// returns a pool config for it. A migration race only exists before the ledger
+// is populated, so a test that reuses the already-migrated shared database
+// proves nothing.
+func freshDatabase(t *testing.T, base string) *pgxpool.Config {
+	t.Helper()
+	ctx := context.Background()
+	cfg, err := pgxpool.ParseConfig(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin, err := pgx.Connect(ctx, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := fmt.Sprintf("codetrail_race_%d", time.Now().UnixNano())
+	if _, err := admin.Exec(ctx, `CREATE DATABASE "`+name+`"`); err != nil {
+		admin.Close(ctx)
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		// FORCE, because a racer whose pool outlived the failure still holds a
+		// session and DROP DATABASE would block on it.
+		if _, err := admin.Exec(ctx, `DROP DATABASE IF EXISTS "`+name+`" WITH (FORCE)`); err != nil {
+			t.Errorf("dropping %s: %v", name, err)
+		}
+		admin.Close(ctx)
+	})
+	cfg.ConnConfig.Database = name
+	return cfg
+}
+
+// CI starts a fresh Postgres per PR and `go test ./...` runs the store and jobs
+// binaries in parallel, so several processes call migrate() against an empty
+// ledger at once. Without a lock they all read "nothing applied" and all apply
+// 0001, and one of them loses.
+func TestConcurrentMigrationsOnAFreshDatabaseLive(t *testing.T) {
+	ctx := context.Background()
+	cfg := freshDatabase(t, dsn(t))
+
+	const racers = 8
+	pools := make([]*pgxpool.Pool, racers)
+	for i := range pools {
+		p, err := pgxpool.NewWithConfig(ctx, cfg.Copy())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer p.Close()
+		// Connect before the barrier: pool setup jitter would otherwise stagger
+		// the racers enough to hide the race.
+		if err := p.Ping(ctx); err != nil {
+			t.Fatal(err)
+		}
+		pools[i] = p
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, racers)
+	for _, p := range pools {
+		go func() {
+			<-start
+			errs <- (&Store{pool: p}).migrate(ctx)
+		}()
+	}
+	close(start)
+	for range racers {
+		if err := <-errs; err != nil {
+			t.Errorf("concurrent migrate: %v", err)
+		}
+	}
+
+	names, err := MigrationNames()
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied, err := appliedMigrations(ctx, pools[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range names {
+		if !applied[n] {
+			t.Errorf("%s is not recorded", n)
+		}
+	}
+	if len(applied) != len(names) {
+		t.Errorf("ledger has %d rows, want %d", len(applied), len(names))
+	}
+
+	// The guard must not outlive the run. Taking it here first proves the count
+	// below can see a held lock, so reading zero means released and not that the
+	// query looks in the wrong place.
+	tx, err := pools[0].Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, migrateLockKey); err != nil {
+		t.Fatal(err)
+	}
+	if n := heldAdvisoryLocks(t, pools[0]); n != 1 {
+		t.Fatalf("pg_locks reports %d advisory locks while one is held", n)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := heldAdvisoryLocks(t, pools[0]); n != 0 {
+		t.Errorf("%d advisory locks still held after every migrate returned", n)
+	}
+}
+
+func heldAdvisoryLocks(t *testing.T, p *pgxpool.Pool) int {
+	t.Helper()
+	var n int
+	if err := p.QueryRow(context.Background(), `
+		SELECT count(*) FROM pg_locks
+		WHERE locktype = 'advisory'
+		  AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
 }

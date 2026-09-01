@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -75,11 +76,37 @@ func (s *Store) Close() { s.pool.Close() }
 // Pool exposes the connection pool to the packages that own their own queries.
 func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 
+// migrateLockKey is the advisory lock every migration run takes. The number is
+// arbitrary; what matters is that every process migrating a given database
+// agrees on it.
+const migrateLockKey int64 = 0x0C0DE7241
+
 // migrate applies every embedded migration whose name is not already recorded,
-// in filename order, each in its own transaction. Names are sorted rather than
-// globbed in directory order so 0010 cannot run before 0002.
+// in filename order. Names are sorted rather than globbed in directory order so
+// 0010 cannot run before 0002.
+//
+// The run is one transaction that takes an advisory lock before it reads the
+// ledger. Deciding what to apply is half the race: against a fresh database
+// several processes otherwise read an empty ledger and all apply 0001. CI
+// starts a new Postgres per PR and `go test ./...` runs package binaries in
+// parallel, so that is the ordinary startup path there. Postgres drops the lock
+// when the transaction ends, so a crashed migrator cannot wedge the next one.
+//
+// One transaction rather than one per migration: a half-applied schema is worse
+// than none, and the lock has to span the whole run anyway.
 func (s *Store) migrate(ctx context.Context) error {
-	if _, err := s.pool.Exec(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	// Before the CREATE TABLE too — concurrent CREATE TABLE IF NOT EXISTS is
+	// itself not safe, it trips pg_type_typname_nsp_index.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, migrateLockKey); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			name       TEXT PRIMARY KEY,
 			applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -99,7 +126,9 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	sort.Strings(names)
 
-	applied, err := s.appliedMigrations(ctx)
+	// Read through tx: on any other connection the check would sit outside the
+	// lock and see a snapshot the holder is still writing.
+	applied, err := appliedMigrations(ctx, tx)
 	if err != nil {
 		return err
 	}
@@ -111,27 +140,24 @@ func (s *Store) migrate(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		tx, err := s.pool.Begin(ctx)
-		if err != nil {
-			return err
-		}
 		if _, err := tx.Exec(ctx, string(body)); err != nil {
-			_ = tx.Rollback(ctx)
 			return fmt.Errorf("%s: %w", name, err)
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations (name) VALUES ($1)`, name); err != nil {
-			_ = tx.Rollback(ctx)
 			return fmt.Errorf("%s: recording: %w", name, err)
 		}
-		if err := tx.Commit(ctx); err != nil {
-			return fmt.Errorf("%s: commit: %w", name, err)
-		}
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
-func (s *Store) appliedMigrations(ctx context.Context) (map[string]bool, error) {
-	rows, err := s.pool.Query(ctx, `SELECT name FROM schema_migrations`)
+// rowQuerier is the half of *pgxpool.Pool and pgx.Tx that appliedMigrations
+// needs, so the ledger can be read inside the migrating transaction.
+type rowQuerier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+func appliedMigrations(ctx context.Context, q rowQuerier) (map[string]bool, error) {
+	rows, err := q.Query(ctx, `SELECT name FROM schema_migrations`)
 	if err != nil {
 		return nil, err
 	}
