@@ -317,3 +317,31 @@ func TestStripsEveryGitSuffix(t *testing.T) {
 		t.Fatal("want a refusal for a name that is only suffixes")
 	}
 }
+
+// 0007 drops repos' (remote, commit_sha) uniqueness on the grounds that it can
+// no longer fire: a row's id is RepoID(Check(remote).Key, commit_sha), so two
+// rows agreeing on remote and commit_sha agree on id, which ON CONFLICT (id)
+// already arbitrates. That holds only while Key is a function of the URL string
+// and of nothing else — not of the policy that happened to admit it.
+func TestKeyDependsOnTheURLAndNothingElse(t *testing.T) {
+	const raw = "https://GitHub.com/OctoCat/Spoon-Knife.git/"
+	var want string
+	for i, p := range []Policy{
+		NewPolicy(DefaultHosts),
+		NewPolicy([]string{"github.com"}),
+		NewPolicy([]string{"example.invalid", " GITHUB.COM ", "codeberg.org"}),
+	} {
+		got, err := p.Check(raw)
+		if err != nil {
+			t.Fatalf("policy %d: %v", i, err)
+		}
+		if i == 0 {
+			want = got.Key
+		} else if got.Key != want {
+			t.Fatalf("policy %d keyed one URL as %q, not %q", i, got.Key, want)
+		}
+	}
+	if want != "github.com/octocat/spoon-knife" {
+		t.Fatalf("key is %q", want)
+	}
+}
