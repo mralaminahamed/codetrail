@@ -30,10 +30,14 @@ import (
 
 // scratchDSN names a database this suite creates for itself.
 //
-// Not the shared one DATABASE_URL points at: store's eviction tests clear every
-// repo, `go test -tags=live ./...` runs the two packages at once, and that
-// DELETE would land in the middle of a job asserted about here. Isolation, not
-// tidiness — the alternative is a suite that fails on another package's fixture.
+// Not the shared one DATABASE_URL points at. `go test -tags=live ./...` runs the
+// packages at once, store's eviction tests clear every repo with no WHERE, and
+// the eviction test below clears every repo the other way. Prevention rather
+// than a fix for an observed failure: forcing the collision — a DELETE loop
+// against the shared database, and the two suites started together — did not
+// make it bite in a dozen tries, because the window between a job's write and
+// its read-back is milliseconds. It costs one CREATE DATABASE to not have to
+// know that.
 var scratchDSN string
 
 func TestMain(m *testing.M) {
@@ -122,10 +126,11 @@ func liveStore(t *testing.T) *store.Store {
 // fixtureRoot is the tree these jobs index, committed so a line range means the
 // same thing on every machine.
 //
-// Every file carries a trailing ".txt": `gofmt -l apps` walks testdata and
-// would report the deliberately unparseable Go, and `go build ./...` would
-// refuse two files claiming one package. The suffix is stripped on the way into
-// the checkout because walk classifies by extension, and ".go.txt" is no
+// Every file carries a trailing ".txt". Measured: `gofmt -l apps` walks testdata
+// and reports Go it finds there, so the deliberately unformatted and unparseable
+// fixtures would fail the lint gate. `go build ./...` and `go vet ./...` ignore
+// testdata entirely, so that half is not a reason. The suffix comes off on the
+// way into the checkout because walk classifies by extension and ".go.txt" is no
 // language at all.
 const fixtureRoot = "testdata/repo"
 
@@ -221,18 +226,21 @@ func indexLive(t *testing.T, st *store.Store, j liveJob) liveRun {
 
 	q := &fakeQueue{}
 	ix, _ := testIndexer(t, q)
-	// The fixture is a repository, not a snippet: big.go alone is 2.7KB, past
-	// testIndexer's 1KB cap, and a skipped file is a missing span rather than
-	// a failure that says so.
+	// The fixture is a repository, not a snippet: big.go alone is 2,466 bytes,
+	// past testIndexer's 1KB cap, and a file the walk skips for size is a
+	// missing span rather than a failure that says so.
 	ix.lim.walk = walk.Limits{MaxFiles: 64, MaxFileBytes: 1 << 20}
 	ix.lim.clone.Deadline = 2 * time.Minute
 	// Smaller than the fixture's span count, so a batch loop that stopped after
-	// the first request leaves most spans unembedded.
+	// the first request leaves the rest with no vector. Measured: PutSpans then
+	// refuses the whole job, naming big.go:93-132 as the first span with 0
+	// components.
 	ix.lim.embedBatch = 4
-	// The real eviction runs at the end of every job here, so a cascade that
-	// broke would surface as a failing job rather than as a silence — but above
-	// the number of repos this suite creates, or a later test would evict an
-	// earlier one's rows out from under it.
+	// The real eviction rather than a stub, so every job here runs the whole of
+	// runJob — but with a keep above the number of repos this suite creates, or
+	// a later test would evict an earlier one's rows out from under it. runJob
+	// logs an eviction failure and drops it, so this is coverage of the call and
+	// not an assertion about it; the cascade is checked below.
 	ix.lim.keepRepos = 100
 	opt := chunk.Defaults()
 	opt.Strategy = j.strategy
@@ -697,9 +705,18 @@ func TestStrippedCorpusHoldsNoDocProseLive(t *testing.T) {
 	}
 }
 
-// Task 6's M11 at the caller: the guarded reader is worth nothing if the
-// indexer does not use it. A package test cannot make this assertion, because
-// the fault is in which function the indexer calls.
+// A link in a checkout never becomes a span, end to end.
+//
+// Not Task 6's M11, which this plan predicted this test would kill. Measured:
+// replacing the chunk pass's walk.ReadRegular with os.ReadFile leaves this test
+// green, because the walk drops anything that is a link at listing time and the
+// second read therefore never sees one. Only the fake walk in main_test.go can
+// hand over a listing that lies, and that is where M11 dies.
+//
+// What this does pin is the pair of guards in walk.Files, at the corpus rather
+// than at the reader. Measured: dropping the listing's IsRegular check alone
+// changes nothing, dropping O_NOFOLLOW alone changes nothing, and dropping both
+// puts "func P" from outside the checkout into the corpus as escape.go:3-4.
 func TestNoSpanHoldsALinkTargetLive(t *testing.T) {
 	st := liveStore(t)
 	outside := filepath.Join(t.TempDir(), "secret.go")
