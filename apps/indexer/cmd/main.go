@@ -160,8 +160,8 @@ func workerID() string {
 // diagnosable version of that.
 //
 // KEEP_REPOS is here for the same reason and a worse consequence: Evict reads a
-// keep of 0 as "keep nothing", so the typo that means "unlimited" everywhere
-// else would delete the whole corpus after every successful index.
+// keep of 0 as "keep nothing" and deletes every repo, so the one knob where a
+// zero would silently destroy data is the one that must not boot with it.
 func limitsFrom() (limits, error) {
 	var err error
 	get := func(key string, def int) int {
