@@ -42,11 +42,12 @@ func newEmbedder(timeout time.Duration) (embed.Embedder, error) {
 // chunkOptions reads the chunk knobs and refuses a set the chunker would not
 // accept, at boot rather than per job.
 //
-// config.GetInt reads a literal "0" as 0, and chunk.Chunks does not fail on a
-// zero window — windows() refuses a non-advancing stride and returns nothing,
-// so CHUNK_WINDOW_LINES=0 would index every declaration the AST recognises and
-// silently drop every fallback and every sub-window, which is a corpus with
-// holes in it that no run reports.
+// config.GetInt reads a literal "0" as 0. Measured, not assumed: chunk.Chunks
+// validates too, and answers "WindowLines must be positive, got 0" — so the
+// counterfactual is not a corrupt corpus but every leased job failing on its
+// first chunkable file and spending its attempts. That is the same trade
+// limitsFrom makes: failing one boot is the diagnosable version of failing
+// every repository in the queue.
 func chunkOptions() (chunk.Options, error) {
 	def := chunk.Defaults()
 	opt := chunk.Options{

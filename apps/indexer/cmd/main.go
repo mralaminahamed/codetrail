@@ -303,8 +303,9 @@ func (ix *indexer) runJob(ctx context.Context, job jobs.Job) {
 
 	// One deadline for the whole job (spec §6): clone, read, chunk, embed and
 	// write share it, so a slow clone cannot buy itself extra time by failing
-	// into the embedder — which is the slowest thing this system does, and the
-	// one stage a per-stage budget would let run for a whole second job.
+	// into the embedder. A budget per stage hands each stage the whole number
+	// again, and a job may then run for as many deadlines as it has stages —
+	// with embedding, the slowest of them, free to spend a full one on its own.
 	jobCtx, cancel := context.WithTimeout(ctx, ix.lim.clone.Deadline)
 	defer cancel()
 
@@ -396,9 +397,9 @@ func (ix *indexer) index(ctx context.Context, l zerolog.Logger, repoID, root str
 	var spans []store.EmbeddedSpan
 	var vanished, unstrippable int
 	for _, f := range files {
-		// The job's deadline reaches the read stage here: ReadRegular is
-		// bounded by MAX_FILE_BYTES but a repository is not bounded by
-		// anything except this.
+		// The job's deadline reaches the read stage here. MAX_FILE_BYTES bounds
+		// one read and MAX_REPO_FILES bounds how many there are, but neither
+		// bounds how long they take, and the walk's own check is behind us.
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err
 		}
