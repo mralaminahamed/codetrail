@@ -92,6 +92,16 @@ a suffix match, so `github.com.evil.example` and `pages.github.com` are both ref
 and ports in the URL are refused outright. A rejection names **which rule** fired, because a generic
 `400` tells an operator nothing about what to change.
 
+**One repository is one queued job — including while it waits to retry.** Submitting a repository
+that is already `pending` or `leased` returns the existing job instead of queueing a second clone of
+it, matched case-insensitively so `octocat/Spoon-Knife` and `OctoCat/spoon-knife` are one job. A job
+that fails an attempt goes back to `pending` and waits out a backoff, and a waiting job is still
+`pending`, so it still holds the slot: **re-submitting during the wait returns the waiting job and
+does not start it any sooner**, and there is no way to force an earlier retry. With the default
+three attempts the waits are 30s and then 60s. That is intended — hammering a forge that is down is
+worse than waiting — but the API answers `202` with the existing job either way, so it is written
+here rather than left to be inferred from a job that does not move.
+
 **The clone is shallow, single-branch, blob-filtered**, runs in its own process group under a
 wall-clock deadline so the timeout kills `git`'s children too, and has `GIT_TERMINAL_PROMPT=0` with
 a neutered `GIT_ASKPASS` so a private URL fails immediately instead of blocking forever on a
