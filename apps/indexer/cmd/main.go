@@ -490,8 +490,12 @@ func (ix *indexer) embedAll(ctx context.Context, spans []store.EmbeddedSpan) err
 	return nil
 }
 
-// recordDeadline bounds the queue writes that close a job out.
-const recordDeadline = 30 * time.Second
+// recordDeadline bounds the queue writes that close a job out. A pool that has
+// stopped answering must not hold the worker on a write forever: the job's own
+// context is deliberately not what bounds these, so nothing else would.
+//
+// A var so a test can shorten it; nothing writes it in production.
+var recordDeadline = 30 * time.Second
 
 // fail returns the job to the queue against its attempt budget.
 func (ix *indexer) fail(ctx context.Context, l zerolog.Logger, id, reason string) {
