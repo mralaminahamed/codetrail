@@ -1,6 +1,7 @@
 package chunk
 
 import (
+	"bytes"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -50,7 +51,8 @@ func StripDocs(filename string, src []byte) ([]byte, error) {
 			if isDirective(c.Text) {
 				continue
 			}
-			for i := tf.Offset(c.Pos()); i < tf.Offset(c.End()); i++ {
+			start := tf.Offset(c.Pos())
+			for i := start; i < commentEnd(src, start); i++ {
 				drop[i] = true
 			}
 		}
@@ -78,14 +80,59 @@ func StripDocs(filename string, src []byte) ([]byte, error) {
 
 	out := make([]byte, 0, len(src))
 	for i, b := range src {
-		// The newline is what is kept: it is the whole of "blanked, not
-		// deleted", and only a /* */ doc comment has any inside it.
-		if drop[i] && b != '\n' {
+		// The line terminator is what is kept: it is the whole of "blanked,
+		// not deleted", and only a /* */ doc comment has any inside it. Under
+		// CRLF the terminator is both bytes, so keeping only the \n would
+		// rewrite every line ending inside a block doc comment.
+		if drop[i] && b != '\n' && b != '\r' {
 			continue
 		}
 		out = append(out, b)
 	}
+	if err := selfCheck(filename, src, out); err != nil {
+		return nil, err
+	}
 	return out, nil
+}
+
+// commentEnd is the offset one past the comment starting at start, read from
+// the source rather than from ast.Comment.End().
+//
+// End() is Slash+len(c.Text), and go/scanner strips carriage returns out of
+// c.Text: on a CRLF file a /* */ doc comment's Text is shorter than the bytes
+// it occupies, End() lands inside it, and the tail — a bare "*/" — is left
+// behind in source that then no longer parses.
+func commentEnd(src []byte, start int) int {
+	if start+1 < len(src) && src[start+1] == '*' {
+		if i := bytes.Index(src[start+2:], []byte("*/")); i >= 0 {
+			return start + 2 + i + 2
+		}
+		return len(src) // unterminated: unreachable, the parse already failed
+	}
+	// A // comment ends before its newline, which is not part of it.
+	if i := bytes.IndexByte(src[start:], '\n'); i >= 0 {
+		return start + i
+	}
+	return len(src)
+}
+
+// selfCheck refuses output that broke either invariant the callers rely on:
+// that the result is still the same Go file minus prose, and that no line
+// number moved. Both are cheap next to the parse this function already does,
+// and the CRLF bug above is what they exist for — it corrupted the corpus for
+// free, because the AST arm's answer to source that will not parse is windows
+// rather than an error.
+var lf = []byte("\n")
+
+func selfCheck(filename string, src, out []byte) error {
+	if got, want := bytes.Count(out, lf), bytes.Count(src, lf); got != want {
+		return fmt.Errorf("chunk: strip %s: %d lines out, %d in", filename, got, want)
+	}
+	fset := token.NewFileSet()
+	if _, err := parser.ParseFile(fset, filename, out, parser.ParseComments|parser.SkipObjectResolution); err != nil {
+		return fmt.Errorf("chunk: strip %s: stripped source no longer parses: %w", filename, err)
+	}
+	return nil
 }
 
 // isDirective reports whether a comment is a directive rather than prose.

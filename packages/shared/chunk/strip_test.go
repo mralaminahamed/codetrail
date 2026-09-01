@@ -3,6 +3,8 @@ package chunk
 import (
 	"strings"
 	"testing"
+
+	"github.com/mralaminahamed/codetrail/packages/shared/models"
 )
 
 func stripped(t *testing.T, name string) ([]byte, []byte, []string) {
@@ -295,5 +297,100 @@ func TestStripDocsSurvivesLineDirectives(t *testing.T) {
 	}
 	if n := strings.Count(string(out), "\n"); n != strings.Count(string(src), "\n") {
 		t.Fatalf("stripped source has %d newlines, original has %d", n, strings.Count(string(src), "\n"))
+	}
+}
+
+// Windows line endings, the one shape in this package that produced wrong
+// output. ast.Comment.End() is Slash+len(c.Text) and go/scanner strips carriage
+// returns out of c.Text, so a CRLF block doc comment's End() lands two bytes
+// short and the closing "*/" survives into source that no longer parses.
+//
+// Nothing here would have said so. StripDocs returned no error, and the AST
+// arm's answer to source it cannot parse is windows — so the corpus quietly
+// lost the declaration and the run still looked healthy. That is why this test
+// chunks the stripped bytes rather than only inspecting them.
+func TestStripDocsBlanksDocCommentsInCRLFSource(t *testing.T) {
+	src := []byte("package p\r\n\r\n/*\r\nDoc for F.\r\nMore prose.\r\n*/\r\nfunc F() {\r\n\t_ = 1\r\n}\r\n")
+	out, err := StripDocs("crlf.go", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), "Doc for F") || strings.Contains(string(out), "*/") {
+		t.Fatalf("the block doc comment did not go away whole:\n%q", out)
+	}
+	if got, want := strings.Count(string(out), "\n"), strings.Count(string(src), "\n"); got != want {
+		t.Fatalf("stripped source has %d newlines, original has %d", got, want)
+	}
+	// The terminator is both bytes: keeping only the \n rewrites the line
+	// endings of every line inside the comment.
+	if strings.Contains(strings.ReplaceAll(string(out), "\r\n", ""), "\n") {
+		t.Fatalf("a CRLF line ending became a bare LF:\n%q", out)
+	}
+	got, err := Chunks("crlf.go", out, astOpts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Kind != models.KindFunc || got[0].Symbol != "F" {
+		for _, c := range got {
+			t.Logf("%s %s %d..%d", c.Kind, c.Symbol, c.StartLine, c.EndLine)
+		}
+		t.Fatalf("stripped CRLF source no longer reaches the AST arm:\n%q", out)
+	}
+}
+
+// A bare \r inside a // comment is the same defect one byte at a time: c.Text
+// drops it, so End() stops short and the comment's last character is left
+// behind as a statement. The remnant is a single letter, which no assertion on
+// the prose would notice — only re-chunking does.
+func TestStripDocsBlanksDocCommentsHoldingABareCarriageReturn(t *testing.T) {
+	src := []byte("package p\n\n// a\rb prose\nfunc G() {\n\t_ = 1\n}\n")
+	out, err := StripDocs("cr.go", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Chunks("cr.go", out, astOpts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Kind != models.KindFunc || got[0].Symbol != "G" {
+		t.Fatalf("stripped source no longer reaches the AST arm: %q", out)
+	}
+}
+
+// The guard that makes this class of bug loud instead of silent. Nothing in the
+// package can produce a broken output any more, so selfCheck is called with one
+// directly: a line short, and a file that no longer parses.
+func TestStripDocsRefusesOutputThatBrokeAnInvariant(t *testing.T) {
+	src := []byte("package p\n\n// Doc.\nfunc F() {}\n")
+	if err := selfCheck("p.go", src, []byte("package p\n\nfunc F() {}\n")); err == nil {
+		t.Fatal("a stripped source one line short was accepted")
+	}
+	if err := selfCheck("p.go", src, []byte("package p\n\n*/\nfunc F() {}\n")); err == nil {
+		t.Fatal("a stripped source that no longer parses was accepted")
+	}
+	if err := selfCheck("p.go", src, src); err != nil {
+		t.Fatalf("source that broke nothing was refused: %v", err)
+	}
+}
+
+// The offsets the blanking loop runs over, stated as numbers. End-to-end this
+// defect reaches a test as selfCheck's error rather than as an assertion, so
+// what the error means is pinned here.
+func TestCommentEndCoversTheWholeRawComment(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		src  string
+		want int
+	}{
+		{"block", "/*\nDoc.\n*/\nfunc F() {}\n", 10},
+		{"block CRLF", "/*\r\nDoc.\r\n*/\r\nfunc F() {}\r\n", 12},
+		{"line", "// Doc.\nfunc F() {}\n", 7},
+		{"line CRLF", "// Doc.\r\nfunc F() {}\r\n", 8},
+		{"line holding a bare CR", "// a\rb\nfunc F() {}\n", 6},
+		{"line at end of file", "// Doc.", 7},
+	} {
+		if got := commentEnd([]byte(tc.src), 0); got != tc.want {
+			t.Errorf("%s: commentEnd is %d, want %d — %q", tc.name, got, tc.want, tc.src[:min(got, len(tc.src))])
+		}
 	}
 }
