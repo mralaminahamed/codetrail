@@ -6,6 +6,8 @@ import (
 	"context"
 	"os"
 	"testing"
+
+	"github.com/mralaminahamed/codetrail/packages/shared/models"
 )
 
 // dsn is the database these tests run against. They create and drop their own
@@ -169,5 +171,92 @@ func TestReposHasNoUnwrittenStatusColumn(t *testing.T) {
 	}
 	if n != 0 {
 		t.Fatal("repos.status is back, and nothing writes it")
+	}
+}
+
+// f1813be re-keyed repos.id without a migration, so a database that already
+// held a row keyed the old way had two identities for one repository. PutRepo
+// arbitrates ON CONFLICT (id), missed the stale row, and failed on the
+// (remote, commit_sha) uniqueness — three attempts, SQLSTATE 23505 every time,
+// and no retry could clear it. 0007 drops that constraint.
+func TestPreFixRepoRowDoesNotWedgePutRepoLive(t *testing.T) {
+	ctx := context.Background()
+	const remote = "https://github.com/octocat/Spoon-Knife"
+	const key = "github.com/octocat/spoon-knife"
+	const commit = "d0dd1f6b1f7e4dfd44dd54e4c2a4c1b9d5e0aa11"
+	// Pre-fix code hashed the submitted URL; RepoID's argument changed, not its
+	// shape, so the old id is this same call with the URL in it.
+	old, want := RepoID(remote, commit), RepoID(key, commit)
+	if old == want {
+		t.Fatal("the two schemes agree, so this test proves nothing")
+	}
+	s := fresh(t, old, want)
+
+	if _, err := s.pool.Exec(ctx, `
+		INSERT INTO repos (id, remote, ref, commit_sha) VALUES ($1, $2, 'main', $3)`,
+		old, remote, commit); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutRepo(ctx, models.Repo{ID: want, Remote: remote, Ref: "main", Commit: commit}, nil); err != nil {
+		t.Fatalf("a pre-fix row still blocks the write: %v", err)
+	}
+}
+
+// The other half: dropping the constraint alone would leave the stale row
+// beside the new one, which is the duplication f1813be set out to remove. The
+// body is re-run here rather than trusted, because migrate() applies it once
+// and the recorded name would make a broken statement look applied.
+//
+// In one rolled-back transaction: the jobs package's live tests share this
+// database, run in their own binary, and truncate jobs on every test, so a
+// committed row of ours would be theirs to delete and theirs to trip over.
+func TestMigration0007ClearsTheCorpusAndSparesJobsLive(t *testing.T) {
+	ctx := context.Background()
+	s := evictFresh(t)
+	body, err := migrationFS.ReadFile("migrations/0007_repo_identity.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+
+	for _, stmt := range []string{
+		`INSERT INTO repos (id, remote, ref, commit_sha) VALUES ('m7', 'https://github.com/a/m7', 'main', 'c0ffee')`,
+		`INSERT INTO files (id, repo_id, path, blob, lang, lines) VALUES ('m7-f', 'm7', 'a.go', '', 'go', 1)`,
+		`INSERT INTO spans (id, repo_id, file_id, path, kind, start_line, end_line, text, digest, embed_model, embed_dim)
+			VALUES ('m7-s', 'm7', 'm7-f', 'a.go', 'func', 1, 1, 'x', 'd', 'm', 768)`,
+		`INSERT INTO jobs (id, remote, ref, status) VALUES ('m7-job', 'https://github.com/a/m7', 'main', 'done')`,
+	} {
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Twice, and the second time against the empty table it just left: a
+	// migration that is not safe to re-run is a migration that runs once.
+	for i := range 2 {
+		if _, err := tx.Exec(ctx, string(body)); err != nil {
+			t.Fatalf("run %d: %v", i+1, err)
+		}
+		for _, tc := range []struct {
+			what, from string
+			want       int
+		}{
+			{"repos", "repos", 0},
+			{"files", "files", 0},
+			{"spans", "spans", 0},
+			{"the job", "jobs WHERE id = 'm7-job'", 1},
+		} {
+			var n int
+			if err := tx.QueryRow(ctx, `SELECT count(*) FROM `+tc.from).Scan(&n); err != nil {
+				t.Fatal(err)
+			}
+			if n != tc.want {
+				t.Errorf("run %d: %s has %d rows, want %d", i+1, tc.what, n, tc.want)
+			}
+		}
 	}
 }
