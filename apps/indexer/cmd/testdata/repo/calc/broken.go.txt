@@ -1,0 +1,4 @@
+package calc
+
+// Broken never parses. CODETRAILDOC.
+func Broken( {

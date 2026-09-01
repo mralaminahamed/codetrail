@@ -1,0 +1,9 @@
+//go:build tools
+
+// Package fixture's build tooling, imported so `go mod tidy` keeps it.
+// CODETRAILDOC.
+package fixture
+
+import (
+	_ "example.com/lint"
+)

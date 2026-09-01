@@ -1,0 +1,5 @@
+// Package fixture documents itself and declares nothing else.
+//
+// CODETRAILDOC: this package comment is the whole file, and f.Doc is not a
+// Decl, so the AST strategy emits no span for it at all.
+package fixture
