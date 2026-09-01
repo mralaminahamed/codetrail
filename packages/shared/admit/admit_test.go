@@ -170,7 +170,7 @@ func TestDefaultHostsArePinned(t *testing.T) {
 	}
 }
 
-// Task 4 renders Rule straight into the 400 body, so the two branches that can
+// The gateway renders Rule straight into the 400 body, so the two branches that can
 // fire before the host is known have to name the right rule, not merely refuse.
 // The control characters are not exotic: they are what makes url.Parse itself
 // fail, which is the only way to reach that second branch.
@@ -192,7 +192,7 @@ func TestPreHostRefusalsAreRuleForm(t *testing.T) {
 	}
 }
 
-// Task 4 builds the policy from a split env var, so "github.com, codeberg.org"
+// Both binaries build the policy from a split env var, so "github.com, codeberg.org"
 // — the natural way to write it — hands NewPolicy a leading space to absorb.
 func TestNewPolicyNormalisesHosts(t *testing.T) {
 	for _, hosts := range [][]string{

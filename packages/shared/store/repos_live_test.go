@@ -123,7 +123,7 @@ func TestDeletingARepoCascadesLive(t *testing.T) {
 	}
 }
 
-// GetRepo and TouchRepo are the LRU clock Task 8 evicts on: a repo that was
+// GetRepo and TouchRepo are the LRU clock Evict orders on: a repo that was
 // never indexed has to be distinguishable from one that was, and a touch has
 // to move the column eviction will order by.
 func TestGetRepoAndTouchRepoLive(t *testing.T) {
