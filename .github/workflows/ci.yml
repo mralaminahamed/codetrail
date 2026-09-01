@@ -34,5 +34,12 @@ jobs:
         run: go test ./... -count=1
       # The tests that matter most. Every hermetic test in the tree can pass
       # against a schema Postgres would reject.
+      #
+      # Spec §9 requires the harness to run with no model. EMBED_PROVIDER is
+      # written out rather than left to a default: the indexer's live suite
+      # defaults to the fake itself and refuses any other provider, so this is
+      # the intent made visible in the log next to the run it describes.
       - name: live datastore tests
+        env:
+          EMBED_PROVIDER: fake
         run: go test -tags=live -count=1 -v ./...
