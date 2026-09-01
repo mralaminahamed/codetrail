@@ -170,7 +170,7 @@ Everything in this task is a pure function over synthetic inputs: no database, n
 - **`Decide` refuses on a `NaN` top score.** `NaN < floor` is `false` in Go, so the natural spelling of the check *answers* on a NaN. P2 measured that pgvector returns `NaN` for the cosine distance of a zero vector; a span with a zero embedding is prevented at the chunker, and this is the second line of defence at the place where the failure would otherwise be a confident answer.
 - **`Decide` is inclusive at the floor:** it refuses when `top < floor`, so a score exactly equal to the floor answers. Arbitrary, but it has to be pinned somewhere or the boundary drifts; the tests fix it.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `fuse_test.go`:
 
@@ -372,7 +372,7 @@ func TestFloorValidateRefusesWhatCosineCannotProduce(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Implement**
+- [x] **Step 2: Implement**
 
 `fuse.go`, in outline — the sum, then one sort:
 
@@ -429,11 +429,11 @@ func Decide(f Floor, hits int, top float64, vectorRan bool) (Outcome, Reason) {
 func DefaultFloor() Floor { return Floor{Value: -1, Calibrated: false} }
 ```
 
-- [ ] **Step 3: Run**
+- [x] **Step 3: Run**
 
 `go test ./packages/shared/rag/ -count=1 -v` — expect PASS.
 
-- [ ] **Step 4: Commit, then prove the tests discriminate**
+- [x] **Step 4: Commit, then prove the tests discriminate**
 
 `git status --porcelain` must be empty first.
 
@@ -441,14 +441,14 @@ func DefaultFloor() Floor { return Floor{Value: -1, Calibrated: false} }
 - *Why the code exists:* `k` is the discount that stops a single arm's top rank from dominating the fusion; it is the parameter P6 sweeps.
 - *Fixture that separates mutant from original:* the `(1st, 20th)` versus `(2nd, 2nd)` fixture in `TestKChangesTheOrderWhereItShould`. A fixture where both arms rank the same documents in the same order cannot: `k` then scales every score by the same monotone function and the order is unchanged.
 - *Must fail:* `TestKChangesTheOrderWhereItShould`
-- *Expected (verify and correct):* `k=60 ranked "X" first, want Y`
+- *Observed:* killed. `fuse_test.go:71: k=60 ranked "X" first, want Y` — prediction correct.
 - *Compiles and vets:* yes; it is an arithmetic change with the same types.
 
 **M2 — fuse on the arm's score instead of its rank: `1/float64(k+rank)` → `h.Score`.**
 - *Why the code exists:* the two arms' units are not comparable, so ranks are the only common currency.
 - *Fixture that separates mutant from original:* `hits()` gives descending scores `1, 0.99, 0.98…` in both arms, so summing scores ranks by "how high each arm put it" with a *different* discount curve than RRF. In `TestFuseIsReciprocalRankOverBothArms`: A=1+0.99=1.99, C=0.98+1=1.98, B=0.99, E=0.98, D=0.97 — **which is the same order**. Expected to survive on that test. The kill is `TestFusedScoreCarriesNoQualitySignal`, whose two fixtures have identical rank order and different scores by construction.
 - *Must fail:* `TestFusedScoreCarriesNoQualitySignal`
-- *Expected (verify and correct):* `a good arm fused to 0.99 and a worthless one to 0.01`
+- *Observed:* killed. `fuse_test.go:133: a good arm fused to 0.99 and a worthless one to 0.01` — prediction correct. **The predicted survival held**: `TestFuseIsReciprocalRankOverBothArms` passed under the mutant, exactly as this block says it would. Two incidental kills the block did not predict, both because a hand-built `Hit` literal leaves `Score` at 0 while `hits()` fills it: `fuse_test.go:71: k=60 ranked "X" first, want Y`, and `fuse_test.go:121: got [alpha zulu3 mike4 delta nine], want [nine delta alpha zulu3 mike4]` (every span scores 0, so the whole order falls to the tie-break).
 - *Compiles and vets:* yes.
 - *Note:* this mutation is listed with its predicted **survival** on the first test on purpose. A mutation that survives the test you expected to kill it is the single most useful thing a mutation round produces, and dropping it quietly is how a plan grows a test that proves nothing.
 
@@ -456,52 +456,61 @@ func DefaultFloor() Floor { return Floor{Value: -1, Calibrated: false} }
 - *Why the code exists:* two runs over an unchanged corpus must be diffable; without it the order among equal scores comes from map iteration.
 - *Fixture that separates mutant from original:* `TestTiesBreakOnPathAndLineNotOnWalkOrder`, whose two documents fuse to bit-identical scores. Any fixture with distinct scores cannot detect this at all.
 - *Must fail:* `TestTiesBreakOnPathAndLineNotOnWalkOrder`
-- *Expected (verify and correct):* `got [aaa bbb], want [bbb aaa]` — on *some* iteration of the 50. Go's `sort.Slice` is not stable and map iteration is randomised, so the failure is overwhelmingly likely rather than certain: 50 draws that all happen to come out in the intended order is roughly `2^-50`. **If it passes, do not record a kill** — record what happened and raise the loop count, because the claim being tested is determinism and a flaky kill is not evidence of it.
+- *Observed:* killed on the first run; no loop-count increase needed. `fuse_test.go:87: got [aaa bbb], want [bbb aaa]`. Predicted as: `got [aaa bbb], want [bbb aaa]` — on *some* iteration of the 50. Go's `sort.Slice` is not stable and map iteration is randomised, so the failure is overwhelmingly likely rather than certain: 50 draws that all happen to come out in the intended order is roughly `2^-50`. **If it passes, do not record a kill** — record what happened and raise the loop count, because the claim being tested is determinism and a flaky kill is not evidence of it.
 - *Compiles and vets:* yes.
 
 **M4 — tie-break on `SpanID` only (drop `Path`/`StartLine`).**
 - *Why the code exists:* a human comparing two result sets reads file order, not hash order.
 - *Fixture that separates mutant from original:* the same fixture, built so `aaa` sorts before `bbb` by id but *after* it by `(path, start_line)`. A fixture whose ids happen to agree with its paths cannot tell the two rules apart.
 - *Must fail:* `TestTiesBreakOnPathAndLineNotOnWalkOrder`
-- *Expected (verify and correct):* `got [aaa bbb], want [bbb aaa]`, deterministically this time.
+- *Observed:* killed. `fuse_test.go:87: got [aaa bbb], want [bbb aaa]` — prediction correct, and deterministic as stated.
 - *Compiles and vets:* yes.
 
 **M5 — absent arm scored as `len(list)+1` instead of skipped.**
 - *Why the code exists:* a span one arm never returned must contribute nothing; giving it a synthetic worst rank turns fusion into "vector, damped by a constant".
-- *Fixture that separates mutant from original:* `TestFuseIsReciprocalRankOverBothArms`, where `D` is in the vector arm only and `E` in the lexical arm only, at depths that make the synthetic ranks change their relative order. Expected: with the mutant, D=1/64+1/64 and E=1/63+1/65, so D and E swap.
-- *Must fail:* `TestFuseIsReciprocalRankOverBothArms`
-- *Expected (verify and correct):* `got [A C B D E], want [A C B E D]` — **verify the arithmetic before recording it**; the synthetic-rank values depend on the exact list lengths in the fixture.
-- *Compiles and vets:* yes.
+- *Fixture named in the plan:* `TestFuseIsReciprocalRankOverBothArms`. **It cannot separate them, and the plan's arithmetic was wrong.** D=1/64+1/64=0.0312500 and E=1/63+1/65=0.0312576, so E still outranks D and the order is unchanged — `[A C B E D]` under mutant and original alike. The plan predicted a swap; there is none.
+- *Fixture that actually separates them (added):* `TestAbsentFromAnArmContributesNothing`, whose arms have deliberately different lengths (2 and 4), so the synthetic terms are 1/65 and 1/63 rather than 1/65 and 1/64, and the vector-only `delta` and lexical-only `alpha` sit 0.00026 apart — close enough for the near-constant the mutant adds to swap them.
+- *Must fail:* `TestAbsentFromAnArmContributesNothing`
+- *Observed (score-only mutant, matching the wording "absent arm **scored** as len+1"):* **survived** `TestFuseIsReciprocalRankOverBothArms`. Killed by the added test: `fuse_test.go:121: got [nine alpha delta zulu3 mike4], want [nine delta alpha zulu3 mike4]`. One unpredicted kill: `fuse_test.go:71: k=60 ranked "Z0" first, want Y` — `Z0` is lexical-only against a 2-long vector arm, so it gains 1/63 and passes `Y`.
+- *Observed (M5b — the same mutant also writing the synthetic value into the rank field):* killed by the prescribed test, but on its **rank** assertion rather than its order assertion: `fuse_test.go:51: E has vector rank 5, want 0`. So the prescribed test detects only the variant that corrupts the reported rank; the variant that corrupts only the score is invisible to it.
+- *Compiles and vets:* yes, both variants.
 
 **M6 — `if top < f.Value` → `if top <= f.Value`.**
 - *Why the code exists:* the boundary has to be fixed somewhere or it drifts between the code, the tests and the README.
 - *Fixture that separates mutant from original:* `TestTheFloorIsInclusive`, which hands `Decide` a top score of *exactly* the floor. Only a unit test can: through pgvector, an exact float equality against a configured floor is not reproducible.
 - *Must fail:* `TestTheFloorIsInclusive`
-- *Expected (verify and correct):* `a top score of exactly 0.5 gave refused/below_floor, want answered`
+- *Observed:* killed. `decide_test.go:22: a top score of exactly 0.5 gave refused/below_floor, want answered` — prediction correct. Also killed `TestTheShippedDefaultRefusesNothingOnScoreAlone`: `decide_test.go:58: the worst possible cosine gave refused/below_floor at the default floor`, because `-1 <= -1`. The shipped default sits exactly on the boundary, so the "ships at -1" test doubles as a second inclusivity assertion.
 - *Compiles and vets:* yes.
 
 **M7 — delete the `math.IsNaN` branch.**
 - *Why the code exists:* `NaN < x` is false, so without the branch a score that is not a number is answered on.
 - *Fixture that separates mutant from original:* `TestANaNTopScoreRefuses`. No fixture with a real score can reach this branch.
 - *Must fail:* `TestANaNTopScoreRefuses`
-- *Expected (verify and correct):* `got answered/, want refused/unscored`
-- *Compiles and vets:* yes — `math` is still imported by `Validate`. **If it is not, the mutation breaks the build and is void:** re-apply it as `if math.IsNaN(top) && false`.
+- *Observed:* killed. `decide_test.go:36: got answered/, want refused/unscored` — prediction correct, empty reason included.
+- *Compiles and vets:* yes, confirmed — `Validate` still calls `math.IsNaN`, so the import survives and the `&& false` fallback was not needed. `Validate` must keep that call for its own sake: `NaN < -1` and `NaN > 1` are both false, so a range check alone accepts NaN.
 
 **M8 — `if hits == 0` → `if false`.**
 - *Why the code exists:* an empty result is a refusal, not an answer with no citations, and it is the refusal that stays live while the floor is uncalibrated.
 - *Fixture that separates mutant from original:* `TestNothingRetrievedRefusesEvenAtTheDefaultFloor`, which passes `hits=0` and a NaN top. Note the mutant then falls through to the NaN branch and *also* refuses — with the wrong reason. The test asserts the reason, which is what makes it a kill; asserting only `OutcomeRefused` would pass.
 - *Must fail:* `TestNothingRetrievedRefusesEvenAtTheDefaultFloor`
-- *Expected (verify and correct):* `got refused/unscored, want refused/no_spans`
+- *Observed:* killed. `decide_test.go:14: got refused/unscored, want refused/no_spans` — prediction correct, and the fall-through to the NaN branch happened exactly as described, which is what makes asserting the reason load-bearing.
 - *Compiles and vets:* yes.
 
 **M9 — `DefaultFloor` returns `Floor{Value: 0.35, Calibrated: true}`.**
 - *Why the code exists:* spec:315. The value is P6's, and the flag is what stops a reader mistaking a placeholder for a measurement.
 - *Fixture that separates mutant from original:* `TestTheShippedDefaultRefusesNothingOnScoreAlone`, which asserts both halves — the flag and the behaviour at the bottom of the cosine range.
 - *Must fail:* `TestTheShippedDefaultRefusesNothingOnScoreAlone`
-- *Expected (verify and correct):* `the default floor claims to be calibrated`
+- *Observed:* killed. `decide_test.go:55: the default floor claims to be calibrated` — prediction correct. The test stops at the flag, so its behavioural half is unreached under this mutant; M6's second kill covers that half.
 - *Compiles and vets:* yes.
 
-- [ ] **Step 5: Commit**
+**M10 — `ParseMode` returns `Mode(s), nil` for anything (added: the plan prescribed `ParseMode` with no test).**
+- *Why the code exists:* `RETRIEVAL_MODE` is validated at boot; defaulting an unrecognised value would hide a typo behind a service retrieving differently than it was asked to.
+- *Fixture that separates mutant from original:* `TestParseModeIsAClosedSet`, whose reject list includes `""` — the value a deployment hits by not setting the variable at all — and `"Hybrid"`, so a case-insensitive parse fails too.
+- *Must fail:* `TestParseModeIsAClosedSet`
+- *Observed:* killed. `rag_test.go:19: ParseMode("") accepted, returning ""`
+- *Compiles and vets:* yes.
+
+- [x] **Step 5: Commit**
 
 ```bash
 gofmt -l apps packages && go vet ./... && go test ./... -count=1
@@ -528,7 +537,13 @@ for a tuned threshold. Spec:315 puts the number in P6."
 - A fused score is proven to carry no quality signal, which is what justifies where the floor is read.
 - `Decide` separates refusal reasons into the closed set the metric labels use, refuses on `NaN`, and does not apply a cosine floor to a lexical-only result.
 - The shipped floor is `-1`, uncalibrated, and a test fails if that changes.
-- M1–M9 each recorded with observed output; M2's predicted survival recorded either way.
+- M1–M10 each recorded with observed output; M2's predicted survival held and is recorded; M5 survived the fixture the plan named for it, and the fixture that does kill it was added.
+
+**Deviations from this task as written, and why:**
+- **`type Arm string` / `ArmVector` / `ArmLexical` are not shipped.** Nothing in P3 consumes them: `Fuse` takes named arms by this task's own argument against `map[Arm][]Hit`, Task 6's metric labels are `mode`/`outcome`/`reason`, and Task 7's response fields are `vector_rank`/`lexical_rank`. They are residue of the design this task rejects, and shipping them would be dead exported API.
+- **`ParseMode` gained a test (`TestParseModeIsAClosedSet`) and a mutation (M10).** It was listed under Produces with neither, and it is a fail-closed boot validator — precisely the shape this codebase tests elsewhere (`chunk.Options.Validate`).
+- **`TestAbsentFromAnArmContributesNothing` added.** See M5: the fixture the plan named cannot detect the mutation it was named for.
+- **Left open for Task 6:** `Fuse` does not guard `k`. `k = -1` makes `rrf(k, 1)` a division by zero (`+Inf`), and `k <= -2` yields negative scores that invert the ranking. `Fuse` returns no error and `Fuse(0, …)` is a required call, so the guard belongs where `RETRIEVAL_MODE` is validated: **Task 6 should validate `RETRIEVAL_RRF_K >= 0` at boot**, which it does not currently mention.
 
 ---
 
