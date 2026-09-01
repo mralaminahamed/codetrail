@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io/fs"
 	"maps"
-	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -17,8 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-
 	"github.com/mralaminahamed/codetrail/apps/indexer/internal/clone"
 	"github.com/mralaminahamed/codetrail/apps/indexer/internal/walk"
 	"github.com/mralaminahamed/codetrail/packages/shared/chunk"
@@ -26,18 +23,15 @@ import (
 	"github.com/mralaminahamed/codetrail/packages/shared/jobs"
 	"github.com/mralaminahamed/codetrail/packages/shared/models"
 	"github.com/mralaminahamed/codetrail/packages/shared/store"
+	"github.com/mralaminahamed/codetrail/packages/shared/testdb"
 )
 
 // scratchDSN names a database this suite creates for itself.
 //
-// Not the shared one DATABASE_URL points at. `go test -tags=live ./...` runs the
-// packages at once, store's eviction tests clear every repo with no WHERE, and
-// the eviction test below clears every repo the other way. Prevention rather
-// than a fix for an observed failure: forcing the collision — a DELETE loop
-// against the shared database, and the two suites started together — did not
-// make it bite in a dozen tries, because the window between a job's write and
-// its read-back is milliseconds. It costs one CREATE DATABASE to not have to
-// know that.
+// Not the shared one DATABASE_URL points at: `go test -tags=live ./...` runs the
+// packages at once and the eviction test below clears every repo. Every live
+// suite in the tree now does the same, through the same helper, so no suite can
+// empty a table in a database a reader pointed it at.
 var scratchDSN string
 
 func TestMain(m *testing.M) {
@@ -65,44 +59,15 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "EMBED_PROVIDER=%q: the live suite runs on the fake embedder\n", p)
 		os.Exit(1)
 	}
-	code, err := withScratchDatabase(base, m.Run)
+	code, err := testdb.Scratch(base, "codetrail_indexer", func(d string) int {
+		scratchDSN = d
+		return m.Run()
+	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 	os.Exit(code)
-}
-
-// withScratchDatabase creates a database beside the one base names, points
-// scratchDSN at it, and drops it afterwards. It returns rather than exiting so
-// its defers run before TestMain's os.Exit.
-func withScratchDatabase(base string, run func() int) (int, error) {
-	ctx := context.Background()
-	u, err := url.Parse(base)
-	if err != nil {
-		return 0, fmt.Errorf("DATABASE_URL is not a URL: %w", err)
-	}
-	admin, err := pgx.Connect(ctx, base)
-	if err != nil {
-		return 0, fmt.Errorf("connect: %w", err)
-	}
-	defer admin.Close(ctx)
-
-	name := fmt.Sprintf("codetrail_indexer_%d", time.Now().UnixNano())
-	if _, err := admin.Exec(ctx, `CREATE DATABASE "`+name+`"`); err != nil {
-		return 0, fmt.Errorf("create %s: %w", name, err)
-	}
-	defer func() {
-		// FORCE, because a pool that outlived a failing test still holds a
-		// session and DROP DATABASE would block on it.
-		if _, err := admin.Exec(ctx, `DROP DATABASE IF EXISTS "`+name+`" WITH (FORCE)`); err != nil {
-			fmt.Fprintf(os.Stderr, "dropping %s: %v\n", name, err)
-		}
-	}()
-
-	u.Path = "/" + name
-	scratchDSN = u.String()
-	return run(), nil
 }
 
 func liveDSN(t *testing.T) string {
