@@ -40,9 +40,26 @@ type Job struct {
 	Error    string `json:"error,omitempty"`
 }
 
-type Queue struct{ pool *pgxpool.Pool }
+// DefaultRetryBase and DefaultRetryMax bound the wait between attempts. Small
+// enough that a forge blip is retried within a poll cycle or two, large enough
+// that a repository which does not exist no longer spends all three attempts
+// in nine seconds — measured, before Fail set a retry time at all.
+const (
+	DefaultRetryBase = 30 * time.Second
+	DefaultRetryMax  = 10 * time.Minute
+)
 
-func New(pool *pgxpool.Pool) *Queue { return &Queue{pool: pool} }
+// RetryBase and RetryMax are fields so a test can watch a retry it would
+// otherwise have to wait half a minute for.
+type Queue struct {
+	pool      *pgxpool.Pool
+	RetryBase time.Duration
+	RetryMax  time.Duration
+}
+
+func New(pool *pgxpool.Pool) *Queue {
+	return &Queue{pool: pool, RetryBase: DefaultRetryBase, RetryMax: DefaultRetryMax}
+}
 
 const cols = `id, remote, ref, status, attempts, error`
 
@@ -82,6 +99,10 @@ func (q *Queue) Enqueue(ctx context.Context, remote, ref string) (Job, error) {
 // Lease claims the oldest claimable job for d. SKIP LOCKED is what lets two
 // indexers poll the same table without handing both the same row.
 //
+// leased_until means "not before this" in both states: on a leased job it is
+// the lease expiry, on a pending one it is the retry time Fail set. A NULL is
+// a job that has never been leased, since Lease always writes one.
+//
 // worker must be unique per process. Complete and Fail authorise on it, so two
 // indexers sharing an id can silently finish each other's jobs: the ownership
 // check passes and no error is raised anywhere.
@@ -89,8 +110,8 @@ func (q *Queue) Lease(ctx context.Context, worker string, d time.Duration) (Job,
 	j, err := scan(q.pool.QueryRow(ctx, `
 		WITH claimed AS (
 			SELECT id FROM jobs
-			WHERE status = 'pending'
-			   OR (status = 'leased' AND leased_until < now())
+			WHERE status IN ('pending', 'leased')
+			  AND (leased_until IS NULL OR leased_until < now())
 			ORDER BY created_at
 			FOR UPDATE SKIP LOCKED
 			LIMIT 1
@@ -131,19 +152,30 @@ func (q *Queue) Complete(ctx context.Context, id, worker string) error {
 	return nil
 }
 
-// Fail returns the job to the queue, or marks it terminally failed once it
-// has used its attempts. The reason is written on both paths, so a job waiting
-// to retry says why it is waiting; Complete clears it, so a job that ends up
-// succeeding keeps no trace of the attempts that did not. Lease ownership is
-// enforced as it is in Complete — a zombie requeueing a job would let a third
-// worker start it while the live one is still cloning.
+// Fail returns the job to the queue after a backoff, or marks it terminally
+// failed once it has used its attempts. The reason is written on both paths,
+// so a job waiting to retry says why it is waiting; Complete clears it, so a
+// job that ends up succeeding keeps no trace of the attempts that did not.
+// Lease ownership is enforced as it is in Complete — a zombie requeueing a job
+// would let a third worker start it while the live one is still cloning.
+//
+// The backoff is leased_until on a pending row, which is the column Lease
+// already reads: no new column, and the existing jobs_claimable_idx still
+// serves the filter. It doubles with attempts and stops at RetryMax; the
+// exponent is capped because an interval multiplied by an unbounded float
+// overflows rather than saturating.
 func (q *Queue) Fail(ctx context.Context, id, worker, reason string, maxAttempts int) error {
 	tag, err := q.pool.Exec(ctx, `
 		UPDATE jobs SET
 			status = CASE WHEN attempts >= $4 THEN 'failed' ELSE 'pending' END,
-			leased_by = NULL, leased_until = NULL,
+			leased_by = NULL,
+			leased_until = CASE WHEN attempts >= $4 THEN NULL
+				ELSE now() + least($5::interval * (2 ^ least(greatest(attempts - 1, 0), 16)), $6::interval)
+			END,
 			error = $3, updated_at = now()
-		WHERE id = $1 AND leased_by = $2`, id, worker, reason, maxAttempts)
+		WHERE id = $1 AND leased_by = $2`, id, worker, reason, maxAttempts,
+		fmt.Sprintf("%d milliseconds", q.RetryBase.Milliseconds()),
+		fmt.Sprintf("%d milliseconds", q.RetryMax.Milliseconds()))
 	if err != nil {
 		return err
 	}
