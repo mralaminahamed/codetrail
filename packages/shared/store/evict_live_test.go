@@ -166,3 +166,34 @@ func TestEvictRefusesANegativeKeepLive(t *testing.T) {
 		t.Fatalf("want the repo still there, got %d (%v)", got, err)
 	}
 }
+
+// Indexing counts as recency, or the worker undoes its own work: runJob writes
+// the rows and then calls Evict, so a repo that was the least recently queried
+// when the job started is deleted by the eviction at the end of that same job —
+// a clone, a walk and a transaction spent on rows that do not survive the next
+// statement.
+func TestAReindexRenewsTheLeaseOnTheCorpusLive(t *testing.T) {
+	ctx := context.Background()
+	s := evictFresh(t)
+
+	stale := seed(t, s, "stale")
+	hot := seed(t, s, "hot")
+	touch(t, s, stale, hot) // stale is now the least recently queried
+
+	// The same write runJob does immediately before it evicts. Same remote and
+	// commit, so this is a re-index of that row, not a new one.
+	time.Sleep(2 * time.Millisecond)
+	if got := seed(t, s, "stale"); got != stale {
+		t.Fatalf("the fixture re-indexed a different repo: %s != %s", got, stale)
+	}
+
+	if _, err := s.Evict(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetRepo(ctx, stale); err != nil {
+		t.Fatalf("the repo this job just indexed was evicted by that same job: %v", err)
+	}
+	if _, err := s.GetRepo(ctx, hot); err == nil {
+		t.Fatal("the re-indexed repo did not overtake the one nothing had touched since")
+	}
+}

@@ -39,6 +39,12 @@ func hash(parts ...string) string {
 // walk that skipped what it read last time — leaves the first run's rows
 // behind, and file_count then disagrees with the row count. Recorded rather
 // than fixed: P1 has no reader for either.
+//
+// It winds last_queried_at, which is what stops the indexer deleting its own
+// work: runJob evicts straight after this write, so a re-index of the least
+// recently used repo would otherwise drop the rows it just committed. Indexing
+// is a use — someone asked for this repository — so it renews the lease the
+// same way a query does.
 func (s *Store) PutRepo(ctx context.Context, r models.Repo, files []models.File) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -47,11 +53,12 @@ func (s *Store) PutRepo(ctx context.Context, r models.Repo, files []models.File)
 	defer tx.Rollback(ctx)
 
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO repos (id, remote, ref, commit_sha, file_count, size_bytes)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		INSERT INTO repos (id, remote, ref, commit_sha, file_count, size_bytes, last_queried_at)
+		VALUES ($1, $2, $3, $4, $5, $6, now())
 		ON CONFLICT (id) DO UPDATE SET
 			ref = EXCLUDED.ref, file_count = EXCLUDED.file_count,
-			size_bytes = EXCLUDED.size_bytes, indexed_at = now()`,
+			size_bytes = EXCLUDED.size_bytes, indexed_at = now(),
+			last_queried_at = now()`,
 		r.ID, r.Remote, r.Ref, r.Commit, len(files), r.SizeBytes); err != nil {
 		return fmt.Errorf("repo: %w", err)
 	}
@@ -80,7 +87,11 @@ func (s *Store) GetRepo(ctx context.Context, id string) (models.Repo, error) {
 }
 
 // TouchRepo records a query against a repo. This is the LRU clock: eviction
-// reads exactly this column.
+// reads exactly this column, and PutRepo is the only other thing that winds it.
+//
+// The column is named for the query that was expected to be its only writer.
+// It now holds "last used", indexing included; renaming it is a migration and
+// a P3 concern, so the narrower name is left in place and written down here.
 func (s *Store) TouchRepo(ctx context.Context, id string) error {
 	_, err := s.pool.Exec(ctx, `UPDATE repos SET last_queried_at = now() WHERE id = $1`, id)
 	return err

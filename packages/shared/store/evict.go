@@ -11,16 +11,17 @@ import "context"
 // this one.
 //
 // LRU, on last_queried_at, rather than on size: the biggest repo is not the
-// least useful one. Nothing calls TouchRepo yet — no endpoint reads a repo
-// before P3 — so in P1 that column holds each repo's first insert time and the
-// order is effectively oldest-indexed-first.
+// least useful one. Both a query (TouchRepo) and an index (PutRepo) wind that
+// column, so "least recently used" covers both ways a repo gets used — without
+// the second, runJob's eviction deletes the rows the same job just wrote.
 //
-// PutRepo does not move that column either, so re-indexing does not renew a
-// repo's lease on the corpus: measured, a re-index of the least recent repo
-// writes its rows and the eviction at the end of that same job deletes them
-// again. Correct as LRU-on-queries — a re-index is not a query — and harmless
-// while nothing reads repos, but it becomes visible in P3 the moment queries
-// start moving the clock for real.
+// Nothing calls TouchRepo yet, since no endpoint reads a repo before P3, so in
+// P1 the column holds each repo's most recent index and the order is in
+// practice least-recently-indexed-first.
+//
+// One column rather than GREATEST(last_queried_at, indexed_at), which would
+// rank identically — PutRepo sets indexed_at to now() on the same writes — but
+// could not use repos_lru_idx and would make this ordering an expression.
 //
 // A negative keep is rejected by Postgres ("OFFSET must not be negative")
 // rather than clamped here, so a caller that computes one gets an error
