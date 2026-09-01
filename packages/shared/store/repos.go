@@ -16,8 +16,14 @@ var ErrNotFound = errors.New("store: not found")
 
 // RepoID and FileID are content-addressed, which is what makes a retried
 // index converge on the same rows instead of duplicating them.
-func RepoID(remote, commit string) string { return hash(remote, commit) }
-func FileID(repoID, path string) string   { return hash(repoID, path) }
+//
+// RepoID takes admit.Remote.Key, not the submitted URL. The forge decides what
+// is one repository and it folds owner and name case, so keying on the URL let
+// two spellings of one repository hold two rows at the same commit and two
+// slots against the eviction quota. The key is the identity; repos.remote
+// still holds a spelling someone actually submitted, for display.
+func RepoID(key, commit string) string  { return hash(key, commit) }
+func FileID(repoID, path string) string { return hash(repoID, path) }
 
 // The trailing NUL after each part is a field separator, so ("ab","c") and
 // ("a","bc") do not hash alike. Neither a URL nor a git path can contain a NUL,

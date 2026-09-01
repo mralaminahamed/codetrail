@@ -55,9 +55,13 @@ func scan(row pgx.Row) (Job, error) {
 	return j, err
 }
 
-// Enqueue adds a job, or returns the active one for the same remote and ref.
-// The dedupe is the partial unique index in 0003, so two gateways racing on
-// the same submission produce one job rather than one job and one error.
+// Enqueue adds a job, or returns the active one for the same repository and
+// ref. The dedupe is the partial unique index in 0005, so two gateways racing
+// on the same submission produce one job rather than one job and one error.
+//
+// remote must be admit.Remote.URL. The index folds its case, which is what
+// makes two spellings of one repository one job; a caller that passes a raw
+// submission instead gets a dedupe that only matches exact strings.
 func (q *Queue) Enqueue(ctx context.Context, remote, ref string) (Job, error) {
 	sum := sha256.Sum256(fmt.Appendf(nil, "%s\x00%s\x00%d", remote, ref, time.Now().UnixNano()))
 	id := hex.EncodeToString(sum[:16])
@@ -70,7 +74,7 @@ func (q *Queue) Enqueue(ctx context.Context, remote, ref string) (Job, error) {
 	return scan(q.pool.QueryRow(ctx, `
 		INSERT INTO jobs (id, remote, ref, status)
 		VALUES ($1, $2, $3, 'pending')
-		ON CONFLICT (remote, ref) WHERE status IN ('pending','leased')
+		ON CONFLICT (lower(remote), ref) WHERE status IN ('pending','leased')
 		DO UPDATE SET updated_at = jobs.updated_at
 		RETURNING `+cols, id, remote, ref))
 }
