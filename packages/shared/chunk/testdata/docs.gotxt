@@ -46,3 +46,9 @@ func (c *Counter) Add(d int) int {
 }
 
 func undocumented() error { return fmt.Errorf("no doc") }
+
+type (
+	// Shape is documented on the spec: inside a type ( … ) group the doc
+	// attaches to the TypeSpec, and nothing above it sees the prose.
+	Shape struct{ N int }
+)

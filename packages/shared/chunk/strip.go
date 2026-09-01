@@ -143,6 +143,10 @@ func selfCheck(filename string, src, out []byte) error {
 // `go doc go/ast.IsDirective` answers "no symbol IsDirective in package go/ast".
 // The rule is go/ast's — the three grandfathered words, then //name:value with
 // name lowercase alphanumeric, which is what excludes prose like "// TODO: x".
+//
+// The //-prefix check is a guard rather than a decision: measured, deleting it
+// changes no answer, because a /* */ comment's text starts with "/" and the
+// name loop refuses it anyway.
 func isDirective(text string) bool {
 	c, ok := strings.CutPrefix(text, "//")
 	if !ok {
