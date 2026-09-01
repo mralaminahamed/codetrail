@@ -44,6 +44,10 @@ type Job struct {
 // enough that a forge blip is retried within a poll cycle or two, large enough
 // that a repository which does not exist no longer spends all three attempts
 // in nine seconds — measured, before Fail set a retry time at all.
+//
+// DefaultRetryMax governs nothing at the default MAX_ATTEMPTS=3, which only
+// ever waits 30s then 60s: the cap first binds on the sixth attempt, so it
+// takes MAX_ATTEMPTS of 7 or more to reach it.
 const (
 	DefaultRetryBase = 30 * time.Second
 	DefaultRetryMax  = 10 * time.Minute
