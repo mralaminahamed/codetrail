@@ -132,7 +132,10 @@ func (h *Handler) postRepo(c echo.Context) error {
 		})
 	}
 	// The normalised URL, not the caller's spelling: the dedupe index would
-	// otherwise see three spellings of one repository as three repositories.
+	// otherwise see a trailing slash and a .git suffix as separate
+	// repositories. The index folds case on top of that, which is the one
+	// spelling difference normalising here must not erase — the forge decides
+	// the display case of an owner and a name.
 	job, err := h.Jobs.Enqueue(c.Request().Context(), remote.URL, ref)
 	if err != nil {
 		return h.fail(c, err, "enqueue")

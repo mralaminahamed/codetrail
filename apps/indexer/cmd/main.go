@@ -240,7 +240,8 @@ func (ix *indexer) runJob(ctx context.Context, job jobs.Job) {
 	// untrusted URL. Checking the row rather than trusting it is what makes
 	// that true: the gateway admits before enqueueing, but a row it did not
 	// write, or an allowlist edited since it did, reaches git otherwise.
-	if _, err := ix.hosts.Check(job.Remote); err != nil {
+	remote, err := ix.hosts.Check(job.Remote)
+	if err != nil {
 		l.Warn().Err(err).Msg("remote refused")
 		// A malformed URL or a non-https scheme is a property of the string
 		// and no retry or setting can make it clonable. An unlisted host can
@@ -269,7 +270,7 @@ func (ix *indexer) runJob(ctx context.Context, job jobs.Job) {
 	}
 	defer os.RemoveAll(dir)
 
-	res, err := ix.clone(ctx, job.Remote, job.Ref, dir, ix.lim.clone)
+	res, err := ix.clone(ctx, remote.URL, job.Ref, dir, ix.lim.clone)
 	if err != nil {
 		l.Warn().Err(err).Msg("clone failed")
 		ix.fail(ctx, l, job.ID, err.Error())
@@ -284,8 +285,9 @@ func (ix *indexer) runJob(ctx context.Context, job jobs.Job) {
 
 	// The repo is keyed by the commit that was actually fetched, not by the ref
 	// that was asked for: a branch moves, and a citation into "main" would mean
-	// a different file next week.
-	repoID := store.RepoID(job.Remote, res.Commit)
+	// a different file next week. And by remote.Key rather than the row's
+	// spelling, so two case-variant submissions are one repository.
+	repoID := store.RepoID(remote.Key, res.Commit)
 	rows := make([]models.File, 0, len(files))
 	for _, f := range files {
 		rows = append(rows, models.File{

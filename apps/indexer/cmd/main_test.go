@@ -232,7 +232,8 @@ func TestRunJobIndexesAndCompletes(t *testing.T) {
 
 	ix.runJob(context.Background(), job)
 
-	repoID := store.RepoID(job.Remote, testCommit)
+	// Keyed on admit's identity, not on the row's spelling.
+	repoID := store.RepoID("github.com/a/b", testCommit)
 	wantRepo := models.Repo{ID: repoID, Remote: job.Remote, Ref: job.Ref, Commit: testCommit, SizeBytes: 4096}
 	if gotRepo != wantRepo {
 		t.Errorf("repo: want %+v, got %+v", wantRepo, gotRepo)
@@ -690,5 +691,44 @@ func TestAnEvictionThatDroppedReposSaysHowMany(t *testing.T) {
 
 	if out := logged.String(); !strings.Contains(out, `"evicted":3`) {
 		t.Errorf("the eviction count is not in the log: %q", out)
+	}
+}
+
+// Measured before this was fixed: github.com/octocat/Spoon-Knife and
+// github.com/OctoCat/spoon-knife indexed to two repos rows at the same commit
+// and six file rows for three files, and burned two eviction slots.
+func TestCaseVariantRemotesIndexToOneRepo(t *testing.T) {
+	index := func(remote string) models.Repo {
+		ix, _ := testIndexer(t, &fakeQueue{})
+		ix.clone = func(_ context.Context, r, _, d string, _ clone.Limits) (clone.Result, error) {
+			// The submitted spelling is what is cloned; the forge decides the
+			// display case and we do not get to rewrite it.
+			if r != remote {
+				t.Errorf("cloned %q, want the submitted %q", r, remote)
+			}
+			return clone.Result{Dir: d, Commit: testCommit, Bytes: 1}, nil
+		}
+		ix.walk = func(string, walk.Limits) ([]walk.File, error) {
+			return []walk.File{{Path: "main.go", Lang: "go", Lines: 1, Bytes: 1}}, nil
+		}
+		var got models.Repo
+		ix.put = func(_ context.Context, r models.Repo, _ []models.File) error {
+			got = r
+			return nil
+		}
+		ix.evict = func(context.Context, int) (int, error) { return 0, nil }
+		ix.runJob(context.Background(), jobs.Job{
+			ID: "j", Remote: remote, Ref: "main", Status: jobs.StatusLeased, Attempts: 1,
+		})
+		return got
+	}
+
+	a := index("https://github.com/octocat/Spoon-Knife")
+	b := index("https://github.com/OctoCat/spoon-knife")
+	if a.ID != b.ID {
+		t.Fatalf("one repository got two ids: %s and %s", a.ID, b.ID)
+	}
+	if a.Remote == b.Remote {
+		t.Fatalf("both rows carry %q; the submitted spelling was rewritten", a.Remote)
 	}
 }

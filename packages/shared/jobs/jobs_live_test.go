@@ -513,3 +513,35 @@ func TestGetUnknownJob(t *testing.T) {
 		t.Fatalf("want ErrNotFound, got %v", err)
 	}
 }
+
+// A forge folds owner and name case, so two spellings are one repository and
+// must be one job. Measured before the index folded them: two jobs, two
+// clones, and two rows in the corpus at the same commit.
+func TestEnqueueDedupesCaseVariantSpellings(t *testing.T) {
+	ctx := context.Background()
+	q := queue(t)
+
+	a, err := q.Enqueue(ctx, "https://github.com/octocat/Spoon-Knife", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := q.Enqueue(ctx, "https://github.com/OctoCat/spoon-knife", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.ID != b.ID {
+		t.Fatalf("one repository queued twice: %s and %s", a.ID, b.ID)
+	}
+	// The first spelling is what is returned and what will be cloned.
+	if b.Remote != "https://github.com/octocat/Spoon-Knife" {
+		t.Fatalf("the existing job's remote is %q", b.Remote)
+	}
+	// A different ref is a different job, folding or not.
+	c, err := q.Enqueue(ctx, "https://github.com/octocat/spoon-knife", "v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ID == a.ID {
+		t.Fatal("two refs collapsed into one job")
+	}
+}
