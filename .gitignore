@@ -21,3 +21,6 @@ docs/plan-*.md
 # OS / editor
 .DS_Store
 *.swp
+
+# SDD workspace (git-ignored scratch)
+.superpowers/

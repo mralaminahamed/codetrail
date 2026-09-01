@@ -4,8 +4,15 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/mralaminahamed/codetrail/packages/shared/models"
 )
 
 // dsn is the database these tests run against. They create and drop their own
@@ -14,6 +21,11 @@ func dsn(t *testing.T) string {
 	t.Helper()
 	v := os.Getenv("DATABASE_URL")
 	if v == "" {
+		// A skipped live suite prints the same "ok" as one that ran, so in CI a
+		// dropped DATABASE_URL would look green with zero live coverage.
+		if os.Getenv("CI") != "" {
+			t.Fatal("DATABASE_URL unset in CI — the live suite must never silently skip")
+		}
 		t.Skip("set DATABASE_URL to run")
 	}
 	return v
@@ -32,7 +44,7 @@ func TestMigrationsAreIdempotentLive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	applied, err := first.appliedMigrations(ctx)
+	applied, err := appliedMigrations(ctx, first.pool)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +63,7 @@ func TestMigrationsAreIdempotentLive(t *testing.T) {
 	}
 	defer second.Close()
 
-	after, err := second.appliedMigrations(ctx)
+	after, err := appliedMigrations(ctx, second.pool)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,4 +158,231 @@ func contains(s, sub string) bool {
 		}
 		return false
 	})()
+}
+
+// Every column in repos is written by something. status was not: 0004 added
+// it, nothing set it, and it read as a lifecycle the code does not have.
+func TestReposHasNoUnwrittenStatusColumn(t *testing.T) {
+	st, err := New(context.Background(), dsn(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	var n int
+	if err := st.Pool().QueryRow(context.Background(), `
+		SELECT count(*) FROM information_schema.columns
+		WHERE table_name = 'repos' AND column_name = 'status'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatal("repos.status is back, and nothing writes it")
+	}
+}
+
+// f1813be re-keyed repos.id without a migration, so a database that already
+// held a row keyed the old way had two identities for one repository. PutRepo
+// arbitrates ON CONFLICT (id), missed the stale row, and failed on the
+// (remote, commit_sha) uniqueness — three attempts, SQLSTATE 23505 every time,
+// and no retry could clear it. 0007 drops that constraint.
+func TestPreFixRepoRowDoesNotWedgePutRepoLive(t *testing.T) {
+	ctx := context.Background()
+	const remote = "https://github.com/octocat/Spoon-Knife"
+	const key = "github.com/octocat/spoon-knife"
+	const commit = "d0dd1f6b1f7e4dfd44dd54e4c2a4c1b9d5e0aa11"
+	// Pre-fix code hashed the submitted URL; RepoID's argument changed, not its
+	// shape, so the old id is this same call with the URL in it.
+	old, want := RepoID(remote, commit), RepoID(key, commit)
+	if old == want {
+		t.Fatal("the two schemes agree, so this test proves nothing")
+	}
+	s := fresh(t, old, want)
+
+	if _, err := s.pool.Exec(ctx, `
+		INSERT INTO repos (id, remote, ref, commit_sha) VALUES ($1, $2, 'main', $3)`,
+		old, remote, commit); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutRepo(ctx, models.Repo{ID: want, Remote: remote, Ref: "main", Commit: commit}, nil); err != nil {
+		t.Fatalf("a pre-fix row still blocks the write: %v", err)
+	}
+}
+
+// The other half: dropping the constraint alone would leave the stale row
+// beside the new one, which is the duplication f1813be set out to remove. The
+// body is re-run here rather than trusted, because migrate() applies it once
+// and the recorded name would make a broken statement look applied.
+//
+// In one rolled-back transaction: the jobs package's live tests share this
+// database, run in their own binary, and truncate jobs on every test, so a
+// committed row of ours would be theirs to delete and theirs to trip over.
+func TestMigration0007ClearsTheCorpusAndSparesJobsLive(t *testing.T) {
+	ctx := context.Background()
+	s := evictFresh(t)
+	body, err := migrationFS.ReadFile("migrations/0007_repo_identity.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+
+	for _, stmt := range []string{
+		`INSERT INTO repos (id, remote, ref, commit_sha) VALUES ('m7', 'https://github.com/a/m7', 'main', 'c0ffee')`,
+		`INSERT INTO files (id, repo_id, path, blob, lang, lines) VALUES ('m7-f', 'm7', 'a.go', '', 'go', 1)`,
+		`INSERT INTO spans (id, repo_id, file_id, path, kind, start_line, end_line, text, digest, embed_model, embed_dim)
+			VALUES ('m7-s', 'm7', 'm7-f', 'a.go', 'func', 1, 1, 'x', 'd', 'm', 768)`,
+		`INSERT INTO jobs (id, remote, ref, status) VALUES ('m7-job', 'https://github.com/a/m7', 'main', 'done')`,
+	} {
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Twice, and the second time against the empty table it just left: a
+	// migration that is not safe to re-run is a migration that runs once.
+	for i := range 2 {
+		if _, err := tx.Exec(ctx, string(body)); err != nil {
+			t.Fatalf("run %d: %v", i+1, err)
+		}
+		for _, tc := range []struct {
+			what, from string
+			want       int
+		}{
+			{"repos", "repos", 0},
+			{"files", "files", 0},
+			{"spans", "spans", 0},
+			{"the job", "jobs WHERE id = 'm7-job'", 1},
+		} {
+			var n int
+			if err := tx.QueryRow(ctx, `SELECT count(*) FROM `+tc.from).Scan(&n); err != nil {
+				t.Fatal(err)
+			}
+			if n != tc.want {
+				t.Errorf("run %d: %s has %d rows, want %d", i+1, tc.what, n, tc.want)
+			}
+		}
+	}
+}
+
+// freshDatabase creates an empty database beside the one dsn points at and
+// returns a pool config for it. A migration race only exists before the ledger
+// is populated, so a test that reuses the already-migrated shared database
+// proves nothing.
+func freshDatabase(t *testing.T, base string) *pgxpool.Config {
+	t.Helper()
+	ctx := context.Background()
+	cfg, err := pgxpool.ParseConfig(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin, err := pgx.Connect(ctx, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := fmt.Sprintf("codetrail_race_%d", time.Now().UnixNano())
+	if _, err := admin.Exec(ctx, `CREATE DATABASE "`+name+`"`); err != nil {
+		admin.Close(ctx)
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		// FORCE, because a racer whose pool outlived the failure still holds a
+		// session and DROP DATABASE would block on it.
+		if _, err := admin.Exec(ctx, `DROP DATABASE IF EXISTS "`+name+`" WITH (FORCE)`); err != nil {
+			t.Errorf("dropping %s: %v", name, err)
+		}
+		admin.Close(ctx)
+	})
+	cfg.ConnConfig.Database = name
+	return cfg
+}
+
+// CI starts a fresh Postgres per PR and `go test ./...` runs the store and jobs
+// binaries in parallel, so several processes call migrate() against an empty
+// ledger at once. Without a lock they all read "nothing applied" and all apply
+// 0001, and one of them loses.
+func TestConcurrentMigrationsOnAFreshDatabaseLive(t *testing.T) {
+	ctx := context.Background()
+	cfg := freshDatabase(t, dsn(t))
+
+	const racers = 8
+	pools := make([]*pgxpool.Pool, racers)
+	for i := range pools {
+		p, err := pgxpool.NewWithConfig(ctx, cfg.Copy())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer p.Close()
+		// Connect before the barrier: pool setup jitter would otherwise stagger
+		// the racers enough to hide the race.
+		if err := p.Ping(ctx); err != nil {
+			t.Fatal(err)
+		}
+		pools[i] = p
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, racers)
+	for _, p := range pools {
+		go func() {
+			<-start
+			errs <- (&Store{pool: p}).migrate(ctx)
+		}()
+	}
+	close(start)
+	for range racers {
+		if err := <-errs; err != nil {
+			t.Errorf("concurrent migrate: %v", err)
+		}
+	}
+
+	names, err := MigrationNames()
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied, err := appliedMigrations(ctx, pools[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range names {
+		if !applied[n] {
+			t.Errorf("%s is not recorded", n)
+		}
+	}
+	if len(applied) != len(names) {
+		t.Errorf("ledger has %d rows, want %d", len(applied), len(names))
+	}
+
+	// The guard must not outlive the run. Taking it here first proves the count
+	// below can see a held lock, so reading zero means released and not that the
+	// query looks in the wrong place.
+	tx, err := pools[0].Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, migrateLockKey); err != nil {
+		t.Fatal(err)
+	}
+	if n := heldAdvisoryLocks(t, pools[0]); n != 1 {
+		t.Fatalf("pg_locks reports %d advisory locks while one is held", n)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := heldAdvisoryLocks(t, pools[0]); n != 0 {
+		t.Errorf("%d advisory locks still held after every migrate returned", n)
+	}
+}
+
+func heldAdvisoryLocks(t *testing.T, p *pgxpool.Pool) int {
+	t.Helper()
+	var n int
+	if err := p.QueryRow(context.Background(), `
+		SELECT count(*) FROM pg_locks
+		WHERE locktype = 'advisory'
+		  AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
 }

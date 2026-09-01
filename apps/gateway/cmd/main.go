@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -13,8 +14,11 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/rs/zerolog"
 
+	"github.com/mralaminahamed/codetrail/apps/gateway/internal/handler"
 	"github.com/mralaminahamed/codetrail/apps/gateway/internal/server"
+	"github.com/mralaminahamed/codetrail/packages/shared/admit"
 	"github.com/mralaminahamed/codetrail/packages/shared/config"
+	"github.com/mralaminahamed/codetrail/packages/shared/jobs"
 	"github.com/mralaminahamed/codetrail/packages/shared/logger"
 	"github.com/mralaminahamed/codetrail/packages/shared/metrics"
 )
@@ -75,8 +79,48 @@ func (r *readiness) Ready() bool {
 
 // newRouter builds the router the binary actually serves. A function rather
 // than inline in main so a test can pin the composition.
-func newRouter(ready func() bool) *echo.Echo {
-	return server.New(ready)
+func newRouter(ready func() bool, h *handler.Handler) *echo.Echo {
+	e := server.New(ready)
+	handler.Mount(e, h)
+	return e
+}
+
+// allowedHosts reads the exact-host allowlist: ALLOWED_HOSTS, comma-separated,
+// replacing the default rather than extending it. NewPolicy trims, so a list
+// written with spaces works.
+//
+// A host whose repository paths nest deeper than /owner/name is only half
+// served by adding it — gitlab.com's group/repo would be accepted and its
+// group/subgroup/repo refused — because Check requires exactly two segments.
+func allowedHosts() []string {
+	return strings.Split(config.Get("ALLOWED_HOSTS", strings.Join(admit.DefaultHosts, ",")), ",")
+}
+
+// newHandler builds the API handler main serves from. A function so a test can
+// pin the wiring: every field here is one main could silently forget, and a
+// zero-value logger discards without complaining.
+func newHandler(log zerolog.Logger, q handler.Enqueuer) *handler.Handler {
+	return &handler.Handler{Policy: admit.NewPolicy(allowedHosts()), Jobs: q, Log: log}
+}
+
+// newServer assembles what the binary serves: probes, router, policy, queue and
+// logger. A function so a test can drive the assembly, because the mistakes
+// here are silent: server.New's probes with no API mounted behind them answer
+// /health and /ready and nothing anyone asked for.
+//
+// main's own body is reachable too — openStore is replaceable, so a test can
+// run main() with no database. None does: under -coverprofile every statement
+// in main is count 0, and mutating the PORT default, the DSN default or the
+// 10s shutdown timeout leaves the suite green. So the logger is not the one
+// argument left uncovered there — the whole body is. It is only the one that
+// was mutated and recorded as surviving.
+//
+// Closing that gap means running main() under test: a self-directed SIGTERM to
+// make it return, and an os.Stdout swap to see what it logged. That is heavier
+// and flakier machinery than anything else in this suite. The body is uncovered
+// by judgement, not because it cannot be reached.
+func newServer(log zerolog.Logger, st storeHandle) *echo.Echo {
+	return newRouter(readinessFor(log, st).Ready, newHandler(log, jobs.New(st.Pool())))
 }
 
 func main() {
@@ -91,7 +135,7 @@ func main() {
 	defer st.Close()
 	log.Info().Msg("postgres ready, schema up to date")
 
-	e := newRouter(readinessFor(log, st).Ready)
+	e := newServer(log, st)
 
 	addr := ":" + config.Get("PORT", "8080")
 	go func() {
