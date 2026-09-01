@@ -614,11 +614,14 @@ func TestRetryDelayDoublesAndIsCapped(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if !(delays[1] > delays[0]) {
-		t.Fatalf("the delay did not grow: %v", delays)
-	}
-	if delays[2] > 3*time.Hour+time.Minute {
-		t.Fatalf("the delay passed RetryMax: %v", delays)
+	// 1h, then 2h, then 4h capped to RetryMax. Pinned to the hour rather than
+	// compared to each other: a constant delay makes "the second is larger" a
+	// coin flip on the milliseconds between the two measurements, which is a
+	// mutant this test let through before the bounds were exact.
+	for i, want := range []time.Duration{time.Hour, 2 * time.Hour, 3 * time.Hour} {
+		if delays[i] > want || delays[i] < want-time.Minute {
+			t.Fatalf("attempt %d waited %v, want about %v (all: %v)", i+1, delays[i], want, delays)
+		}
 	}
 }
 
