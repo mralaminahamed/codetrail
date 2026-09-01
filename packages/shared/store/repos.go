@@ -34,11 +34,11 @@ func hash(parts ...string) string {
 // PutRepo writes a repo and its files in one transaction. Upserts throughout,
 // so a job retried after a crash converges rather than failing on a conflict.
 //
-// It adds and updates; it does not delete. Two indexes of the same commit see
-// the same tree, so the only way a file row goes stale is a cap changing
-// between them — a file over MAX_FILE_BYTES on the first pass and under it on
-// the second leaves the first pass's row behind. file_count then disagrees
-// with the rows. Recorded rather than fixed: P1 has no reader for either.
+// It adds and updates; it does not delete. A second index of the same commit
+// that produces a smaller file set — a cap lowered between the two runs, or a
+// walk that skipped what it read last time — leaves the first run's rows
+// behind, and file_count then disagrees with the row count. Recorded rather
+// than fixed: P1 has no reader for either.
 func (s *Store) PutRepo(ctx context.Context, r models.Repo, files []models.File) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
