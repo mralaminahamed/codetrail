@@ -54,7 +54,7 @@ type indexer struct {
 	log   zerolog.Logger
 	q     queue
 	clone func(ctx context.Context, remote, ref, dir string, lim clone.Limits) (clone.Result, error)
-	walk  func(root string, lim walk.Limits) ([]walk.File, error)
+	walk  func(ctx context.Context, root string, lim walk.Limits) ([]walk.File, error)
 	put   func(ctx context.Context, r models.Repo, files []models.File) error
 	evict func(ctx context.Context, keep int) (int, error)
 	// hosts is the same allowlist the gateway admits against, applied again
@@ -276,7 +276,7 @@ func (ix *indexer) runJob(ctx context.Context, job jobs.Job) {
 		ix.fail(ctx, l, job.ID, err.Error())
 		return
 	}
-	files, err := ix.walk(res.Dir, ix.lim.walk)
+	files, err := ix.walk(ctx, res.Dir, ix.lim.walk)
 	if err != nil {
 		l.Warn().Err(err).Msg("walk failed")
 		ix.fail(ctx, l, job.ID, err.Error())

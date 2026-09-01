@@ -99,7 +99,7 @@ func testIndexer(t *testing.T, q *fakeQueue) (*indexer, *bytes.Buffer) {
 			t.Error("clone ran when it should not have")
 			return clone.Result{}, errors.New("unexpected clone")
 		},
-		walk: func(string, walk.Limits) ([]walk.File, error) {
+		walk: func(context.Context, string, walk.Limits) ([]walk.File, error) {
 			t.Error("walk ran when it should not have")
 			return nil, errors.New("unexpected walk")
 		},
@@ -206,7 +206,7 @@ func TestRunJobIndexesAndCompletes(t *testing.T) {
 		}
 		return clone.Result{Dir: d, Commit: testCommit, Bytes: 4096}, nil
 	}
-	ix.walk = func(root string, lim walk.Limits) ([]walk.File, error) {
+	ix.walk = func(_ context.Context, root string, lim walk.Limits) ([]walk.File, error) {
 		if root != dir {
 			t.Errorf("walk got root %q, want the clone's dir %q", root, dir)
 		}
@@ -273,7 +273,7 @@ func TestRunJobRemovesTheScratchTreeOnEveryPath(t *testing.T) {
 		}
 		return clone.Result{Dir: d, Commit: testCommit}, os.WriteFile(filepath.Join(d, "sub", "f.go"), []byte("x"), 0o600)
 	}
-	okWalk := func(string, walk.Limits) ([]walk.File, error) {
+	okWalk := func(context.Context, string, walk.Limits) ([]walk.File, error) {
 		return []walk.File{{Path: "sub/f.go", Lang: "go", Lines: 1}}, nil
 	}
 
@@ -290,7 +290,9 @@ func TestRunJobRemovesTheScratchTreeOnEveryPath(t *testing.T) {
 		}, true},
 		{"walk fails", func(ix *indexer) {
 			ix.clone = okClone
-			ix.walk = func(string, walk.Limits) ([]walk.File, error) { return nil, errors.New("walk exploded") }
+			ix.walk = func(context.Context, string, walk.Limits) ([]walk.File, error) {
+				return nil, errors.New("walk exploded")
+			}
 		}, true},
 		{"write fails", func(ix *indexer) {
 			ix.clone, ix.walk = okClone, okWalk
@@ -443,7 +445,7 @@ func TestALostLeaseIsLogged(t *testing.T) {
 			ix.clone = func(_ context.Context, _, _, d string, _ clone.Limits) (clone.Result, error) {
 				return clone.Result{Dir: d, Commit: testCommit}, nil
 			}
-			ix.walk = func(string, walk.Limits) ([]walk.File, error) { return nil, nil }
+			ix.walk = func(context.Context, string, walk.Limits) ([]walk.File, error) { return nil, nil }
 			ix.put = func(context.Context, models.Repo, []models.File) error { return nil }
 
 			ix.runJob(context.Background(), aJob())
@@ -600,7 +602,7 @@ func TestEvictionRunsOnlyAfterAnIndexThatCompleted(t *testing.T) {
 	okClone := func(_ context.Context, _, _, d string, _ clone.Limits) (clone.Result, error) {
 		return clone.Result{Dir: d, Commit: testCommit}, nil
 	}
-	okWalk := func(string, walk.Limits) ([]walk.File, error) { return nil, nil }
+	okWalk := func(context.Context, string, walk.Limits) ([]walk.File, error) { return nil, nil }
 	okPut := func(context.Context, models.Repo, []models.File) error { return nil }
 
 	for _, tc := range []struct {
@@ -658,7 +660,7 @@ func TestAFailedEvictionIsLoggedAndDoesNotUncompleteTheJob(t *testing.T) {
 	ix.clone = func(_ context.Context, _, _, d string, _ clone.Limits) (clone.Result, error) {
 		return clone.Result{Dir: d, Commit: testCommit}, nil
 	}
-	ix.walk = func(string, walk.Limits) ([]walk.File, error) { return nil, nil }
+	ix.walk = func(context.Context, string, walk.Limits) ([]walk.File, error) { return nil, nil }
 	ix.put = func(context.Context, models.Repo, []models.File) error { return nil }
 	ix.evict = func(context.Context, int) (int, error) { return 0, errors.New("postgres went away") }
 
@@ -683,7 +685,7 @@ func TestAnEvictionThatDroppedReposSaysHowMany(t *testing.T) {
 	ix.clone = func(_ context.Context, _, _, d string, _ clone.Limits) (clone.Result, error) {
 		return clone.Result{Dir: d, Commit: testCommit}, nil
 	}
-	ix.walk = func(string, walk.Limits) ([]walk.File, error) { return nil, nil }
+	ix.walk = func(context.Context, string, walk.Limits) ([]walk.File, error) { return nil, nil }
 	ix.put = func(context.Context, models.Repo, []models.File) error { return nil }
 	ix.evict = func(context.Context, int) (int, error) { return 3, nil }
 
@@ -708,7 +710,7 @@ func TestCaseVariantRemotesIndexToOneRepo(t *testing.T) {
 			}
 			return clone.Result{Dir: d, Commit: testCommit, Bytes: 1}, nil
 		}
-		ix.walk = func(string, walk.Limits) ([]walk.File, error) {
+		ix.walk = func(context.Context, string, walk.Limits) ([]walk.File, error) {
 			return []walk.File{{Path: "main.go", Lang: "go", Lines: 1, Bytes: 1}}, nil
 		}
 		var got models.Repo
