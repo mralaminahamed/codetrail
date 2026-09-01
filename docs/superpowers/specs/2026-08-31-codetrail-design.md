@@ -131,15 +131,22 @@ validating dialer. The README states this in these terms.
 
 ### Job lifecycle
 
-`pending → leased → running → done | failed`. Leases expire, so a dead indexer's job returns to the
-queue rather than vanishing. Attempts are capped with backoff; a terminal failure carries its reason
-into the API.
+`pending → leased → done | failed`. There is no separate `running`: a leased job is a running one,
+and a second name for one state would be a state nothing writes. Leases expire, so a dead indexer's
+job returns to the queue rather than vanishing. Attempts are capped, with the retry delay doubling
+from 30s to a 10m ceiling; a terminal failure carries its reason into the API.
 
 ### Retention
 
-Hard admission caps plus **LRU eviction** on `last_queried_at`. Anyone may submit; nothing grows
-without bound; a popular repo stays warm. An evicted repo answers `410 Gone`, not `404` — it
-existed, and that is a different fact.
+Hard admission caps plus **LRU eviction** on `last_queried_at`. Anyone may submit; the *corpus* does
+not grow without bound; a popular repo stays warm. An evicted repo answers `410 Gone`, not `404` —
+it existed, and that is a different fact.
+
+The `jobs` table is not covered by this and is not bounded: the dedupe index only collapses jobs
+that are still active, so every re-submission of a finished repository appends a row, on an endpoint
+with no auth and no rate limit. Bounding it means deciding how much job history a caller may still
+read back, which is the same decision as the P3 read endpoints — carried there rather than guessed
+at here.
 
 ---
 
@@ -308,12 +315,17 @@ None blocking P0–P2. Deferred deliberately, to be decided with evidence rather
 - **The score floor's value.** Measured in P6; picking it earlier would be guessing.
 - **Whether lexical fusion helps, and by how much.** An experiment in P6/P7, not an assumption.
 - **The second language.** Not before Go is measured.
+- **How much job history to keep.** The `jobs` table is unbounded: only active jobs dedupe, so
+  every re-submission of a finished repository appends a row. A retention rule has to say what a
+  caller may still poll for, which is the P3 read endpoints' question — so it is decided there, not
+  guessed at in P1.
 
 ### Decided since
 
 - **Which forges the default allowlist contains.** Settled in P1: `github.com` and
   `codeberg.org`, not `gitlab.com`. Both of the first two serve exactly `/owner/name`
-  (Codeberg is Gitea), which is the shape the admission policy accepts. GitLab nests
+  (Codeberg has run Forgejo, the 2022 Gitea fork, since 2023), which is the shape the
+  admission policy accepts. GitLab nests
   namespaces arbitrarily (`group/subgroup/repo`), so the policy refuses its typical URL;
   shipping it in the default allowlist would advertise a forge that half-works. Supporting
   it means changing the path check's shape and validating an arbitrary number of segments,

@@ -149,7 +149,8 @@ Pure, hermetic, and the first line of the sandbox. No network, no filesystem, no
 - Produces:
   - `type Rule string` with `RuleForm`, `RuleScheme`, `RuleHost`
   - `type Error struct { Rule Rule; Detail string }` implementing `error`
-  - `type Remote struct { URL, Host, Owner, Name string }`
+  - `type Remote struct { URL, Key, Host, Owner, Name string }` — `Key` is the case-folded
+    identity, `URL` the submitted spelling
   - `type Policy struct{ ... }`, `func NewPolicy(hosts []string) Policy`
   - `func (p Policy) Check(raw string) (Remote, error)`
   - `var DefaultHosts = []string{"github.com", "codeberg.org"}`
@@ -341,8 +342,15 @@ type Error struct {
 func (e *Error) Error() string { return fmt.Sprintf("admit: %s: %s", e.Rule, e.Detail) }
 
 // Remote is an accepted, normalised repository reference.
+//
+// URL keeps the case the submitter typed, because a forge preserves the
+// display case of an owner and a repository and that is what a citation has
+// to show. Key is the identity: forges match owner and name
+// case-insensitively, so two spellings are one repository and anything that
+// keys on a repository keys on this, not on URL.
 type Remote struct {
 	URL   string
+	Key   string
 	Host  string
 	Owner string
 	Name  string
@@ -398,23 +406,54 @@ func (p Policy) Check(raw string) (Remote, error) {
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		return Remote{}, &Error{RuleForm, "path must be /owner/name"}
 	}
-	owner, name := parts[0], strings.TrimSuffix(parts[1], ".git")
+	// Repeatedly, not once: a forge serves /owner/foo.git and /owner/foo.git.git
+	// as the same repository, and one trim would leave "foo.git" as a second
+	// identity for it. No forge here allows a name that really ends in ".git".
+	owner, name := parts[0], parts[1]
+	for strings.HasSuffix(name, ".git") {
+		name = strings.TrimSuffix(name, ".git")
+	}
 	if name == "" {
 		return Remote{}, &Error{RuleForm, "path must be /owner/name"}
 	}
+	if !validSegment(owner) {
+		return Remote{}, &Error{RuleForm, fmt.Sprintf("owner %q is not a plain name", owner)}
+	}
+	if !validSegment(name) {
+		return Remote{}, &Error{RuleForm, fmt.Sprintf("name %q is not a plain name", name)}
+	}
 	return Remote{
 		URL:   "https://" + host + "/" + owner + "/" + name,
+		Key:   host + "/" + strings.ToLower(owner) + "/" + strings.ToLower(name),
 		Host:  host,
 		Owner: owner,
 		Name:  name,
 	}, nil
+}
+
+// Owner and Name are exported, so anything downstream may join them into a
+// path. Allowlist the charset rather than blacklisting the escapes, and refuse
+// the two relative names the charset would otherwise let through.
+func validSegment(s string) bool {
+	if s == "" || s == "." || s == ".." {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '.', r == '_', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 ```
 
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `go test ./packages/shared/admit/ -count=1 -v`
-Expected: PASS, all eight tests.
+Expected: PASS.
 
 - [ ] **Step 5: Prove the tests discriminate**
 

@@ -101,8 +101,10 @@ anything.
 
 **The walker never follows a symlink.** A repository can contain `link -> /etc/passwd`, and a naive
 walk reads and indexes it. Anything that is not a regular file is skipped outright. This is a
-vulnerability, not a hardening nicety, and it has a committed fixture and a test that fails when the
-guard is removed.
+vulnerability, not a hardening nicety, and the guards are mutation-checked rather than assumed:
+removing `O_NOFOLLOW` fails two tests, and removing all three of the link, type and fstat guards
+fails ten. Every symlink, fifo and device fixture is built at runtime — nothing symlink-shaped is
+committed, because checking this repository out should not require any.
 
 **What the allowlist does not buy.** Host-allowlisting is the SSRF control. It does **not** defend
 against a hostile allowlisted forge, and codetrail claims no DNS-rebinding protection: `git` is a
@@ -115,9 +117,11 @@ know before setting it: an accepted path is exactly `/owner/name`, so a forge th
 deeper is only half served — adding `gitlab.com` accepts `group/repo` and refuses
 `group/subgroup/repo`.
 
-**Nothing grows without bound.** Hard admission caps plus LRU eviction on last-queried time. Anyone
-may submit; a popular repository stays warm; the least recently queried one goes when the quota is
-reached, in a single `DELETE` that cascades.
+**The corpus does not grow without bound.** Hard admission caps plus LRU eviction on last-queried
+time. Anyone may submit; a popular repository stays warm; the least recently queried one goes when
+the quota is reached, in a single `DELETE` that cascades. The `jobs` table is the exception and is
+deliberately not bounded yet: re-submitting a repository that has finished appends a row, and how
+much of that history is worth keeping is a decision that belongs with the P3 read endpoints.
 
 ## The symbol graph, and its honesty
 
@@ -137,8 +141,8 @@ downgraded wholesale.
 
 | Phase | Delivers | State |
 | --- | --- | --- |
-| **P0** | Skeleton, schema, migrations, compose, CI with live Postgres | schema and migrations done; CI is P1 Task 1 |
-| **P1** | Ingestion: admission, sandbox, job queue, caps, LRU eviction | **planned**, in progress |
+| **P0** | Skeleton, schema, migrations, compose, CI with live Postgres | done; CI landed with P1 |
+| **P1** | Ingestion: admission, sandbox, job queue, caps, LRU eviction | done |
 | **P2** | AST chunking, embeddings, spans, window fallback | not started |
 | **P3** | Retrieval, citations, extractive ask, measured floor | not started |
 | **P4** | Symbol graph, per-edge provenance, graph endpoints | not started |
