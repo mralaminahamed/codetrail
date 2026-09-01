@@ -66,10 +66,11 @@ func TestEvictKeepsTheMostRecentlyQueriedLive(t *testing.T) {
 	second := seed(t, s, "bb")
 	third := seed(t, s, "ccc")
 
-	// Queried in a different order than they were indexed, deliberately: with
-	// the two orders agreeing, ordering by indexed_at — or by nothing at all,
-	// since ids happen to sort — would pass this test while evicting on the
-	// wrong clock. The least recently queried repo is the newest indexed one.
+	// Queried in a different order than they were indexed, deliberately. With
+	// the two agreeing — as they do if these are touched in seeding order — an
+	// implementation ordering by indexed_at passes this test while evicting on
+	// the wrong clock: measured, that mutant survives the agreeing fixture and
+	// dies against this one. So the victim below is the newest indexed repo.
 	touch(t, s, third, first, second)
 
 	n, err := s.Evict(ctx, 2)
@@ -89,6 +90,28 @@ func TestEvictKeepsTheMostRecentlyQueriedLive(t *testing.T) {
 	}
 	if got, err := s.CountRepos(ctx); err != nil || got != 2 {
 		t.Fatalf("want 2 repos left, got %d (%v)", got, err)
+	}
+
+	// Again, with the clock moved so the survivors rank the other way round.
+	// One eviction can be reproduced by ordering on any column that happens to
+	// agree with it — `ORDER BY id DESC` passes the round above, measured,
+	// because these content-addressed ids sort reverse to insertion. Two
+	// evictions whose victims disagree on every static column cannot be: the
+	// first drops the newest indexed repo, this one drops the oldest.
+	touch(t, s, first, second)
+
+	n, err = s.Evict(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("want 1 evicted on the second round, got %d", n)
+	}
+	if _, err := s.GetRepo(ctx, first); err == nil {
+		t.Fatal("the repo that fell to least recently queried should be gone")
+	}
+	if _, err := s.GetRepo(ctx, second); err != nil {
+		t.Fatalf("the most recently queried repo should have been kept: %v", err)
 	}
 }
 
