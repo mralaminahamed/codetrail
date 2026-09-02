@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -90,6 +91,43 @@ func (s *Store) GetRepo(ctx context.Context, id string) (models.Repo, error) {
 		return models.Repo{}, ErrNotFound
 	}
 	return r, err
+}
+
+// NewerCommit reports whether this repository's own ref is also indexed here
+// at a different, later commit. That is the one staleness claim the corpus can
+// prove: the ref moved, and here is where it moved to.
+//
+// It is not a freshness check and an empty result is not "up to date". A ref
+// that moved on the forge and was never re-indexed leaves no trace in this
+// table, and asking the forge would put a network call to a stranger's host on
+// the gateway's read path. rag.Staleness is where that distinction is worded.
+//
+// The remotes are compared case-folded, the same fold jobs_active_idx uses and
+// for the same reason: repos.remote holds the first submitter's spelling for
+// display while identity is admit.Remote.Key, so two commits of one repository
+// can carry two spellings. An id that names no row has no newer commit rather
+// than an error — every caller is citing a repo row it has already read.
+func (s *Store) NewerCommit(ctx context.Context, repoID string) (string, time.Time, error) {
+	var (
+		commit string
+		at     time.Time
+	)
+	err := s.pool.QueryRow(ctx, `
+		WITH me AS (
+			SELECT remote, ref, commit_sha, indexed_at FROM repos WHERE id = $1
+		)
+		SELECT r.commit_sha, r.indexed_at
+		FROM repos r, me
+		WHERE lower(r.remote) = lower(me.remote)
+		  AND r.ref = me.ref
+		  AND r.commit_sha <> me.commit_sha
+		  AND r.indexed_at > me.indexed_at
+		ORDER BY r.indexed_at DESC, r.commit_sha
+		LIMIT 1`, repoID).Scan(&commit, &at)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", time.Time{}, nil
+	}
+	return commit, at, err
 }
 
 // TouchRepo records a query against a repo. This is the LRU clock: eviction
