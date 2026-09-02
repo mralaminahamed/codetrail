@@ -16,11 +16,13 @@
 
 > **Status: in development. Nothing here is deployed, and most of it is not built yet.**
 > The [design spec](docs/superpowers/specs/2026-08-31-codetrail-design.md) is written and approved.
-> [P1](docs/superpowers/plans/2026-08-31-p1-ingestion.md) — ingestion — and
-> [P2](docs/superpowers/plans/2026-09-01-p2-chunking.md) — chunking, embeddings and spans — are
-> merged and green in CI. A repository now goes in and citable spans come out; **nothing retrieves
-> them yet**, and the chunking experiment has not been run. This README says plainly which parts
-> exist. See [Status](#status).
+> [P1](docs/superpowers/plans/2026-08-31-p1-ingestion.md) — ingestion —
+> [P2](docs/superpowers/plans/2026-09-01-p2-chunking.md) — chunking, embeddings and spans — and
+> [P3](docs/superpowers/plans/2026-09-01-p3-retrieval.md) — retrieval, citations and the extractive
+> ask — are merged and green in CI. A repository goes in, citable spans come out, and a question
+> now gets an answer whose citations check byte for byte against the file at that commit. **The
+> score floor ships uncalibrated and the chunking experiment has not been run** — both are P6.
+> This README says plainly which parts exist. See [Status](#status).
 
 ## What it is
 
@@ -38,30 +40,58 @@ so the questions cannot be authored to flatter the chunker under test, and **it 
 yet**.
 
 **A code citation can be checked.** A prose citation can only be quoted back at you. A code
-citation is `(commit, path, line range, digest)` — it either still holds what was claimed or it
-does not. Every one renders as an immutable forge permalink, carries a content digest, and says so
-explicitly when the ref has moved on since indexing. "Correct at commit `abc123`, which is three
-months behind `main`" is a different claim from "correct", and codetrail makes the difference
-visible rather than hoping you assume the generous reading.
+citation is `(repo, commit, path, line range, digest)` — it either still holds what was claimed or
+it does not. Each carries a content digest and renders an immutable forge permalink — or **no link
+at all** for a forge whose URL shape is not in the table, because a guessed URL that `404`s reads
+as "the code is gone" rather than "we guessed"; the tuple is the claim and the link is the
+convenience. Each states exactly what is known about staleness and what is not: the commit it is
+correct at, how
+long ago that was indexed, and — in those words — that **codetrail has not checked whether the ref
+has moved since**. Asking the forge would put a network call to a stranger's host on the public
+read path, which is the egress the design confines to the indexer. The one positive claim the
+corpus can support it does make: when the same ref is *also* indexed here at a later commit, the
+citation says it is superseded and names that commit.
 
 **Retrieval is hybrid, not just vectors.** "Who calls this?" is a graph question that embeddings
-answer badly. "Where is `parseConfig` defined?" is a lexical question they answer worse. So there
-is a symbol graph and a lexical arm alongside the vector search, and which combination actually
-helps is a question the eval settles rather than the README asserting.
+answer badly. "Where is `parseConfig` defined?" is a lexical question they answer worse. So a
+lexical arm runs alongside the vector search and the two are fused by reciprocal rank — both ship
+in P3 — and a symbol graph joins them in P4. That second example is the honest one to hold this to:
+as shipped, that question becomes the `OR` of `where | is | parseconfig | parse | config | defined`
+— every word of it, because the `simple` text-search configuration has no stopword list, plus the
+camel-case parts a widener adds. It is a real arm with a real
+limitation, both written down in [Retrieval](#retrieval), and which combination actually helps is a
+question the eval settles rather than the README asserting.
 
 ### Grounded, or refused
 
-When retrieval cannot support an answer, codetrail declines instead of writing something plausible.
-The score floor that decides this is **measured** — calibrated from the eval's distribution and
-recorded with the numbers that produced it — not picked because it sounded about right.
+codetrail refuses when retrieval returns nothing, when the top cosine similarity falls under
+`ANSWER_SCORE_FLOOR`, and when that similarity is not a number at all. **That floor ships
+uncalibrated**: its default is `-1`, the bottom of the cosine range, which refuses nothing on score
+alone, and every answer carries `"floor": {"value": -1, "calibrated": false}`. The number is
+**measured in P6**, from the eval's distribution over a generated golden set, and will be recorded
+here with the figures that produced it. What P3 ships is the mechanism and the instrument — the
+refusal path, the knob, and the top-score histogram the calibration reads — because picking a
+threshold before measuring one is a guess wearing a measurement's clothes.
+
+A refusal is a `200` carrying `"refused": true` and a reason from a closed set (`no_spans`,
+`below_floor`, `unscored`). It is never an HTTP error: filing "we had nothing to say" inside every
+error-rate panel is exactly the confusion the design forbids, and the two are separate counters
+asserted in both directions.
 
 ### Offline by default
 
-The default answer is extractive: ranked spans, assembled with citation markers, no model call, no
-API key, no marginal cost. Set a provider key and the same pipeline runs a bounded agentic tool loop
-over `search_code`, `read_span`, `definition_of` and `callers_of` — and **the response names which
-one answered it**, because a silent downgrade from a model to a fallback is the kind of failure that
-costs a week before anyone notices.
+The default answer is extractive: ranked spans, assembled with citation markers, with no API key
+and no per-request cost to any vendor. It is **not** free of model calls — the *question* has to be
+embedded on every search and every ask, which is one request to a local embedder. That is also why
+the gateway now depends on the embedder at boot: with `EMBED_PROVIDER=ollama` and Ollama down, the
+gateway does not start, and submission and job polling go down with retrieval. Parity with the
+indexer is chosen over booting into a mode where retrieval `503`s and submission works, because a
+degraded mode nobody can see is the silent downgrade this design is built to avoid.
+
+Set a provider key and the same pipeline runs a bounded agentic tool loop over `search_code`,
+`read_span`, `definition_of` and `callers_of` — and **the response names which one answered it**
+(`"answered_by": "extractive"` today), because a silent downgrade from a model to a fallback is the
+kind of failure that costs a week before anyone notices.
 
 ## Architecture
 
@@ -137,13 +167,20 @@ deeper is only half served — adding `gitlab.com` accepts `group/repo` and refu
 
 **The corpus does not grow without bound.** Hard admission caps plus LRU eviction on last-queried
 time. Anyone may submit; a popular repository stays warm; the least recently queried one goes when
-the quota is reached, in a single `DELETE` that cascades. The `jobs` table is the exception and is
-deliberately not bounded yet: re-submitting a repository that has finished appends a row, and how
-much of that history is worth keeping is a decision that belongs with the P3 read endpoints.
+the quota is reached, in a single `DELETE` that cascades. "Least recently used" now means what it
+says: every successful read winds the clock, so a repository is no longer evicted while it is being
+queried.
+
+**Job history is bounded by age, and the bound is a rule you can read.** A terminal job is swept
+`JOB_HISTORY_HOURS` after it finishes — one week by default — and a running job is never swept. The
+cheaper bound was refused on purpose: dropping a repository's old jobs when it is re-submitted would
+`404` a job id its holder is still polling, at a moment chosen by an unrelated stranger. What this
+does **not** bound is a flood inside the window; the control for that is a rate limit on
+`POST /api/repos`, which does not exist and was not added here.
 
 ### What it does today
 
-All three captures below are real terminal output from the merged phases, not mockups. There is
+All four captures below are real terminal output from the merged phases, not mockups. There is
 no console yet — that is P5 — so there is no UI to screenshot, and inventing one would break the
 rule at the bottom of this file.
 
@@ -159,6 +196,15 @@ And it is chunked into spans, each carrying the columns a citation is made of �
 digest, model — so the range can be checked against the file at that commit:
 
 <img src="assets/screenshots/spans.png" alt="rs/zerolog indexed into 1303 spans, one of them checked against git show and sed" width="880">
+
+And a question over that index gets an extractive answer whose top citation hashes to the bytes
+`git show` prints for those lines at that commit:
+
+<img src="assets/screenshots/ask.png" alt="An answer over rs/zerolog, its citation's digest matching git show piped through sed and sha256sum, and an uncalibrated floor of -1" width="880">
+
+`head -c -1` is not decoration: a span's text ends at the last byte of its last line, not at the
+newline after it, so `sed -n '18,23p' | sha256sum` alone hashes one byte more than the digest
+covers. The check is only a check if it fails when it should.
 
 
 ## Chunking, and the two corpora
@@ -234,6 +280,123 @@ one embed call at startup: an address that is not one, a server that is not ther
 was never pulled are each a refusal to boot naming the setting, rather than a failure on the first
 leased job that spends an attempt against its cap for something no retry can fix.
 
+## Retrieval
+
+Two arms over one repository, fused by reciprocal rank.
+
+**The vector arm** is pgvector cosine similarity, filtered by `repo_id`, ordered on the distance
+operator so it can use the HNSW index — sorting on the computed similarity gives the same order and
+no index path at all. What leaves the store is the similarity, `1 - distance`, because a floor on a
+quantity where lower is better is an inverted filter whose tests still pass.
+
+**The lexical arm** is Postgres full-text search over a generated `tsvector` column: the span's
+symbol at weight `A` and its whole text at weight `B`, with a GIN index. A question never reaches
+`to_tsquery` — `&`, `|`, `!`, `:` and `(` are operators there and most questions about code contain
+one — so the query is tokenised into letter-and-digit runs and `OR`-ed. `OR`, not `AND`: this arm
+exists to widen what fusion has to work with, and an `AND` over a tokenised question finds nothing
+as soon as one word is missing.
+
+**Fusion is by rank, never by score.** A cosine similarity and a `ts_rank_cd` have no common unit,
+and normalising them would invent an exchange rate nobody measured. So a span scores
+`Σ 1/(k + rank)` over the arms that returned it, with `k = 60` — the constant from the paper the
+method comes from, **not a value measured against this corpus**.
+
+**Nothing here claims fusion retrieves better.** Whether it does is the experiment, not the
+premise. `RETRIEVAL_MODE` is `vector`, `lexical` or `hybrid`; `hybrid` is the default because the
+design *defines* retrieval as hybrid, which is a conformance choice and not a quality claim. Every
+hit carries its `vector_rank` and `lexical_rank` (`0` meaning that arm did not return it) so an
+arm's contribution is readable from the data rather than inferred, and `k` and the per-arm
+candidate depth are knobs so P6 can sweep them without a code change.
+
+**The floor is compared against the vector arm's cosine similarity**, not the fused score. After
+reciprocal-rank fusion there is no quality number left: the top hit of any non-empty result scores
+`1/(k+1)` whether it is perfect or the best of a worthless set, so a floor there would be "did
+anything come back" with extra arithmetic. In `RETRIEVAL_MODE=lexical` there is no such number at
+all, and the response says `"applicable": false` rather than comparing an unbounded, corpus-
+dependent `ts_rank_cd` against a cosine threshold.
+
+**A repository that was evicted answers `410`, not `404`.** Eviction is one `DELETE` that cascades,
+after which nothing distinguishes an evicted repository from one nobody ever submitted — so the
+same statement writes a tombstone. Past `KEEP_TOMBSTONES` (500) it goes back to `404`, which is
+honest: we no longer remember. Job history is bounded separately and by age; see
+[above](#indexing-a-strangers-repository).
+
+The routes: `GET /api/repos`, `GET /api/repos/:repo`, `GET /api/repos/:repo/spans/:span`, and
+`POST /api/repos/:repo/search` and `/ask`. Search and ask are `POST` with the question in the body
+on purpose — a question in a query string is logged by every proxy, load balancer and access log
+between the caller and the process, and it is the one string here that must not be. It is not in
+any of codetrail's own log lines either.
+
+The knobs: `RETRIEVAL_MODE`, `RETRIEVAL_RRF_K`, `RETRIEVAL_CANDIDATES`,
+`LEXICAL_SPLIT_IDENTIFIERS`, `ANSWER_SCORE_FLOOR`, `ANSWER_MAX_SPANS`, `ANSWER_MAX_CHARS`, and —
+new to the gateway, because it has to embed the question — `EMBED_PROVIDER`, `EMBED_MODEL`,
+`EMBED_DIM` and `OLLAMA_URL`. `RETRIEVAL_CANDIDATES` is 40 because that is pgvector 0.8.6's own
+`hnsw.ef_search` default on the pinned image, read from `pg_settings.boot_val` rather than assumed:
+asking the ANN index for more rows than `ef_search` degrades recall with no error.
+
+**"Validated at boot" is not true of all of them, and the gap is stated rather than rounded up.**
+Every one of these has its *range* checked before the process serves anything — an unknown mode, a
+negative `k`, a zero candidate depth, a zero budget and a floor outside `[-1, 1]` are each a
+refusal to boot naming the setting. But four are read through an integer helper that answers its
+default for anything it cannot parse, so `RETRIEVAL_RRF_K=abc`, `RETRIEVAL_CANDIDATES=oops`,
+`ANSWER_MAX_SPANS=five` and `ANSWER_MAX_CHARS=lots` each boot silently on the default. Measured, by
+running the binary with each: the first three logged `rrf_k=60 candidates=40` and
+`answer_max_spans=5` and started, while `ANSWER_SCORE_FLOOR=abc` and `RETRIEVAL_MODE=nope` refused.
+The floor is parsed by hand for exactly that reason — a filter an operator believes is running is
+worse than one that never started — and the same hardening is owed to the other four.
+
+### What this phase measured
+
+`rs/zerolog` at `dfd11cca`, 1,303 spans, embedded with `nomic-embed-text`, asked seven real
+questions about the library. **These are costs and ranges, not a quality result** — there is no
+golden set yet, so nothing below says retrieval is good.
+
+- **Top cosine similarity: 0.664 to 0.744** across the seven. That is a distribution, not a
+  recommendation, and it is exactly the kind of figure that becomes a floor only after P6 measures
+  it against labelled answers. A histogram of the same quantity is exported as
+  `codetrail_retrieval_top_score` for that purpose; its `Help` string says it is an instrument and
+  not a calibration, because a confident wrong answer and a confident right one land in the same
+  bucket.
+- **Retrieval latency, mean over 21 asks per mode**: `lexical` 5.3 ms, `vector` 24.0 ms, `hybrid`
+  33.7 ms. Most of the vector modes' time is the query embed — one `nomic-embed-text` call on CPU
+  measured at ~16 ms on its own — so the pgvector query is ~8 ms and the second arm costs ~10 ms on
+  a 1,303-span corpus. The cost of the second arm is a number; its benefit is not.
+- **The same question in two modes, reported as two result sets and not as a winner.**
+  `"how does the sampler decide to drop an event"`:
+
+  | | `vector` | `hybrid` |
+  | --- | --- | --- |
+  | 1 | `sampler.go:18-23` `Sampler` | `sampler.go:18-23` `Sampler` |
+  | 2 | `sampler.go:60-74` `BurstSampler` | `event.go:202-210` `Dict` |
+  | 3 | `sampler.go:76-87` `BurstSampler.Sample` | `event.go:191-200` `Event.CreateDict` |
+  | 4 | `sampler.go:29-38` `RandomSampler.Sample` | `event_test.go:279-318` |
+  | 5 | `sampler.go:9-16` `Often` | `event_test.go:159-198` |
+
+  The mechanism behind the difference is known and is written up as a limitation below. Which
+  column serves a reader better is not something this repository can answer yet, and P6 is where it
+  gets answered.
+
+### Three limitations this phase measured rather than guessed
+
+- **The shipped ranking makes repetition outrank coverage.** Under `ts_rank_cd` a span mentioning
+  one query term six times outranks a span mentioning each of two terms once (2.4 against 0.8);
+  under `ts_rank` the order reverses (0.1813 against 0.2432). Cover density does not break the tie
+  — it never runs under `OR`, which is the only shape this arm builds — so the choice is between
+  *frequency* and *distinct-term coverage*, made with no corpus to measure against.
+- **The `simple` text-search configuration has no stopword list.** So `"where is X defined"` `OR`s
+  in `where`, `is` and `defined`, and every span containing the word "defined" is a candidate. The
+  two compound, and the table above is what that looks like on a real repository: `event` is a term
+  of the question, `event_test.go` repeats it, and the lexical arm ranks it up. A code-appropriate
+  stopword list and a ranking-function sweep are both P6 decisions — adding either now would be the
+  same guess the `-1` floor exists to avoid.
+- **Package documentation is unretrievable under the AST strategy**, and that is a retrieval
+  limitation and not only a chunking one. `f.Doc` is not a declaration, so a file holding only a
+  package comment produces no spans, and a question about that prose cannot be answered from it.
+  Under `hybrid` it does not even refuse: the vector arm returns its top candidates whatever they
+  score, so the honest outcome is an answer citing *other* files. The refusal is real only in
+  `lexical` mode, where a term no span holds retrieves nothing. Both halves are pinned by a live
+  test rather than left to be discovered.
+
 ## The symbol graph, and its honesty
 
 A precise Go call graph needs type information, which needs the repository to actually compile —
@@ -255,7 +418,7 @@ downgraded wholesale.
 | **P0** | Skeleton, schema, migrations, compose, CI with live Postgres | done; CI landed with P1 |
 | **P1** | Ingestion: admission, sandbox, job queue, caps, LRU eviction | done |
 | **P2** | AST chunking, embeddings, spans, window fallback | done |
-| **P3** | Retrieval, citations, extractive ask, measured floor | not started |
+| **P3** | Retrieval, citations, extractive ask, the floor as a mechanism | done; the floor's *value* is P6 |
 | **P4** | Symbol graph, per-edge provenance, graph endpoints | not started |
 | **P5** | React console | not started |
 | **P6** | Eval harness: generated golden set, AST versus window | not started |
@@ -264,8 +427,11 @@ downgraded wholesale.
 
 Nothing above is deployed. There is no live instance, no cloud account behind this repository, and
 no benchmark result to quote yet — when there is one, it will come with the numbers that produced
-it. The figures in [Chunking](#chunking-and-the-two-corpora) are what indexing one repository
-**cost**; nothing yet says which chunking retrieves better, because nothing retrieves at all.
+it. The figures in [Chunking](#chunking-and-the-two-corpora) and [Retrieval](#retrieval) are what
+indexing and querying one repository **cost**. Nothing yet says which chunking retrieves better,
+nothing says whether fusing the two arms beats either alone, and the score floor is a knob at `-1`
+rather than a measured threshold. All three are P6, and all three are questions this repository is
+built to answer with evidence rather than to assert.
 
 ## Running what exists
 
@@ -282,11 +448,33 @@ DATABASE_URL='postgres://codetrail:codetrail@localhost:55432/codetrail?sslmode=d
   go test -tags=live ./...
 
 # The one check a fake cannot make: that the real model returns the width the schema
-# is built for. Behind its own tag, so CI never needs a model.
+# is built for. Behind its own tag, so CI never needs a model — CI does `go vet` it,
+# so an opt-in suite cannot rot unnoticed between the runs nobody makes.
 docker compose -f infra/docker-compose.yml --profile ai up -d ollama
 docker compose -f infra/docker-compose.yml exec ollama ollama pull nomic-embed-text
 OLLAMA_URL=http://localhost:11435 go test -tags=ollama ./packages/shared/embed/
 ```
+
+To actually ask something, run the two binaries against that Postgres and the model above. The
+gateway embeds every question, so it needs an embedder to boot at all:
+
+```bash
+make build
+export DATABASE_URL='postgres://codetrail:codetrail@localhost:55432/codetrail?sslmode=disable'
+export EMBED_PROVIDER=ollama OLLAMA_URL=http://localhost:11435
+./bin/gateway & ./bin/indexer &
+
+curl -s -XPOST localhost:8080/api/repos -H 'content-type: application/json' \
+  -d '{"remote":"https://github.com/rs/zerolog","ref":"master"}'
+# poll GET /api/jobs/<id> until status is "done"; it carries the repo_id it produced.
+# Indexing rs/zerolog takes about 2.5 minutes, nearly all of it embedding on CPU.
+
+curl -s -XPOST localhost:8080/api/repos/$REPO/ask -H 'content-type: application/json' \
+  -d '{"q":"how does the sampler decide to drop an event"}' | jq .
+```
+
+The `content-type` header is not optional: without it the body is bound as a form, `q` is empty,
+and the answer is a `400` naming that rule rather than the question you meant to ask.
 
 Each live suite **creates a throwaway database of its own** beside the one `DATABASE_URL` names,
 migrates it, and drops it when the suite ends. That is not tidiness: these tests clear whole tables
