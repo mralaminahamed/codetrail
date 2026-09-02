@@ -229,6 +229,48 @@ func TestLimitsRefuseANonPositiveKnob(t *testing.T) {
 	}
 }
 
+// Every integer knob the indexer reads, with a letter O for a zero. Before
+// this, all fifteen booted on their defaults and logged "indexer up": a worker
+// keeping 50 repositories while its operator wrote 5O is exactly the silence
+// the positive check above exists to prevent, one step earlier.
+func TestEveryIntegerKnobRefusesAValueThatIsNotAnInteger(t *testing.T) {
+	for _, key := range []string{
+		"MAX_REPO_BYTES", "JOB_DEADLINE_SECONDS", "MAX_REPO_FILES",
+		"MAX_FILE_BYTES", "MAX_ATTEMPTS", "POLL_SECONDS", "KEEP_REPOS", "EMBED_BATCH",
+		"KEEP_TOMBSTONES", "JOB_HISTORY_HOURS", "JOB_SWEEP_MINUTES",
+	} {
+		t.Run(key, func(t *testing.T) {
+			t.Setenv(key, "4O")
+			_, err := limitsFrom()
+			refusalNames(t, err, key)
+		})
+	}
+	for _, key := range []string{"CHUNK_WINDOW_LINES", "CHUNK_WINDOW_OVERLAP", "CHUNK_MAX_DECL_LINES"} {
+		t.Run(key, func(t *testing.T) {
+			t.Setenv(key, "4O")
+			_, err := chunkOptions()
+			refusalNames(t, err, key)
+		})
+	}
+	t.Run("EMBED_DIM", func(t *testing.T) {
+		t.Setenv("EMBED_PROVIDER", "fake")
+		t.Setenv("EMBED_DIM", "4O")
+		_, err := newEmbedder(context.Background(), time.Minute)
+		refusalNames(t, err, "EMBED_DIM")
+	})
+}
+
+// A refusal an operator can act on names the setting and the value they typed.
+func refusalNames(t *testing.T, err error, key string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("%s=4O booted", key)
+	}
+	if !strings.Contains(err.Error(), key) || !strings.Contains(err.Error(), "4O") {
+		t.Errorf("the error names neither the setting nor the value: %v", err)
+	}
+}
+
 // Every knob has to reach the cap it names. A crossed pair is silent: the
 // worker boots, clones and indexes, with the wrong two numbers in force.
 func TestLimitsAreWiredToTheCapsTheyName(t *testing.T) {

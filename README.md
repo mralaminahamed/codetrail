@@ -341,16 +341,19 @@ new to the gateway, because it has to embed the question — `EMBED_PROVIDER`, `
 `hnsw.ef_search` default on the pinned image, read from `pg_settings.boot_val` rather than assumed:
 asking the ANN index for more rows than `ef_search` degrades recall with no error.
 
-**"Validated at boot" is not true of all of them, and the gap is stated rather than rounded up.**
-Every one of these has its *range* checked before the process serves anything — an unknown mode, a
-negative `k`, a zero candidate depth, a zero budget and a floor outside `[-1, 1]` are each a
-refusal to boot naming the setting. But four are read through an integer helper that answers its
-default for anything it cannot parse, so `RETRIEVAL_RRF_K=abc`, `RETRIEVAL_CANDIDATES=oops`,
-`ANSWER_MAX_SPANS=five` and `ANSWER_MAX_CHARS=lots` each boot silently on the default. Measured, by
-running the binary with each: the first three logged `rrf_k=60 candidates=40` and
-`answer_max_spans=5` and started, while `ANSWER_SCORE_FLOOR=abc` and `RETRIEVAL_MODE=nope` refused.
-The floor is parsed by hand for exactly that reason — a filter an operator believes is running is
-worse than one that never started — and the same hardening is owed to the other four.
+**"Validated at boot" is now true of all of them, and the gap it closed was bigger than P3
+recorded.** Every one of these has its *range* checked before the process serves anything — an
+unknown mode, a negative `k`, a zero candidate depth, a zero budget and a floor outside `[-1, 1]`
+are each a refusal to boot naming the setting. Until this fix, **five** of the eleven — not the
+four P3 counted — were read through an integer helper that answered its *default* for anything it
+could not parse, so the range check beside them never saw the value at all: `RETRIEVAL_RRF_K`,
+`RETRIEVAL_CANDIDATES`, `ANSWER_MAX_SPANS`, `ANSWER_MAX_CHARS`, and `EMBED_DIM`, which P3 missed
+because it is read inside the shared embedder rather than in the gateway's own boot. Measured by
+running the binary with each: `RETRIEVAL_CANDIDATES=4O`, with a letter O for the zero, logged
+`candidates=40` and served, while `ANSWER_SCORE_FLOOR=abc` and `RETRIEVAL_MODE=nope` refused. Each
+of the five now refuses too, naming the setting and the value it was given — as do the fifteen
+integer knobs the indexer reads, which had the same hole for the same reason. The floor is still
+parsed by hand, because the shared helper reads integers and a floor is not one.
 
 ### What this phase measured
 
