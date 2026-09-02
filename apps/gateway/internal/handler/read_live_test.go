@@ -678,7 +678,7 @@ func TestARepoIndexedWithNoSpansRefusesInEveryMode(t *testing.T) {
 // repoRoutesFor is every route keyed on a repo id, which is the set the
 // 404/410 distinction has to hold across rather than on the one route a test
 // happened to drive.
-func repoRoutesFor(id, spanID string) []struct {
+func repoRoutesFor(id, spanID, symbolID string) []struct {
 	method, path, body string
 } {
 	return []struct{ method, path, body string }{
@@ -686,7 +686,74 @@ func repoRoutesFor(id, spanID string) []struct {
 		{http.MethodGet, "/api/repos/" + id + "/spans/" + spanID, ""},
 		{http.MethodPost, "/api/repos/" + id + "/search", `{"q":"machine"}`},
 		{http.MethodPost, "/api/repos/" + id + "/ask", `{"q":"machine"}`},
+		{http.MethodGet, "/api/repos/" + id + "/symbols?name=Add", ""},
+		{http.MethodGet, "/api/repos/" + id + "/symbols/" + symbolID, ""},
+		{http.MethodGet, "/api/repos/" + id + "/symbols/" + symbolID + "/callers", ""},
 	}
+}
+
+// liveGraph writes a small call graph over an indexed fixture repository: three
+// definitions and the two edges between them, one resolved and one syntactic.
+//
+// Hand-built rather than produced by the indexer's graph stage, for the reason
+// this whole suite copies langByExt rather than importing walk — apps/indexer
+// is the other side of the deployment boundary. What it needs from the indexer
+// path is what decides a row's identity, and SymbolID and EdgeID are shared.
+//
+// The definitions link to real spans, so a citation's digest is the hash of
+// text on disk; Other deliberately links to none, which is Task 2's
+// sub-windowed declaration and the only row that can tell a null citation from
+// a rendered guess.
+func liveGraph(t *testing.T, st *store.Store, repo models.Repo) (add, other models.Symbol) {
+	t.Helper()
+	ctx := context.Background()
+	span := func(path string) (string, int, int) {
+		t.Helper()
+		var id string
+		var start, end int
+		if err := st.Pool().QueryRow(ctx, `
+			SELECT id, start_line, end_line FROM spans
+			WHERE repo_id = $1 AND path = $2 ORDER BY start_line LIMIT 1`,
+			repo.ID, path).Scan(&id, &start, &end); err != nil {
+			t.Fatal(err)
+		}
+		return id, start, end
+	}
+	sym := func(path, name string, start, end int, spanID string) models.Symbol {
+		return models.Symbol{
+			ID:     store.SymbolID(repo.ID, path, start, string(models.KindFunc), name),
+			RepoID: repo.ID, FileID: store.FileID(repo.ID, path), Path: path,
+			Name: name, Pkg: "calc", Kind: models.KindFunc,
+			StartLine: start, EndLine: end, SpanID: spanID,
+		}
+	}
+	calcSpan, calcStart, calcEnd := span("calc/calc.go")
+	useSpan, useStart, useEnd := span("calc/use.go")
+	add = sym("calc/calc.go", "Add", calcStart, calcEnd, calcSpan)
+	use := sym("calc/use.go", "Use", useStart, useEnd, useSpan)
+	other = sym("calc/use.go", "Other", useEnd+1, useEnd+40, "")
+
+	edge := func(from models.Symbol, off, line int, toName, to string) models.Edge {
+		prov := models.ProvenanceSyntactic
+		if to != "" {
+			prov = models.ProvenanceResolved
+		}
+		return models.Edge{
+			ID: store.EdgeID(repo.ID, from.ID, from.Path, off, toName), RepoID: repo.ID,
+			FromSymbolID: from.ID, ToSymbolID: to, ToName: toName,
+			Kind: models.EdgeCalls, Provenance: prov, Path: from.Path, Line: line,
+		}
+	}
+	if err := st.PutGraph(ctx, repo.ID,
+		[]models.Symbol{add, use, other},
+		[]models.Edge{
+			edge(use, 100, useStart+1, "Add", add.ID),
+			// The same name, unresolved: the two answers must not merge.
+			edge(other, 200, useEnd+2, "Add", ""),
+		}); err != nil {
+		t.Fatal(err)
+	}
+	return add, other
 }
 
 // Spec §10 on a live database, in both directions: an indexed repository never
@@ -709,7 +776,8 @@ func TestAnEvictedRepoAnswersGoneOnEveryReadRoute(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, r := range repoRoutesFor(repo.ID, spanID) {
+	add, _ := liveGraph(t, st, repo)
+	for _, r := range repoRoutesFor(repo.ID, spanID, add.ID) {
 		rec := drive(t, h, r.method, r.path, r.body)
 		if rec.Code == http.StatusGone {
 			t.Errorf("%s %s: a live repository answered 410", r.method, r.path)
@@ -722,7 +790,7 @@ func TestAnEvictedRepoAnswersGoneOnEveryReadRoute(t *testing.T) {
 	if _, err := st.Evict(ctx, 0, 100); err != nil {
 		t.Fatal(err)
 	}
-	for _, r := range repoRoutesFor(repo.ID, spanID) {
+	for _, r := range repoRoutesFor(repo.ID, spanID, add.ID) {
 		rec := drive(t, h, r.method, r.path, r.body)
 		if rec.Code == http.StatusNotFound {
 			t.Errorf("%s %s: an evicted repository answered 404, which forgets it was ever here",
@@ -880,5 +948,146 @@ func TestEveryRetrievalModeRetrievesFromALiveCorpus(t *testing.T) {
 					vector, lexical)
 			}
 		}
+	}
+}
+
+// The repo view's graph counts, over a graph a query actually holds. Three
+// separate numbers rather than a ratio, and the provenance split from its own
+// two predicates: a repository whose edges all resolve makes the two counts
+// equal, and a view that read one total twice would look right.
+func TestTheRepoViewCountsTheGraphSplitByProvenance(t *testing.T) {
+	st := liveStore(t)
+	repo := indexFixture(t, st, "graphcounts", chunk.StrategyAST)
+	h := liveHandler(t, st, rag.ModeHybrid, rag.DefaultFloor())
+
+	// Before the graph exists the counts are zeros, not absent keys: a client
+	// cannot otherwise tell "no graph" from "this build does not report one".
+	empty := body(t, get(t, h, "/api/repos/"+repo.ID))
+	for _, k := range []string{"symbols", "edges", "edges_resolved", "edges_syntactic"} {
+		if v, ok := empty[k]; !ok || v != float64(0) {
+			t.Errorf("before the graph, %s = %v (present %v)", k, v, ok)
+		}
+	}
+
+	liveGraph(t, st, repo)
+	out := body(t, get(t, h, "/api/repos/"+repo.ID))
+	for k, want := range map[string]float64{
+		"symbols": 3, "edges": 2, "edges_resolved": 1, "edges_syntactic": 1,
+	} {
+		if out[k] != want {
+			t.Errorf("%s = %v, want %v", k, out[k], want)
+		}
+	}
+	// The span counts are still the chunker's, so the graph did not overwrite
+	// what the view already said.
+	if out["files"] == float64(0) || out["spans"] == float64(0) {
+		t.Errorf("the graph counts displaced the corpus counts: %v", out)
+	}
+}
+
+// The three routes over a real database: the two caller sets stay apart, every
+// row carries a call site, and a citation is either the span's real digest or
+// null.
+func TestTheGraphEndpointsAnswerFromALiveCorpus(t *testing.T) {
+	st := liveStore(t)
+	repo := indexFixture(t, st, "graphroutes", chunk.StrategyAST)
+	h := liveHandler(t, st, rag.ModeHybrid, rag.DefaultFloor())
+	add, other := liveGraph(t, st, repo)
+
+	defs := body(t, get(t, h, "/api/repos/"+repo.ID+"/symbols?name=Add"))
+	if defs["count"] != float64(1) || defs["matched"] != "exact" {
+		t.Errorf("definitions of Add: %v", defs)
+	}
+
+	var callers struct {
+		Symbol struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"symbol"`
+		Depth   int `json:"depth"`
+		Callers []struct {
+			Symbol struct {
+				Name string `json:"name"`
+			} `json:"symbol"`
+			Depth      int    `json:"depth"`
+			Provenance string `json:"provenance"`
+			Call       struct {
+				Path string `json:"path"`
+				Line int    `json:"line"`
+			} `json:"call"`
+			Citation *rag.Citation `json:"citation"`
+		} `json:"callers"`
+		Approximate struct {
+			MatchedOn string `json:"matched_on"`
+			Count     int    `json:"count"`
+			Callers   []struct {
+				Symbol struct {
+					Name string `json:"name"`
+				} `json:"symbol"`
+				ToName     string        `json:"to_name"`
+				Provenance string        `json:"provenance"`
+				Citation   *rag.Citation `json:"citation"`
+			} `json:"callers"`
+		} `json:"approximate"`
+	}
+	rec := get(t, h, "/api/repos/"+repo.ID+"/symbols/"+add.ID+"/callers")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("callers: %d %s", rec.Code, rec.Body)
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &callers); err != nil {
+		t.Fatal(err)
+	}
+	if callers.Symbol.Name != "Add" || callers.Depth != 1 {
+		t.Errorf("callers of %+v at depth %d", callers.Symbol, callers.Depth)
+	}
+	// One resolved caller and one name-matched one, from two queries whose
+	// answers the API refuses to merge (spec:84).
+	if len(callers.Callers) != 1 || callers.Callers[0].Symbol.Name != "Use" ||
+		callers.Callers[0].Provenance != "resolved" {
+		t.Fatalf("precise callers %+v, want just Use", callers.Callers)
+	}
+	if callers.Callers[0].Call.Path != "calc/use.go" || callers.Callers[0].Call.Line == 0 {
+		t.Errorf("call site %+v", callers.Callers[0].Call)
+	}
+	// The digest is the hash of the span's text as the chunker wrote it, read
+	// back from the same database.
+	cit := callers.Callers[0].Citation
+	if cit == nil || cit.Digest == "" || cit.Permalink == "" || cit.Commit != repo.Commit {
+		t.Fatalf("citation %+v", cit)
+	}
+	var digest string
+	if err := st.Pool().QueryRow(context.Background(),
+		`SELECT digest FROM spans WHERE repo_id = $1 AND path = 'calc/use.go' ORDER BY start_line LIMIT 1`,
+		repo.ID).Scan(&digest); err != nil {
+		t.Fatal(err)
+	}
+	if cit.Digest != digest {
+		t.Errorf("citation digest %s, want the span's %s", cit.Digest, digest)
+	}
+	if callers.Approximate.Count != 1 || callers.Approximate.MatchedOn != "name" ||
+		callers.Approximate.Callers[0].Symbol.Name != "Other" ||
+		callers.Approximate.Callers[0].ToName != "Add" ||
+		callers.Approximate.Callers[0].Provenance != "syntactic" {
+		t.Errorf("approximate %+v", callers.Approximate)
+	}
+	// Other has no span, so it has no digest to cite with.
+	if callers.Approximate.Callers[0].Citation != nil {
+		t.Errorf("the spanless caller cites %+v", callers.Approximate.Callers[0].Citation)
+	}
+
+	// And on its own route, the same null.
+	one := body(t, get(t, h, "/api/repos/"+repo.ID+"/symbols/"+other.ID))
+	if v, ok := one["citation"]; !ok || v != nil {
+		t.Errorf("citation %v (present %v), want null", v, ok)
+	}
+	if _, ok := one["staleness"]; !ok {
+		t.Errorf("a definition with no span lost its repository's staleness claim: %v", one)
+	}
+
+	// A symbol of another repository is a 404 here, not a read across a corpus
+	// boundary the caller never named.
+	otherRepo := indexFixture(t, st, "graphroutes2", chunk.StrategyAST)
+	if rec := get(t, h, "/api/repos/"+otherRepo.ID+"/symbols/"+add.ID); rec.Code != http.StatusNotFound {
+		t.Errorf("repo A's symbol read from repo B answered %d: %s", rec.Code, rec.Body)
 	}
 }

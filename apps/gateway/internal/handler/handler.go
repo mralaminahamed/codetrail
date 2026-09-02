@@ -51,6 +51,12 @@ func Mount(e *echo.Echo, h *Handler, mw ...echo.MiddlewareFunc) {
 	// process, and it is the one string in this phase that must not be.
 	g.POST("/repos/:repo/search", h.search)
 	g.POST("/repos/:repo/ask", h.ask)
+	// GET, unlike the two above: a symbol name is an identifier, not prose, and
+	// it is already in the URL of every permalink this product renders. See
+	// graph.go.
+	g.GET("/repos/:repo/symbols", h.listSymbols)
+	g.GET("/repos/:repo/symbols/:symbol", h.getSymbol)
+	g.GET("/repos/:repo/symbols/:symbol/callers", h.callersOfSymbol)
 }
 
 type repoRequest struct {
