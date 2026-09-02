@@ -133,7 +133,7 @@ Each of these is a constraint on the design, not context.
 - **Eviction is one `DELETE` that cascades** (§3). `symbols` and `edges` must cascade from `repos` and — for `symbols.span_id` — degrade rather than block when a span row goes. Task 2.
 - **The indexer has no `/metrics` endpoint** (P3's finding, unchanged). This phase's counters are indexer-side counters with nowhere to be scraped from. They are still written, because the alternative is a stage with no instrumentation at all, and the gap is recorded again rather than quietly fixed with an unscrapable exporter.
 - **Spec §10 keeps a refusal distinct from an error.** The graph endpoints have no refusal — a symbol that is not there is a `404`, not "we had nothing to say" — and so this phase must not increment the answer-outcome counters at all. Task 6's M8 checks that over the whole series set of both counters.
-- **P1's sandbox is deliberately hostile** and this phase runs a compiler inside it. That is Task 3, and it is the sharpest new risk in the project since P1's clone.
+- **P1's sandbox is deliberately hostile** and this phase runs a compiler inside it. That is Task 3, and it is the sharpest new risk in the project since P1's clone. *(Landed. The sandbox that resulted is an environment allowlist rather than P1's append-to-`os.Environ`, because git's dangerous settings are the four `clone.Run` sets last and go's are a dozen it would inherit.)*
 
 ---
 
@@ -526,172 +526,212 @@ Fifteen mutations, all fifteen killed, each with the observed message rather tha
 - **`GOWORK=off`.** A `go.work` file inside the checkout can name directories outside it; `off` means the module is the module.
 - **`GOMODCACHE`, `GOCACHE`, `GOPATH` and `GOTMPDIR` all under the job's scratch directory**, which the indexer already removes per job and sweeps at boot and at exit. Two reasons: nothing a stranger's build writes outlives the job, and no two jobs share a cache one of them wrote. The cost is real and is recorded in Open question 10 — with `GOPROXY=off` there is no module cache to reuse, and the build cache starts empty every time.
 - **`PATH` contains exactly one directory: the one holding the `go` binary**, resolved once at boot with `exec.LookPath`. `go` needs `PATH` to find its own tools; it does not need the operator's.
+
+  > **PLAN DEFECT — the rationale is false and the control does less than it says.** Measured: `packages.Load` succeeds with the child's `PATH` set to `/nonexistent-bin` and with it set to empty, because `go` finds its own tools through `GOROOT`, not `PATH`. Two consequences. (a) **The child's `PATH` does not choose the `go` binary.** `go/packages` runs `exec.Command("go", …)`, which resolves the name against the *parent's* `PATH`; `Policy.GoBin` was therefore decorative, and M16 shows a bogus `GoBin` still producing `reason "ok"` and four resolutions. `Validate` now pins `exec.LookPath("go") == GoBin` and refuses with `ErrNoToolchain` otherwise. (b) **`filepath.Dir(GoBin)` is often `/usr/bin`**, where `git` and `cc` also live, so `PATH` is not a containment boundary on its own — measured as M6/M6b: with `go` at `~/.local/bin/go` the child cannot reach a C compiler at all, which *masks* `CGO_ENABLED=0`'s kill; widen `PATH` to include `/usr/bin` and the same mutant loads the cgo package. The settled value is kept, and the honest statement of what keeps `git` and `cc` out of reach is `GOVCS`, `GOPROXY` and `CGO_ENABLED`, each of which is its own lock. **An empty `PATH` is strictly stronger and provably works; recommended for a follow-up.**
 - **The git variables from `clone.Run` are set here too** (`GIT_TERMINAL_PROMPT=0`, `GIT_ASKPASS=/bin/false`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`). Redundant under `GOVCS=*:off`, kept because two independent controls against arbitrary outbound `git` is the right number for the one thing in this phase that would be a genuine vulnerability.
-- **No `packages.Config.ParseFile` hook, and the reason is a measurement.** The chunker may be reading *stripped* bytes (`STRIP_DOC_COMMENTS`), while `go/packages` reads the file from disk. Those would be two coordinate systems if stripping moved anything — but `StripDocs` **blanks doc bytes in place and keeps every newline**, so byte offsets and line numbers are identical in both streams. Task 1's `TestOffsetsAndRangesSurviveDocCommentStripping` is what makes this true, and it is named in a comment here, because the day someone makes stripping *delete* bytes, this task's resolution rate silently collapses with no error anywhere.
+- **No `packages.Config.ParseFile` hook — and the reason the plan gave for it was false.**
+
+  > **PLAN DEFECT — the stated measurement said the opposite.** Task 1 measured that `StripDocs` does *not* blank in place: it removes the prose bytes and keeps only their line terminators, so line numbers are invariant and **byte offsets are not** (102 bytes in, 41 out, on `docs.gotxt`). The two streams therefore do **not** share a coordinate system, and the comment this bullet asked for would have been a false comment — the thirteenth in this project.
+  >
+  > The conclusion survives on a different reason: **both passes parse the same bytes on disk.** `go/packages` reads the file, and Task 4 must hand `symbols.Parse` the raw `body` and never the stripped `src`. A hook cannot enforce that — the mismatch is the caller's, not the loader's — so it is pinned by a test instead. `TestResolutionKeysAreOffsetsIntoTheBytesOnDisk` asserts that four of `Parse`'s keys over the on-disk bytes resolve, that stripping the same file *moves* offsets, and that the stripped keys do not hit as often. `Key`'s doc comment says the same in one sentence. Under M10 the first assertion reads `0 of Parse's keys resolved, want 4`, which is exactly what silently handing over stripped bytes would look like.
 - **Only a call resolving to a `*types.Func` that is package-scoped or a method is resolved.** `Uses` will happily resolve `fn()` where `fn` is a local variable holding a closure — to the *variable*, whose position is inside the enclosing function, which would map to an edge from a function to itself. A self-call that is not a self-call is worse than no edge.
 - **A call that resolves to an object outside the checkout is `External`, and produces no target.** `fmt.Println` type-checks perfectly and has no `symbols` row to point at. §3 says a resolved edge points at a symbol row and spec:84 says a null target means syntactic; both cannot hold for this call, so the invariant wins and the fact is kept in `Stats.External`. See "what the spec leaves underspecified".
-- **`packages.Load(cfg, "./...")` from the checkout root**, `Tests: false`, mode `NeedName|NeedFiles|NeedSyntax|NeedTypes|NeedTypesInfo`. `NeedDeps` is deliberately absent: it asks for the dependency graph's types, which is what makes the go command build things. `-e` behaviour (errors tolerated, packages still returned) is what `packages.Load` does by default with `NeedSyntax`; **verify that against the version resolved into `go.mod`** rather than trusting this sentence.
+- **`packages.Load(cfg, "./...")` from the checkout root**, `Tests: false`, mode `NeedName|NeedFiles|NeedSyntax|NeedTypes|NeedTypesInfo|NeedImports|NeedDeps`.
 
-- [ ] **Step 1: Measure what the go command does under this policy, before writing the policy**
+  > **PLAN DEFECT — `NeedDeps` is present, and the plan's reason for omitting it was backwards.** `packages.usesExportData` is `Mode&NeedExportFile != 0 || Mode&NeedTypes != 0 && Mode&NeedDeps == 0` (x/tools v0.49.0, `packages.go:1593`). Omitting `NeedDeps` is therefore what makes go/packages run `go list -export=true`, and `-export=true` is what makes the go command **compile** every dependency. Measured with a logging wrapper named `go` on the parent's `PATH`: on the `std` fixture, 2.66s and 31.8MB written under the job's scratch home without `NeedDeps` against 0.38s and 0.69MB with it; on a package importing `net/http` and `encoding/json`, 5.89s and 92.4MB against 0.69s and 1.04MB (peak RSS 274MB against 411MB — the one number that moves the wrong way). With the caches scoped to one job, none of those 92MB is ever reused. `NeedDeps` also means the only subprocess is `go list`, which matters for a phase whose whole risk is a subprocess against untrusted input.
+  >
+  > **Verified, not trusted:** `go list` is invoked with `-e` and, unasked, with `-buildvcs=false` and `-pgo=off`. The first is the `-e` behaviour the plan asked to be checked; the second means `go list` does not run `git` inside the stranger's checkout.
 
-Fixture modules under `testdata/mod/`, each a directory with a `go.mod` (named `go.mod.txt` and copied into a `t.TempDir()`, so the repository's own `go build ./...` does not try to build them):
+- [x] **Step 1: Measure what the go command does under this policy, before writing the policy**
+
+Six fixture modules under `testdata/mod/` (`.gotxt` and `go.mod.txt`, copied and renamed into a `t.TempDir()` so neither the repository's own build nor `gofmt -l` walks into a module meant to be broken). Two more than the plan listed, and both were earned by a measurement:
 
 | fixture | shape | what it is for |
 | --- | --- | --- |
-| `std` | two packages, standard library imports only, one calling the other | the resolved path |
-| `absent` | `require example.com/nope v1.0.0` | the expected failure |
+| `std` | two packages, std imports only, a cross-package call, `fmt.Println`, a local closure, `a(One(), One())` | the resolved path and every per-call classification |
+| `absent` | `require example.com/nope v1.0.0` **plus a `go.sum`**, three packages: `good`, `bad`, `blocked` | the expected failure, and the per-edge claim |
+| `thirdparty` | `require golang.org/x/mod v0.39.0` with real `go.sum` hashes | *(new)* the module fetch that would succeed if fetching were on |
+| `work` | `std` plus a `go.work` naming `/nonexistent-outside-the-checkout` | *(new)* the workspace escape |
 | `newgo` | `go 1.99.0` | the toolchain trap |
 | `cgo` | `import "C"` with a `#cgo LDFLAGS` line | the execution trap |
 | `nomod` | no `go.mod` at all | the shape most single-file repositories have |
 
-Run each by hand first, with `GOPROXY` pointed at a listener that logs, and **paste the transcript into the commit message**. The questions this settles, none of which this plan should guess:
+Measured with a wrapper named `go` first on the parent's `PATH` logging argv, and an `httptest` recorder as `GOPROXY`. The four questions the plan refused to guess:
 
-1. Does `packages.Load` return syntax and partial type info for the packages that *did* load when a sibling package fails? (The whole per-edge design depends on yes.)
-2. What does `Stats` look like for `nomod` — one package, or zero?
-3. Does `GOTOOLCHAIN=local` fail `newgo` before or after any network activity?
-4. With `GOPROXY=off`, is anything at all attempted over the network? The answer must be **nothing**, and the recorder is how it is proven.
+1. **Does `packages.Load` return syntax and partial type info for packages that failed?** Yes, and better than the design needed. On `absent`, both `good` and `bad` come back with `Types` and `TypesInfo`; `bad` carries `could not import example.com/nope/thing (invalid package name: "")` and still resolves its own `Helper`. So a single package carries both labels, which is a stronger statement of spec:190 than the plan's "one package loads and its sibling does not".
+2. **`nomod`:** `packages.Load` returns *no error* and **one** synthetic package named `./...` carrying `pattern ./...: directory prefix . does not contain main module or its selected dependencies`. `Resolve` therefore stats `Root/go.mod` first and never starts a subprocess for it.
+3. **`GOTOOLCHAIN=local` fails `newgo` before any network activity.** `go: go.mod requires go >= 1.99.0 (running go 1.27.0; GOTOOLCHAIN=local)`, recorder count 0. Without it, and with a proxy, two requests for `/golang.org/toolchain/@v/v0.0.1-go1.99.0.linux-amd64.zip`.
+4. **With `GOPROXY=off`, is anything attempted over the network?** Nothing, on every fixture.
 
-- [ ] **Step 2: Write the failing tests**
+> **PLAN DEFECT — the `absent` fixture as specified could not prove question 4.** With a `require` line and **no `go.sum`**, the recorder receives **zero** requests *even when the child is pointed at it*: under `-mod=readonly` the go command refuses on the missing `go.sum` entry before it fetches. A test written on that fixture would have asserted zero against a fixture that never wanted a module — the "fails for an unrelated reason" trap. Adding `go.sum.txt` makes the fetch real: the control run receives `/example.com/nope/@v/v1.0.0.zip` and `/example.com/nope/@v/v1.0.0.mod`. **The zero only means something because the control is in the same test.**
+
+Also measured, each one now a comment only because the counterfactual was run first:
+
+- **`GOTMPDIR` must exist.** Every load fails with `go: creating work dir: stat …/tmp: no such file or directory`. The go command creates `GOCACHE` and `GOMODCACHE` and does not create this one. `Resolve` makes all four (M17).
+- **A symlinked checkout root needs no `EvalSymlinks`.** Positions come back *under the symlink* (`…/link/lib/lib.go`), because `go/packages` sets `PWD` to the working directory it was given. No code was added for a case that does not exist.
+- **`go list` is run with `-buildvcs=false` and `-pgo=off`** without being asked, so it does not run `git` inside the checkout.
+- **In proxy mode the module cache is written read-only**, and `os.RemoveAll` over the job scratch directory then fails with `permission denied`. Observed as a `TempDir RemoveAll cleanup` failure during M2a. Harmless under the shipped default, where nothing is ever fetched; **a leak for Task 4 to handle if an operator sets a proxy.** Recorded against Open question 10.
+
+- [x] **Step 2: Write the failing tests**
+
+`policy_test.go` is hermetic; `load_test.go` runs the real go command and needs no network. Every test in the second file is run against a *planted hostile parent environment* where that is the point.
 
 ```go
-// policy_test.go — hermetic.
-func TestTheChildEnvironmentIsAnAllowlist(t *testing.T)     // no inherited GO* survives
-func TestAProxyOfDirectIsRefused(t *testing.T)              // Validate: "direct", "off,direct", "https://x,direct"
+// policy_test.go
+func TestTheChildEnvironmentIsAnAllowlist(t *testing.T)          // the whole key set, not one entry
+func TestAProxyOfDirectIsRefused(t *testing.T)                   // direct, off,direct, https://x,direct, https://x|direct, http://, file://
 func TestPolicyRefusesAnEmptyGoBinOrRoot(t *testing.T)
+func TestAGoBinaryThePathDoesNotResolveIsRefused(t *testing.T)   // new: see the PATH defect
 
-// load_test.go — runs the real go command; no network required.
-func TestCallsWithinTheModuleResolveToTheirDefinitions(t *testing.T)      // std
-func TestACallIntoTheStandardLibraryIsExternalNotResolved(t *testing.T)   // std
-func TestACallToALocalClosureIsNotResolved(t *testing.T)                  // std
-func TestAPackageThatCannotLoadLeavesItsCallsUnresolved(t *testing.T)     // absent
-func TestOnePackageResolvesWhileItsSiblingDoesNot(t *testing.T)           // absent: the per-edge claim
-func TestTheLoaderNeverReachesTheModuleProxy(t *testing.T)                // absent + recorder
-func TestTheOperatorsGoflagsCannotBreakTheLoad(t *testing.T)              // parent GOFLAGS=-mod=vendor
-func TestAToolchainDirectiveDoesNotFetchAToolchain(t *testing.T)          // newgo + recorder, proxy mode
-func TestACgoPackageDoesNotLoad(t *testing.T)                             // cgo
-func TestARepositoryWithNoGoModRecordsItsReason(t *testing.T)             // nomod
-func TestAnExpiredContextResolvesNothingAndSaysWhy(t *testing.T)          // Reason == "deadline"
-func TestResolutionIsKeyedByOffsetNotByLine(t *testing.T)                 // a(b(), b())
+// load_test.go
+func TestCallsWithinTheModuleResolveToTheirDefinitions(t *testing.T)
+func TestACallIntoTheStandardLibraryIsExternalNotResolved(t *testing.T)
+func TestACallToALocalClosureIsNotResolved(t *testing.T)
+func TestATargetsLineIsTheDeclarationNotItsDocComment(t *testing.T)   // new: a Task 4 carry-forward
+func TestResolutionIsKeyedByOffsetNotByLine(t *testing.T)
+func TestResolutionKeysAreOffsetsIntoTheBytesOnDisk(t *testing.T)     // new: replaces the false rationale
+func TestOneCallResolvesWhileAnotherInTheSamePackageDoesNot(t *testing.T)
+func TestAPackageThatCannotLoadLeavesItsCallsUnresolved(t *testing.T)
+func TestTheLoaderNeverReachesTheModuleProxy(t *testing.T)            // + its control
+func TestARequiredThirdPartyModuleDoesNotTypeCheck(t *testing.T)      // new: the network-free half of the same claim
+func TestAHostileParentEnvironmentCannotBreakTheLoad(t *testing.T)    // nine variables
+func TestAnExternalPackagesDriverOnThePathIsNotRun(t *testing.T)      // new: see below
+func TestAGoWorkFileInTheCheckoutIsIgnored(t *testing.T)              // new
+func TestAGoEnvFileUnderTheScratchHomeIsIgnored(t *testing.T)         // new
+func TestAToolchainDirectiveDoesNotFetchAToolchain(t *testing.T)      // + its proxy-mode control
+func TestACgoPackageDoesNotLoad(t *testing.T)
+func TestARepositoryWithNoGoModRecordsItsReason(t *testing.T)
+func TestAnExpiredContextResolvesNothingAndSaysWhy(t *testing.T)      // + its control
+func TestAMissingGoBinaryDegradesRatherThanFailing(t *testing.T)      // new: Open question 9
 ```
 
-`TestTheLoaderNeverReachesTheModuleProxy` is the test that carries this whole task, and its design is the point: it starts an `httptest` server that counts requests, sets `GOPROXY` **in the parent process** to that server's URL, runs `Resolve` over the `absent` fixture, and asserts the counter is **zero**. The original never contacts it because the policy sets `GOPROXY=off`; a mutant that inherits the environment, or drops the `off`, contacts it and the counter moves. A test that merely asserted `Env()` contains `GOPROXY=off` would pass under a mutant that appends the inherited value afterwards.
+> **PLAN DEFECT — `TestTheOperatorsGoflagsCannotBreakTheLoad` on the `std` fixture is void.** Measured: `go list -e ./...` with `GOFLAGS=-mod=vendor` and no vendor directory **succeeds** on a module with no requirements — `example.test/std` and `example.test/std/lib`, exit 0. The mutant passes. The variable only bites on a module with a `require` line, where it produces `go: inconsistent vendoring in …`. The test is kept, moved to the `absent` fixture, and generalised: nine parent variables, each of which is closed **by omission** rather than by an entry setting it to something safe, so the append-to-`os.Environ` mutant inherits it. `GOFLAGS`, `GOROOT`, `GOEXPERIMENT` and `GODEBUG` are the four that kill M1; `GOPRIVATE`, `GOTOOLCHAIN`, `CGO_ENABLED`, `GOWORK` and `GOPACKAGESDRIVER` do not, because `os/exec` de-duplicates the child's environment keeping the *last* occurrence and the allowlist is appended last. **That is also why the allowlist must not spell `GOFLAGS=`**: an entry naming it would be safe under the mutant too, and the mutation would prove nothing.
 
-`TestOnePackageResolvesWhileItsSiblingDoesNot` carries the spec's per-edge claim: the `absent` fixture is two packages, one importing only the standard library and one importing the missing module, each with one call, and the assertions name **which** call resolved and **which** did not. A count of resolutions would pass under a mutant that swapped them.
+> **FINDING — `GOPACKAGESDRIVER=off`, which the plan does not mention, is a hole nothing else closes.** `packages.findExternalDriver` reads `GOPACKAGESDRIVER` from `cfg.Env` and, when it is unset, falls back to `exec.LookPath("gopackagesdriver")` **against the parent's `PATH`** and runs whatever it finds *in place of the go command*, handing it the config and the checkout. Measured with a script named `gopackagesdriver` on the parent's `PATH`: with the entry, it does not run and the load resolves four calls; without it, the marker file appears and `packages.Load` returns 0 packages in 1ms. This is arbitrary program execution selected by the operator's `PATH`, and no value in the child's environment can close it — only naming it `off` can.
 
-**CI note:** these tests run the go command and need no network, so they run in the ordinary `go test ./...` step rather than behind a tag. Keep the fixtures to two files each — the point is the policy, not the corpus. If any of them turns out to need the network, it does not belong in this suite at all.
+- [x] **Step 3: Implement**
 
-- [ ] **Step 3: Implement**
+`policy.go` and `load.go`. Two shapes are worth stating because they are the ones the mutations attack:
 
-```go
-// Env is the child's entire environment, not an addition to ours. The go
-// command reads a dozen settings that re-open what this policy closes, and
-// GOENV=off is here because ~/.config/go/env is a second copy of all of them.
-//
-// GOPROXY=off by default: a module fetch is driven by require lines in a
-// stranger's go.mod, so with fetching on, the set of hosts this process
-// contacts is chosen by whoever submitted the repository — which is the thing
-// P1's admission allowlist exists to prevent, reached by a road it cannot see.
-//
-// GOVCS=*:off in both modes: with a direct proxy or a matching GOPRIVATE, the
-// go command fetches with git, at a host a require line names.
-//
-// GOTOOLCHAIN=local: a "go 1.29.0" directive otherwise downloads a toolchain
-// before any policy about modules applies.
-//
-// CGO_ENABLED=0: type-checking import "C" runs cgo, and #cgo LDFLAGS is
-// arbitrary execution.
-func (p Policy) Env() []string
-```
+- `Env()` is the whole environment and it is built from nothing. What is *absent* is the control: `GOFLAGS`, `GOPRIVATE`, `GOINSECURE`, `GOEXPERIMENT`, `GOROOT`, `GODEBUG`, `LD_PRELOAD`, `HTTPS_PROXY`, `XDG_CONFIG_HOME` and `CGO_LDFLAGS` are closed by omission. What is *present* is only what has an unsafe default: `GOPROXY`, `GOVCS`, `GOTOOLCHAIN`, `GOWORK`, `GOENV`, `GOPACKAGESDRIVER`, `CGO_ENABLED`, the four caches, `PATH`, `HOME`, and `clone.Run`'s four git variables.
+- `Resolve` has no error return and a closed reason set. **A sixth reason was added: `policy`**, for a `Validate` failure that is not a missing toolchain — a refused `GOPROXY`, a relative `Root`. The plan's five could only have expressed it as `disabled`, which would be a lie about which knob was turned. Recorded as a deviation.
 
-- [ ] **Step 4: Commit, then prove the tests discriminate**
+- [x] **Step 4: Commit, then prove the tests discriminate**
+
+Twenty mutations. **Eighteen killed, two recorded as survivors**, each with the observed message rather than the prediction.
 
 **M1 — `Env()` returns `append(os.Environ(), …)` instead of the allowlist.**
 - *Why the code exists:* the operator's environment can re-open every control in this file.
-- *Fixture that separates mutant from original:* two, and both are needed. `TestTheOperatorsGoflagsCannotBreakTheLoad` sets `GOFLAGS=-mod=vendor` in the parent and asserts the `std` fixture still resolves — under the mutant the go command refuses the whole load because there is no vendor directory. `TestTheLoaderNeverReachesTheModuleProxy` catches the other half. **An assertion over `Env()`'s contents cannot** replace either: the mutant's slice *contains* `GOPROXY=off`, just not last.
-- *Must fail:* `TestTheOperatorsGoflagsCannotBreakTheLoad`
-- *Expected (verify and correct):* `resolved 0 of 2 calls, reason "load_error"; want 2 resolved` — verify the reason string the go command's vendor complaint produces.
+- *Fixture that separates mutant from original:* `TestAHostileParentEnvironmentCannotBreakTheLoad` on the **`absent`** fixture (see the defect above: on `std` it cannot), plus `TestTheChildEnvironmentIsAnAllowlist`.
+- *Observed — killed, four subtests plus the allowlist test:* `TestAHostileParentEnvironmentCannotBreakTheLoad/{GOFLAGS,GOROOT,GOEXPERIMENT,GODEBUG}`, each `the call at good/good.go offset 70 resolved to nothing, want good/good.go:3`. `GOPRIVATE`, `GOTOOLCHAIN`, `CGO_ENABLED`, `GOWORK` and `GOPACKAGESDRIVER` survive this mutant, because the appended entry wins — which is the measured reason the omitted variables are the ones that matter.
+- *Also observed, and worth its own line:* the allowlist test's output under M1 names what an inherited environment actually carries into a subprocess running on a stranger's source tree — `SSH_AUTH_SOCK`, `GITHUB_PERSONAL_ACCESS_TOKEN`, `RAZORPAY_KEY`, `XAUTHORITY`, and fifty more.
+- *Compiles and vets:* yes, with `os` imported.
+
+**M2a — the `GOPROXY` entry dropped from the allowlist.**
+- *Why the code exists:* it is the control that decides whether this process fetches anything at all.
+- *Fixture that separates mutant from original:* **not the recorder** — this is the trap the plan walked into. With the entry gone the child falls back to the go command's default `https://proxy.golang.org,direct`, which the recorder in the parent cannot see; a recorder-only test records zero and the mutant survives. The fixture that separates them is `thirdparty`, whose `require golang.org/x/mod v0.39.0` **succeeds** the moment fetching is allowed.
+- *Must fail:* `TestARequiredThirdPartyModuleDoesNotTypeCheck`
+- *Observed — killed:* `stats {Packages:1 Loaded:1 Failed:0 Resolved:0 External:1 Unresolved:0 Reason:ok}, want one failed package and none loaded`, `External is 1, want 0`, `reason "ok", want "load_error"` — the mutant went to the real network and type-checked a third-party module. `TestTheLoaderNeverReachesTheModuleProxy`'s control also fails (`the control run reached the proxy 0 times`), because there is no `GOPROXY=` entry left to override.
 - *Compiles and vets:* yes.
 
-**M2 — `GOPROXY=off` dropped from the allowlist.**
-- *Why the code exists:* it is the control that decides whether this process fetches anything at all.
-- *Fixture that separates mutant from original:* the `absent` fixture plus the recording server, with `GOPROXY` set in the parent. **The `std` fixture cannot see this** — it needs no modules, so nothing is fetched under either version. That is the trap: a policy test written over the happy fixture proves nothing.
-- *Must fail:* `TestTheLoaderNeverReachesTheModuleProxy`
-- *Expected (verify and correct):* `the module proxy received 2 requests (/example.com/nope/@v/list, …), want 0`
+**M2b — `Env()` falls back to the inherited `GOPROXY` when the policy's is empty.**
+- *Why the code exists:* this, not deletion, is the shape the bug takes in real life — "respect the operator's setting".
+- *Fixture:* `absent` with its `go.sum`, and the recorder as the parent's `GOPROXY`.
+- *Observed — killed:* `the module proxy received 2 requests [/example.com/nope/@v/v1.0.0.zip /example.com/nope/@v/v1.0.0.mod], want 0`.
 - *Compiles and vets:* yes.
 
 **M3 — `GOVCS=*:off` dropped.**
-- *Why the code exists:* it is the second lock on arbitrary outbound `git`.
-- *Fixture that separates mutant from original:* **none, and this is recorded as a survivor.** With `GOPROXY=off` no fetch of any kind is attempted, so `GOVCS` is never consulted; the only configuration that would consult it is `GOPROXY=direct`, which `Validate` refuses. The instrument for that refusal is `TestAProxyOfDirectIsRefused`, which is a different mutation (M4). Recorded as defence in depth with the reason it cannot be killed, rather than deleted for being untestable.
-- *Must fail:* nothing. Survivor.
-- *Compiles and vets:* yes.
+- *Observed — survivor, as predicted.* Whole suite `ok`. With `GOPROXY=off` no fetch of any kind is attempted, so `GOVCS` is never consulted; the only configuration that would consult it is a `direct` proxy, which `Validate` refuses (M4). Kept as defence in depth with the reason it cannot be killed.
 
-**M4 — `Validate` accepts `direct` as a proxy.**
+**M4 — `Validate` accepts anything but a bare `direct` (`strings.TrimSpace(p.Proxy) == "direct"`).**
 - *Why the code exists:* `GOPROXY=direct` turns a stranger's `require` line into an outbound connection to a host of their choosing.
-- *Fixture that separates mutant from original:* `TestAProxyOfDirectIsRefused`, whose table includes `"off,direct"` and `"https://proxy.example,direct"` — a naive `p.Proxy == "direct"` check passes the plain case and misses both fallbacks, which is the shape the mutation should take.
-- *Must fail:* `TestAProxyOfDirectIsRefused`
-- *Expected (verify and correct):* `Validate("https://proxy.example,direct") returned nil, want an error naming the setting`
-- *Compiles and vets:* yes.
+- *Observed — killed, five subtests:* `Validate("off,direct") returned nil, want an error naming the setting`, and the same for `https://proxy.example,direct`, `https://proxy.example|direct`, `http://proxy.example` and `file:///tmp/proxy`. The `|` row is the one the plan did not have: `GOPROXY` separates fallbacks with `,` **and** `|`.
+- *Compiles and vets:* yes — `strings` keeps a use, which the naive `p.Proxy == "direct"` spelling did not (that version is a build break, and void).
 
 **M5 — `GOTOOLCHAIN=local` dropped.**
-- *Why the code exists:* a `go` directive newer than the installed toolchain otherwise triggers a toolchain download.
-- *Fixture that separates mutant from original:* the `newgo` fixture **in proxy mode**, with the recorder as the proxy. In the default mode both versions fail without a fetch, because `GOPROXY=off` blocks the toolchain download too — so a test run in the default mode cannot separate them, which is worth saying out loud since the default mode is what ships.
-- *Must fail:* `TestAToolchainDirectiveDoesNotFetchAToolchain`
-- *Expected (verify and correct):* `the module proxy received a request for /golang.org/toolchain/@v/…, want 0 requests` — verify the exact path shape; it is a normal module path and the recorder should log it.
+- *Fixture that separates mutant from original:* `newgo` **in proxy mode**. In the default mode both versions fail without a fetch, because `GOPROXY=off` blocks the toolchain download too. The proxy-mode control overrides *only* `GOPROXY` and reads `GOTOOLCHAIN` from production's `Env()`, which is what makes it a kill rather than a tautology.
+- *Observed — killed:* `the proxy received /golang.org/toolchain/@v/v0.0.1-go1.99.0.linux-amd64.zip: a toolchain was fetched for a stranger's go directive` (twice — the go command retries).
 - *Compiles and vets:* yes.
 
 **M6 — `CGO_ENABLED=0` dropped.**
-- *Why the code exists:* `#cgo LDFLAGS:` in a stranger's source is arbitrary execution during a type-check.
-- *Fixture that separates mutant from original:* the `cgo` fixture. **The kill is machine-dependent and must be recorded as such:** on CI's `ubuntu-latest` a C toolchain is present, so the mutant loads the package and the assertion that its call is unresolved fails. On a machine with no C compiler both versions fail. Record which machine produced the result.
-- *Must fail:* `TestACgoPackageDoesNotLoad`
-- *Expected (verify and correct):* `the cgo package's call to helper resolved, want unresolved` (on a machine with a C toolchain).
+- *Observed — survivor on this machine, and the reason is the finding.* `go test -run Cgo` is `ok`. `go` is at `~/.local/bin/go`, so the child's `PATH` holds one directory with no C compiler in it, and cgo is unavailable whatever `CGO_ENABLED` says. **`PATH` masked the control.**
+- **M6b — `CGO_ENABLED=0` dropped *and* `/usr/bin` added to the child's `PATH`**, modelling the Debian/Ubuntu and `ubuntu-latest` layout where `go` lives beside `gcc`. *Observed — killed:* `Packages is 1, want 0: a cgo package must not load at all` and `reason "ok", want "load_error"`. Machine: Linux 7.0.0-30-generic, `/usr/bin/gcc` present, go 1.27.0 at `/home/alamin/.local/bin/go`.
+- **M6c — `CGO_ENABLED=0` kept, `/usr/bin` added to the child's `PATH`.** *Observed — survivor:* `ok`. So the two controls are independent and each is sufficient alone, which is the empirical case for keeping both rather than the plan's assumption that one is redundant.
 - *Compiles and vets:* yes.
 
 **M7 — the context is replaced by a fresh one (`context.WithTimeout(context.Background(), 2*time.Minute)`).**
 - *Why the code exists:* spec:194 — one deadline for the whole job.
-- *Fixture that separates mutant from original:* `TestAnExpiredContextResolvesNothingAndSaysWhy`, which hands `Resolve` an already-cancelled context over the `std` fixture. **A fixture with time left cannot see this**, and neither can one whose packages fail to load anyway.
-- *Must fail:* `TestAnExpiredContextResolvesNothingAndSaysWhy`
-- *Expected (verify and correct):* `resolved 2 calls with reason "ok", want 0 and "deadline"`
+- *Fixture:* an already-cancelled context over `std`, with a control sub-test proving the same fixture resolves four calls when the budget is intact.
+- *Observed — killed:* `reason "ok", want "deadline"` and `resolved 4 calls with reason "ok", want 0 and "deadline"`.
 - *Compiles and vets:* yes.
 
-**M8 — the `*types.Func` / package-scope guard removed, so a local closure resolves.**
-- *Why the code exists:* `Uses` resolves `fn()` to the variable holding the closure, whose position lies inside the enclosing function, producing an edge from a function to itself.
-- *Fixture that separates mutant from original:* the `std` fixture's function containing `fn := func() {...}; fn()`. Every fixture without a closure passes under the mutant.
-- *Must fail:* `TestACallToALocalClosureIsNotResolved`
-- *Expected (verify and correct):* `call to fn resolved to run:12, want no target` — verify whether the object's position is the variable's declaration line or the literal's.
-- *Compiles and vets:* yes.
+**M8 — the `*types.Func` / package-scope guard removed, so any object with a position resolves.**
+- *Observed — killed:* `the call at app.go offset 348 resolved to app.go:14, want no target: Uses names the variable holding the closure, whose position is inside Run itself`, plus `Unresolved is 0, want 1` and the whole-`Stats` comparison `Resolved:5 … Unresolved:0` against `Resolved:4 … Unresolved:1`. The plan predicted the target would be the enclosing function's line 12; it is **14**, the variable's declaration — still inside `Run`, still an edge from a function to itself.
+- *Compiles and vets:* yes, with `go/types` unimported.
 
 **M9 — a target outside the checkout is returned rather than counted as external.**
-- *Why the code exists:* a standard-library function has no `symbols` row, and §3's resolved edge must point at one.
-- *Fixture that separates mutant from original:* `TestACallIntoTheStandardLibraryIsExternalNotResolved`, asserting both that the map has no entry **and** that `Stats.External` moved. Asserting only the absence of the entry passes under a mutant that drops the call on the floor without counting it — which is a different bug with the same symptom.
-- *Must fail:* `TestACallIntoTheStandardLibraryIsExternalNotResolved`
-- *Expected (verify and correct):* `fmt.Println resolved to /usr/local/go/src/fmt/print.go:314, want external`
+- *Observed — killed:* `the call at app.go offset 284 resolved to :306, want no target: fmt.Println has no symbols row` and `External is 0, want 1`. The empty path in `:306` is what the row would have carried. Asserting only the absence of the map entry would have passed under a mutant that dropped the call without counting it, which is why `Stats.External` is asserted beside it.
 - *Compiles and vets:* yes.
 
 **M10 — resolution keyed by line instead of offset.**
-- *Why the code exists:* the key has to be the same key Task 1 wrote, and two calls on one line are two keys.
-- *Fixture that separates mutant from original:* `a(b(), b())` in the `std` fixture. This is the same trap as Task 1's M3, one layer down, and the fixture has to exist in both places.
-- *Must fail:* `TestResolutionIsKeyedByOffsetNotByLine`
-- *Expected (verify and correct):* `resolved 1 call at line 9, want 2 at offsets 96 and 101` — the offsets are the fixture's; paste the real ones.
+- *Observed — killed:* `the call at offset 374 did not resolve; a line key would have kept only one of the two` and the same for 385, plus `0 of Parse's keys resolved, want 4: the loader is not keying the bytes on disk`. The two calls to `One` are at offsets 374 and 385 on line 16 — the fixture's real numbers.
 - *Compiles and vets:* yes.
 
 **M11 — `Stats.Reason` hard-wired to `"ok"`.**
-- *Why the code exists:* it is the only thing that distinguishes "this repository has no cross-package calls" from "the type-checker never ran", and Task 4 turns it into a counter and a log line.
-- *Fixture that separates mutant from original:* `nomod` and `absent`, whose reasons differ from each other (`no_module` versus `load_error`) — a test that asserts merely "reason is not empty" cannot tell those apart, and telling them apart is the entire value of the field.
-- *Must fail:* `TestARepositoryWithNoGoModRecordsItsReason`
-- *Expected (verify and correct):* `reason "ok", want "no_module"`
+- *Observed — killed, four tests:* `reason "ok", want "load_error"` from `absent`, `thirdparty` and `cgo`, and `reason "ok", want "no_module": it is what tells this apart from a load that failed` from `nomod`. Four fixtures with three distinct reasons is what makes the field worth having; "reason is not empty" would have passed.
 - *Compiles and vets:* yes.
 
-- [ ] **Step 5: Commit**
+**M12 — `GOWORK=off` dropped.** *(new)*
+- *Why the code exists:* a `go.work` inside the checkout can name directories outside it, and the go command will try to load them.
+- *Fixture:* `work`, whose `go.work` says `use /nonexistent-outside-the-checkout`.
+- *Observed — killed:* `the call at app.go offset 296 resolved to nothing, want lib/lib.go:3`; the go command's own message is `cannot load module /nonexistent-outside-the-checkout listed in go.work file`.
 
-**Definition of Done**
-- The child's environment is an allowlist, proven by a test in which the *parent* environment is hostile.
-- With the default policy, a recording proxy receives **zero** requests while type-checking a module that requires an absent dependency.
-- A `go` directive newer than the toolchain does not download a toolchain, proven in proxy mode where the difference is observable.
-- A cgo package does not load, recorded with the machine the result came from.
-- One package resolving while its sibling does not, asserted by naming both calls.
-- An expired context resolves nothing and says `deadline`.
+**M13 — `GOENV=off` dropped.** *(new)*
+- *Why the code exists:* `~/.config/go/env` is a second copy of every setting the allowlist closes, and it is read by a child with an otherwise empty environment.
+- *Fixture:* a planted `$Home/.config/go/env` holding `GOFLAGS=-mod=vendor`.
+- *Observed — killed:* `the call at good/good.go offset 70 resolved to nothing, want good/good.go:3`.
+
+**M14 — `GOPACKAGESDRIVER=off` dropped.** *(new — the hole the plan did not have)*
+- *Observed — killed:* `a gopackagesdriver on the operator's PATH was executed against the checkout`, and `the call at app.go offset 296 resolved to nothing`.
+
+**M15 — `cfg.Env` set to `nil`.** *(new — the other half of M1, and the one that is a one-token edit)*
+- *Why the code exists:* `golist.cfgInvocation` sets `CleanEnv: cfg.Env != nil`. A nil `Env` is not "no environment", it is **the parent's**.
+- *Observed — killed, four tests:* `the module proxy received 2 requests …, want 0`; six subtests of the hostile-parent table; `a gopackagesdriver on the operator's PATH was executed`; and the `go.work` test.
+
+**M16 — `Validate` stops pinning `GoBin` to what the parent's `PATH` resolves.** *(new — see the PATH defect)*
+- *Observed — killed:* `Validate returned nil for a GoBin the parent's PATH does not resolve to`, and `reason "ok", want "no_toolchain"` with `4 resolutions, want none` — a policy naming `/usr/bin/definitely-not-the-go-on-path` happily type-checking with a binary it never named.
+
+**M17 — the cache directories are not created.** *(new — the measured `GOTMPDIR` requirement)*
+- *Observed — killed:* `reason "load_error", want "ok"; stats {Packages:1 Loaded:0 Failed:1 …}` and `the call at good/good.go offset 70 resolved to nothing`.
+
+**M18 — the `go.mod` pre-check dropped, so `nomod` reaches the loader.** *(new)*
+- *Observed — killed:* `reason "load_error", want "no_module": it is what tells this apart from a load that failed`. The distinction is the whole value of the field: `no_module` is a repository shape, `load_error` is a repository that tried.
+
+**M19 — `st.Failed > 0` dropped from the reason switch.** *(new: the per-package failure count is otherwise a write nothing reads back)*
+- *Observed — killed:* `reason "ok", want "load_error"; stats {Packages:2 Loaded:1 Failed:1 Resolved:2 …}` and the same on `thirdparty`.
+
+*Considered and excluded:* mutating `loadMode` (a different mode is a performance and subprocess change that the assertions cannot see as a behaviour change on these fixtures — it is measured in Step 1 instead); reversing `Loaded`/`Failed` (an incident, not a kill, since every stats comparison is whole-struct already); and dropping the git variables, which is M3's survivor with a different name.
+
+- [x] **Step 5: Commit**
+
+**Definition of Done** — all met.
+- The child's environment is an allowlist, proven by tests whose *parent* is hostile: nine variables, four of which kill the append-to-`os.Environ` mutant, and a planted `gopackagesdriver`, `go.work` and `~/.config/go/env` besides.
+- A recording proxy receives **zero** requests while type-checking a module that requires an absent dependency — **and a control in the same test proves the same fixture makes two requests when the child is allowed to fetch**, which is the only thing that makes the zero evidence. The network-free half of the claim is `thirdparty`, where a real module simply does not type-check.
+- A `go` directive newer than the toolchain does not download a toolchain, proven in proxy mode where the difference is observable, with the exact path recorded.
+- A cgo package does not load. Machine recorded, and the survivor/kill pair M6/M6b/M6c shows `PATH` and `CGO_ENABLED` are independently sufficient rather than redundant.
+- One call resolving while another in the same package does not, asserted by naming both — and the fixture turned out to carry the stronger form of the claim: `bad/` loads with an error, resolves its own `Helper`, and leaves `Missing` unresolved. `blocked/` never loads at all.
+- An expired context resolves nothing and says `deadline`, with a control proving the fixture resolves when the budget is intact.
 - `Resolve` has no error return, and nothing in the package returns one to a caller.
-- M1–M11 recorded with observed output; M3 recorded as a survivor with its reason.
+- A missing `go` binary is `no_toolchain`, not a boot failure and not a job failure (Open question 9).
+- M1–M19 recorded with observed output; M3 and M6 recorded as survivors with their reasons, M6 resolved by the M6b variant.
+
+**Carry-forwards this task owes Task 4**, each pinned by a test here rather than left as prose:
+
+1. **Hand `symbols.Parse` the raw `body`, never the stripped `src`** (`apps/indexer/cmd/main.go:486`). `Key` is a byte offset into the bytes on disk; stripping moves offsets and the failure is a silent collapse to zero resolutions. `TestResolutionKeysAreOffsetsIntoTheBytesOnDisk`.
+2. **Match a `Target` to a `Def` by containment, not by `StartLine`.** A target's line is the declaration's own token; a `Def`'s `StartLine` begins at its doc comment. `lib.One` in the `std` fixture is defined at 7..9 and resolves to line 9. `TestATargetsLineIsTheDeclarationNotItsDocComment`.
+3. **Boot with `exec.LookPath("go")` and pass the result as `Policy.GoBin`.** `Validate` refuses any other value with `ErrNoToolchain`, because the loader runs whatever the parent's `PATH` resolves.
+4. **`Stats.Reason` has six values, not five.** `policy` was added for a `Validate` failure that is not a missing toolchain; the counter's label set has to include it.
+5. **In proxy mode the module cache is written read-only and `os.RemoveAll` over the scratch directory fails.** Not reachable under the shipped default. Open question 10.
 
 ---
 
@@ -1343,7 +1383,7 @@ New section, in the register the existing README uses. It must say, in these ter
 - [ ] Definitions come from the AST, spelled by the same function that spells a span's symbol, with a live assertion that the two agree across a whole corpus.
 - [ ] Edges are attempted through `go/packages` with type information; where `types.Info.Uses` resolves a call to an object **that has a symbol row in this repository**, the edge is `resolved` and points at it; everywhere else it is `syntactic` with a null target, enforced by a CHECK constraint rather than by convention.
 - [ ] Provenance is per row. One repository carries both labels, and a fixture with two packages — one loadable, one not — pins it by naming an edge in each. No line of code copies a package-level fact onto a row.
-- [ ] The type-check runs inside the sandbox, on the job's own remaining budget, with an environment allowlist that a hostile parent environment cannot widen and that makes a recording proxy receive zero requests.
+- [x] The type-check runs inside the sandbox, on the job's own remaining budget, with an environment allowlist that a hostile parent environment cannot widen and that makes a recording proxy receive zero requests. *(Task 3. The zero is paired with a control that fetches, so it is evidence rather than an absence.)*
 - [ ] A type-check failure — missing toolchain, absent module, expired budget, disabled by knob — produces a complete graph of syntactic edges, a distinct counted reason, a log line, and a `done` job.
 - [ ] "Who calls this" is a recursive CTE that terminates on self-calls, cycles and diamonds, reports depth and call sites, and never traverses a name.
 - [ ] Approximate, name-matched callers are a separate labelled set at depth 1, with their own count.
@@ -1369,7 +1409,7 @@ Nothing here is blocking. Each is something the spec does not settle, with the t
    *Recommendation:* **they do not share identity.** Symbols carry their own `start_line`/`end_line` and link to a span by containment, nullable. Three reasons: a declaration longer than `MaxDeclLines` has no span with its range, so an identity-sharing design loses exactly the biggest declarations; span ids are `hash(repo, path, start, end, digest)` and therefore change when a body changes, which would make a symbol's identity change with its implementation; and the eval's window arm chunks the same file differently, so a shared identity would make the graph strategy-dependent. The cost is a deviation from §3's column list, recorded in the migration's comment.
 
 4. **What `go/packages` may reach.** §6 says type-checking "requires module downloads" and says nothing about from where — while §4's whole design is an allowlist of hosts, because the alternative is an SSRF.
-   *Recommendation:* **`GOPROXY=off` by default**, with `GOVCS=*:off`, `GOTOOLCHAIN=local`, `GOWORK=off`, `GOENV=off`, `CGO_ENABLED=0`, scratch-local `GOMODCACHE`/`GOCACHE`/`GOPATH`/`GOTMPDIR`, and an environment allowlist rather than an inherited environment. An operator can set `TYPECHECK_GOPROXY` to a proxy they trust; `direct` and any `,direct` fallback are refused, because that is the setting that turns a stranger's `require` line into an outbound `git` to a host of their choosing. The cost is stated plainly: with the default, only standard-library-only packages type-check, and everything else is honestly syntactic.
+   *Recommendation:* **`GOPROXY=off` by default**, with `GOVCS=*:off`, `GOTOOLCHAIN=local`, `GOWORK=off`, `GOENV=off`, **`GOPACKAGESDRIVER=off`**, `CGO_ENABLED=0`, scratch-local `GOMODCACHE`/`GOCACHE`/`GOPATH`/`GOTMPDIR`, and an environment allowlist rather than an inherited environment. (`GOPACKAGESDRIVER=off` was added in Task 3: without it `go/packages` runs a binary named `gopackagesdriver` found on the *operator's* `PATH` in place of the go command. Task 3 also found that the settings closed **by omission** — `GOFLAGS`, `GOPRIVATE`, `GOROOT`, `GOEXPERIMENT`, `GODEBUG`, `LD_PRELOAD`, `HTTPS_PROXY` — are the ones a mutation can be built against, and that naming them with a safe value would make the allowlist untestable.) An operator can set `TYPECHECK_GOPROXY` to a proxy they trust; `direct` and any `,direct` fallback are refused, because that is the setting that turns a stranger's `require` line into an outbound `git` to a host of their choosing. The cost is stated plainly: with the default, only standard-library-only packages type-check, and everything else is honestly syntactic.
 
 5. **What `pkg` means.** §3 lists the column and never defines it.
    *Recommendation:* the **package clause name** from the AST (`store`), not the import path. The import path needs a module-aware load, which is the thing that is allowed to fail; a column whose meaning depended on whether the type-check ran would be a per-package fact leaking into a per-row column, which is the failure §6 is written against. Two packages named `store` in one repository are distinguished by `path`. Revisit if a console needs import paths.
@@ -1387,13 +1427,13 @@ Nothing here is blocking. Each is something the spec does not settle, with the t
    *Recommendation:* probe with `exec.LookPath` at boot, log one line when it is absent, count `no_toolchain` per job, and **do not refuse to boot** — an indexer that cannot type-check still indexes, and refusing would make a missing toolchain worse than a syntactic graph. P8's image must include a toolchain, and the README says so, because the failure mode otherwise is CI resolving and production not, which is the silent downgrade §8 calls the failure that costs a week.
 
 10. **`go/packages` gives no hook to put its subprocess in a process group, and its cache is not covered by any cap.** P1 kills the whole process group on deadline; `packages.Load` runs `go list` through its own `exec.Command` and the plan cannot reach it. Separately, `MAX_REPO_BYTES` is measured on the clone, and `GOCACHE`/`GOMODCACHE` are written afterwards.
-    *Recommendation:* accept both for P4 and write them down. The blast radius is bounded in practice — the caches live under the job's scratch directory, which `runJob` removes and which the worker sweeps at boot and exit — but "bounded in practice" is not "enforced", and the honest form is a README line plus the `TYPECHECK=false` kill switch. Revisit by measuring cache growth over a real corpus; if it matters, the fix is a `du` check after the stage, matching the clone's, or a driver we fork ourselves.
+    *Recommendation:* accept both for P4 and write them down. **Measured in Task 3 and it changes the size of the second half:** with `NeedDeps` the only subprocess is `go list`, and the caches a job leaves behind are ~0.7MB rather than the ~92MB `-export=true` writes for a package importing `net/http`. A third item joins the list: in proxy mode the module cache is written **read-only**, so `runJob`'s `defer os.RemoveAll(dir)` fails with `permission denied` and the scratch directory leaks. Not reachable under the shipped default, where nothing is fetched. The blast radius is bounded in practice — the caches live under the job's scratch directory, which `runJob` removes and which the worker sweeps at boot and exit — but "bounded in practice" is not "enforced", and the honest form is a README line plus the `TYPECHECK=false` kill switch. Revisit by measuring cache growth over a real corpus; if it matters, the fix is a `du` check after the stage, matching the clone's, or a driver we fork ourselves.
 
 11. **Last-segment matching for `definition_of`.** P3's lexical arm reaches `Store.Get` through its parts, so a user who found a method by searching will type `Get`.
     *Recommendation:* exact by default, `suffix=true` to opt in, and the response says which match it made. A silent fallback would answer a different question than the one asked and would be indistinguishable in the payload. Revisit in P5 when the console knows what a user actually types.
 
 12. **Where the graph pass gets its bytes.** The chunker may read *stripped* source; `go/packages` reads from disk.
-    *Recommendation:* both, unchanged, with no `ParseFile` hook — because `StripDocs` blanks in place and preserves every byte offset and line number, so the two streams share a coordinate system. This is only true because of how stripping is implemented, so Task 1 pins it with a test and Task 3's comment names that test. If stripping ever deletes bytes, resolution silently collapses.
+    *Recommendation as written was wrong and Task 1 measured it so.* `StripDocs` removes the prose bytes and keeps only their line terminators: line numbers are invariant, **byte offsets are not**. The answer is still "both, unchanged, with no `ParseFile` hook", for a different reason — **the graph pass must parse the same bytes `go/packages` reads, which are the ones on disk**. That is a constraint on the *caller*, so a hook cannot enforce it; Task 3 pins it with `TestResolutionKeysAreOffsetsIntoTheBytesOnDisk`, which asserts that raw offsets hit and stripped ones do not, and Task 4 must pass the indexer's raw `body`.
 
 13. **Whether the repo view should carry graph counts.** §3 says nothing.
     *Recommendation:* yes — `symbols`, `edges`, `edges_resolved`, `edges_syntactic` on `GET /api/repos/:repo`. It is the only place a user can see how much of a repository's graph is precise, and it is an aggregate over a per-row column rather than a per-repo label. The risk to watch is a client treating the aggregate as the label, which is why the per-edge field exists in every caller row too.
@@ -1411,7 +1451,7 @@ Recorded so a reviewer sees them as findings rather than as choices made quietly
 - **§3's `symbols` row cannot cite a definition.** It has a `span_id` and no line range, and P2's `MaxDeclLines` sub-windowing means the largest declarations have no span of their own. Taken literally, the symbol table is uncitable for exactly the declarations most worth asking about. Task 2 adds the range and records the deviation.
 - **§3's `edges` row cannot cite a call site.** No path, no line. "Who calls this" would answer with a symbol name in a product whose first sentence promises `file:line`. Task 2 adds them.
 - **§3's `edges.kind` enum names `imports`, which the same row's `NOT NULL from_symbol_id` makes unwritable.** An import belongs to a file, not a definition, and `symbols` is defined as "one row per definition". One of the two has to give; P4 writes neither kind and says so rather than inventing a file-level pseudo-symbol.
-- **§6 says type-checking "requires module downloads" and §4 says the sandbox makes no network assumptions and admits only allowlisted hosts.** These are in direct tension, and §6 does not resolve it: the hosts a module download reaches are chosen by a stranger's `go.mod`, which is the exact shape of the SSRF §4's allowlist exists to refuse. This plan resolves it by defaulting the fetch off and making the resulting failure a first-class, counted outcome — which §6 already blesses. It is worth noticing that §6's own sentence ("its failure is expected rather than exceptional") is what makes the safe choice affordable.
+- **§6 says type-checking "requires module downloads" and §4 says the sandbox makes no network assumptions and admits only allowlisted hosts.** These are in direct tension, and §6 does not resolve it: the hosts a module download reaches are chosen by a stranger's `go.mod`, which is the exact shape of the SSRF §4's allowlist exists to refuse. This plan resolves it by defaulting the fetch off and making the resulting failure a first-class, counted outcome — which §6 already blesses. It is worth noticing that §6's own sentence ("its failure is expected rather than exceptional") is what makes the safe choice affordable. **Task 3 measured the cost of the other choice:** with the entry removed from the allowlist, the go command falls back to `https://proxy.golang.org,direct` and a fixture requiring `golang.org/x/mod` type-checks — the SSRF, executed.
 - **"It runs inside the same sandbox" describes a sandbox that is git-shaped.** P1's controls are `GIT_*` variables, a process group and a wall-clock deadline; none of them constrain a compiler. Running `go` on a stranger's tree adds cgo directives, `go.work` files, toolchain directives and a build cache to the threat surface, and each needs its own control. §6 assumes a sandbox that is more general than the one that exists.
 - **§11's counters still have nowhere to live in the indexer.** P3 recorded this; P4 adds four more instruments to the same gap. The indexer has no HTTP server, so job outcomes, admission rejections, evictions and now type-check outcomes are written and unscrapable. Giving the indexer a probe server is P0-shaped work and belongs in its own task rather than being smuggled in here.
 - **§8's tool list implies a graph API shape that §3's data model does not describe.** `definition_of` and `callers_of` are named as *tools*, with no routes, no parameters and no notion of depth or of what happens to a name that matches two definitions. Everything about the endpoint surface in Task 6 is a decision this plan made, and the open questions say which.

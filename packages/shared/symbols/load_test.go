@@ -307,7 +307,7 @@ func TestResolutionKeysAreOffsetsIntoTheBytesOnDisk(t *testing.T) {
 			strippedHits++
 		}
 	}
-	if strippedHits == resolved {
+	if resolved > 0 && strippedHits == resolved {
 		t.Errorf("stripped offsets hit as often as raw ones (%d), so a caller handing Parse stripped source would look fine", strippedHits)
 	}
 }
