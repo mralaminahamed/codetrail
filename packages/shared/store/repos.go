@@ -134,8 +134,9 @@ func (s *Store) NewerCommit(ctx context.Context, repoID string) (string, time.Ti
 // reads exactly this column, and PutRepo is the only other thing that winds it.
 //
 // The column is named for the query that was expected to be its only writer.
-// It now holds "last used", indexing included; renaming it is a migration and
-// a P3 concern, so the narrower name is left in place and written down here.
+// It holds "last used", indexing included. P3 gave it its reader — the gateway
+// touches on every successful read — and left the name alone: a rename is a
+// migration and a rewrite of every query that reads it, for a word.
 func (s *Store) TouchRepo(ctx context.Context, id string) error {
 	_, err := s.pool.Exec(ctx, `UPDATE repos SET last_queried_at = now() WHERE id = $1`, id)
 	return err

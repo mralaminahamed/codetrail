@@ -80,6 +80,13 @@ func NewCitation(r models.Repo, s models.Span, newer Newer, now time.Time) Citat
 	}
 }
 
+// NewStaleness is what a repository can claim about its own ref with no span to
+// cite — the repo view's version of the same sentence, from the same evidence,
+// so the two cannot word it differently.
+func NewStaleness(r models.Repo, newer Newer, now time.Time) Staleness {
+	return staleness(r, newer, now)
+}
+
 func staleness(r models.Repo, newer Newer, now time.Time) Staleness {
 	s := Staleness{
 		State: StaleUnknown,

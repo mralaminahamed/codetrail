@@ -387,3 +387,39 @@ func TestSubmitAcceptsAnOrdinaryRef(t *testing.T) {
 		}
 	}
 }
+
+// Every read endpoint is keyed on a repo id, and hash(key, commit) is
+// computable only by the indexer, which saw the commit. Without this field the
+// submit-then-poll flow cannot name what it produced, and the corpus listing is
+// a caller's only route to an id.
+func TestAFinishedJobNamesTheRepositoryItProduced(t *testing.T) {
+	q := &fakeQueue{job: jobs.Job{
+		ID: "job-1", Remote: "https://github.com/a/b", Ref: "main",
+		Status: jobs.StatusDone, RepoID: "9f2c1b0e",
+	}}
+	rec := do(router(q), http.MethodGet, "/api/jobs/job-1", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	// The value, not its presence: a constant would satisfy a non-empty check
+	// and would name the wrong repository.
+	if out["repo_id"] != "9f2c1b0e" {
+		t.Errorf("repo_id %v, want %q: %s", out["repo_id"], "9f2c1b0e", rec.Body)
+	}
+
+	// And a job that has not produced one says nothing rather than "". A fresh
+	// map, because Unmarshal merges into one that is not.
+	q.job.Status, q.job.RepoID = jobs.StatusLeased, ""
+	rec = do(router(q), http.MethodGet, "/api/jobs/job-1", "")
+	running := map[string]any{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &running); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := running["repo_id"]; ok {
+		t.Errorf("a running job names a repository: %s", rec.Body)
+	}
+}

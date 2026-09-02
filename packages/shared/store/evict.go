@@ -32,9 +32,10 @@ import (
 // column, so "least recently used" covers both ways a repo gets used — without
 // the second, runJob's eviction deletes the rows the same job just wrote.
 //
-// Nothing calls TouchRepo yet, since no endpoint reads a repo before P3, so
-// the column holds each repo's most recent index and the order is in practice
-// least-recently-indexed-first.
+// The gateway's read endpoints call TouchRepo on every successful read, so the
+// column now holds what its name says: a popular repository is no longer
+// evicted while it is being queried, which is what the order meant before there
+// was a reader to wind it.
 //
 // One column rather than GREATEST(last_queried_at, indexed_at), which would
 // rank identically — PutRepo sets indexed_at to now() on the same writes — but
