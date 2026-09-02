@@ -55,7 +55,10 @@ func repoIDFor(name string) string {
 // expected order *was* insertion order: it killed ORDER BY ASC and survived
 // deleting the ORDER BY altogether.
 //
-// Two rows share a clock reading, so the id tiebreak is exercised too.
+// Two rows share a clock reading, which is a corpus state PutRepo produces, but
+// the tiebreak is not what this test kills: measured, deleting the id from the
+// ORDER BY leaves it green, because Postgres returns this pair in id order
+// anyway. The test below is where that key is asserted.
 func TestListReposIsMostRecentlyUsedFirstLive(t *testing.T) {
 	ctx := context.Background()
 	names := []string{"lru-one", "lru-two", "lru-three", "lru-four"}
@@ -149,6 +152,54 @@ func TestListReposIsMostRecentlyUsedFirstLive(t *testing.T) {
 	}
 	if len(short) != 1 {
 		t.Fatalf("limit 1 returned %d rows", len(short))
+	}
+}
+
+// The id tiebreak, on a corpus where every row ties. PutRepo stamps
+// last_queried_at from now() once per transaction, so a batch indexed inside
+// one clock tick is exactly this shape, and without a second key two listings
+// of it may disagree.
+//
+// Six rows rather than two: with a single sort key Postgres may return a tied
+// pair in either order, and a two-row fixture that happens to come back in id
+// order proves nothing. Six do not land in id order by accident.
+func TestListReposBreaksAClockTieByIdLive(t *testing.T) {
+	ctx := context.Background()
+	names := []string{"tie-a", "tie-b", "tie-c", "tie-d", "tie-e", "tie-f"}
+	ids := make([]string, len(names))
+	name := make(map[string]string, len(names))
+	for i, n := range names {
+		ids[i] = repoIDFor(n)
+		name[ids[i]] = n
+	}
+	s := fresh(t, ids...)
+	for _, n := range names {
+		seedReadRepo(t, s, n, []string{"a.go"}, 1)
+	}
+	tick := time.Now().UTC().Truncate(time.Microsecond)
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE repos SET last_queried_at = $2 WHERE id = ANY($1)`, ids, tick); err != nil {
+		t.Fatal(err)
+	}
+
+	want := slices.Clone(names)
+	slices.SortFunc(want, func(a, b string) int { return strings.Compare(repoIDFor(a), repoIDFor(b)) })
+	if slices.Equal(want, names) {
+		t.Fatal("fixture: id order is insertion order, so this asserts nothing")
+	}
+
+	rows, err := s.ListRepos(ctx, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, 0, len(names))
+	for _, r := range rows {
+		if n, ok := name[r.ID]; ok {
+			got = append(got, n)
+		}
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("a corpus indexed inside one clock tick listed %v, want id order %v", got, want)
 	}
 }
 
