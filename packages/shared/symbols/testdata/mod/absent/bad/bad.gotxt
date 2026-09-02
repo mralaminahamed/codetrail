@@ -1,0 +1,7 @@
+package bad
+
+import "example.com/nope/thing"
+
+func Helper() int { return 2 }
+
+func Use() int { return Helper() + thing.Missing() }

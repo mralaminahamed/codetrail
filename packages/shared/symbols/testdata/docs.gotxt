@@ -1,0 +1,14 @@
+package docs
+
+import "errors"
+
+// Parse turns bytes into an error and nothing else.
+//
+// The doc comment is three lines so the range it adds is load-bearing.
+func Parse(src []byte) error {
+	if len(src) == 0 {
+		return errors.New("empty")
+	}
+	_ = src
+	return nil
+}

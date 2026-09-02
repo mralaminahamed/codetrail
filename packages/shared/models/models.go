@@ -81,3 +81,81 @@ type Cite struct {
 	Span
 	Score float32 `json:"score"`
 }
+
+// Provenance is how much an edge knows about its own target. It is a per-row
+// property, not a per-repo one (spec:190): the edge set comes from the AST and
+// type information only ever upgrades individual rows, so one repository whose
+// packages type-check unevenly carries both labels.
+type Provenance string
+
+const (
+	// ProvenanceResolved: the type-checker named an object and that object has
+	// a symbol row in this repository, so ToSymbolID points at it.
+	ProvenanceResolved Provenance = "resolved"
+	// ProvenanceSyntactic: the target is null. The edge knows it calls
+	// something named Close and cannot say which one (spec:84). A call that
+	// resolves outside the corpus — fmt.Println — is this, not resolved,
+	// because there is no symbol row to point at.
+	ProvenanceSyntactic Provenance = "syntactic"
+)
+
+// Provenances is the whole range, exported so a test can pin the set.
+var Provenances = []Provenance{ProvenanceResolved, ProvenanceSyntactic}
+
+// EdgeKind is what one symbol does to another. Spec §3's closed set; P4 writes
+// only EdgeCalls. EdgeImports is unwritable under this schema — an import
+// belongs to a file, not to a definition, and FromSymbolID is NOT NULL — and
+// EdgeReferences is a volume decision to make with a measured row count.
+type EdgeKind string
+
+const (
+	EdgeCalls      EdgeKind = "calls"
+	EdgeImports    EdgeKind = "imports"
+	EdgeReferences EdgeKind = "references"
+)
+
+// EdgeKinds is the whole range, exported so a test can pin the set.
+var EdgeKinds = []EdgeKind{EdgeCalls, EdgeImports, EdgeReferences}
+
+// Symbol is one top-level definition, from the AST.
+//
+// StartLine and EndLine are the definition's own, not its span's, and they are
+// what makes it citable: the chunker sub-windows a declaration longer than
+// MaxDeclLines, so the largest declarations have no span with their range and
+// a symbol locatable only through SpanID would be uncitable for exactly the
+// definitions most worth asking about.
+//
+// SpanID is the span containing the definition's first line, or empty when
+// there is none. Empty means SQL NULL; a span id is never the empty string.
+type Symbol struct {
+	ID        string   `json:"id"`
+	RepoID    string   `json:"repo_id"`
+	FileID    string   `json:"file_id"`
+	Path      string   `json:"path"`
+	Name      string   `json:"name"`
+	Pkg       string   `json:"pkg"`
+	Kind      SpanKind `json:"kind"`
+	StartLine int      `json:"start_line"`
+	EndLine   int      `json:"end_line"`
+	SpanID    string   `json:"span_id,omitempty"`
+}
+
+// Edge is one call site: the definition it is in, the name it calls, where it
+// is, and how much is known about what it means.
+//
+// ToSymbolID is empty for a syntactic edge, which is SQL NULL. The pair with
+// Provenance is a CHECK constraint in the schema as well as a check in
+// PutGraph, because an edge that claims to be resolved while pointing nowhere
+// claims a precision no column records.
+type Edge struct {
+	ID           string     `json:"id"`
+	RepoID       string     `json:"repo_id"`
+	FromSymbolID string     `json:"from_symbol_id"`
+	ToSymbolID   string     `json:"to_symbol_id,omitempty"`
+	ToName       string     `json:"to_name"`
+	Kind         EdgeKind   `json:"kind"`
+	Provenance   Provenance `json:"provenance"`
+	// Path and Line are the call site's, so a caller row can cite file:line.
+	Path string `json:"path"`
+	Line int    `json:"line"`
+}

@@ -52,27 +52,45 @@ func (s *Store) ListRepos(ctx context.Context, limit int) ([]RepoRow, error) {
 	return out, rows.Err()
 }
 
-// Stats is what a repo view can say about coverage. Three numbers rather than a
-// ratio: chunk.Chunks drops token-less regions, so a repo's span count is not
-// derivable from its file count and any single "coverage" figure would be
-// inventing the relationship between them.
+// Stats is what a repo view can say about coverage. Separate numbers rather
+// than a ratio: chunk.Chunks drops token-less regions, so a repo's span count
+// is not derivable from its file count and any single "coverage" figure would
+// be inventing the relationship between them.
+//
+// The provenance split is an aggregate over a per-row column, not a per-repo
+// label (spec:190). It is the only place a user can see that three packages
+// resolved and two did not; the label itself stays on the edge, and every
+// caller row carries it too so a client cannot mistake the summary for it.
 type Stats struct {
 	Files          int
 	Spans          int
 	FilesWithSpans int
+	Symbols        int
+	Edges          int
+	EdgesResolved  int
+	EdgesSyntactic int
 }
 
 // RepoStats counts what one repository actually holds, rather than reading
 // repos.file_count: PutRepo upserts and never deletes, so after a re-index that
 // produced fewer files the column disagrees with the rows. The rows are what
 // retrieval searches.
+// Each provenance is counted by its own predicate rather than one as the
+// total minus the other: spec §6's open question 8 wants a third label for a
+// call that resolves outside the corpus, and a subtraction would file it under
+// syntactic without anything looking wrong.
 func (s *Store) RepoStats(ctx context.Context, repoID string) (Stats, error) {
 	var st Stats
 	err := s.pool.QueryRow(ctx, `
 		SELECT (SELECT count(*) FROM files WHERE repo_id = $1),
 		       (SELECT count(*) FROM spans WHERE repo_id = $1),
-		       (SELECT count(DISTINCT file_id) FROM spans WHERE repo_id = $1)`,
-		repoID).Scan(&st.Files, &st.Spans, &st.FilesWithSpans)
+		       (SELECT count(DISTINCT file_id) FROM spans WHERE repo_id = $1),
+		       (SELECT count(*) FROM symbols WHERE repo_id = $1),
+		       (SELECT count(*) FROM edges WHERE repo_id = $1),
+		       (SELECT count(*) FROM edges WHERE repo_id = $1 AND provenance = 'resolved'),
+		       (SELECT count(*) FROM edges WHERE repo_id = $1 AND provenance = 'syntactic')`,
+		repoID).Scan(&st.Files, &st.Spans, &st.FilesWithSpans,
+		&st.Symbols, &st.Edges, &st.EdgesResolved, &st.EdgesSyntactic)
 	return st, err
 }
 

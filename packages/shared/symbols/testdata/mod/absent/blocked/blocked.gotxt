@@ -1,0 +1,7 @@
+//go:build codetrail_never
+
+package blocked
+
+func Helper() int { return 3 }
+
+func Use() int { return Helper() }

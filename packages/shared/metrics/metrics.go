@@ -49,6 +49,32 @@ var (
 		Help: "Refusals by reason: no_spans, below_floor or unscored.",
 	}, []string{"reason"})
 
+	// graphEdges is the phase's headline claim as a series: how much of the
+	// corpus's call graph is precise. Per edge and by label, never per job —
+	// a total would say nothing about the split, which is the only thing this
+	// counter exists to show.
+	graphEdges = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "codetrail_graph_edges_total",
+		Help: "Call edges written, by provenance: resolved or syntactic.",
+	}, []string{"provenance"})
+
+	// typechecks counts job outcomes, not edges. A repository whose edges are
+	// all syntactic because no toolchain is installed and one whose code has
+	// no in-repo calls look identical in graphEdges; this is what tells them
+	// apart.
+	typechecks = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "codetrail_typecheck_total",
+		Help: "Type-check outcomes, one per job, by reason.",
+	}, []string{"reason"})
+
+	// Wider than DefBuckets' 10s ceiling: the stage runs a compiler's front
+	// end over a stranger's repository and shares the job's whole budget.
+	typecheckSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "codetrail_typecheck_seconds",
+		Help:    "Time the type-check stage took, whatever its outcome.",
+		Buckets: prometheus.ExponentialBuckets(0.05, 2, 12),
+	})
+
 	// Two gauges rather than one, so a dashboard shows a guess as a guess.
 	// Spec:315 puts the number in P6; until then the value is -1 and
 	// calibrated is 0, and an operator can see both without reading the code.
@@ -61,6 +87,15 @@ var (
 		Name: "codetrail_score_floor_calibrated",
 		Help: "1 when the score floor was measured, 0 when it is a placeholder. It is 0 until P6 measures one.",
 	})
+)
+
+// GraphProvenances and TypecheckReasons are the graph counters' whole
+// vocabularies, exported so a test can pin them against models.Provenances and
+// symbols' reason constants. Written out rather than imported: symbols pulls in
+// go/packages, and the gateway links this package.
+var (
+	GraphProvenances = []string{"resolved", "syntactic"}
+	TypecheckReasons = []string{"ok", "disabled", "no_toolchain", "no_module", "load_error", "deadline", "policy"}
 )
 
 // The label sets are closed, and these are their whole vocabularies — rag's
@@ -81,6 +116,12 @@ func init() {
 	}
 	for _, reason := range []string{"no_spans", "below_floor", "unscored"} {
 		refusals.WithLabelValues(reason)
+	}
+	for _, p := range GraphProvenances {
+		graphEdges.WithLabelValues(p)
+	}
+	for _, reason := range TypecheckReasons {
+		typechecks.WithLabelValues(reason)
 	}
 }
 
@@ -111,6 +152,18 @@ func ObserveTopScore(v float64) {
 func CountAnswer(outcome string) { answers.WithLabelValues(outcome).Inc() }
 
 func CountRefusal(reason string) { refusals.WithLabelValues(reason).Inc() }
+
+// CountGraph counts one written edge by its provenance, CountTypecheck one
+// job's type-check by why it stopped, and ObserveTypecheck how long that took.
+//
+// Three instruments because they answer three questions an operator asks
+// separately: how precise is the corpus, why is it not more precise, and what
+// does the precision cost.
+func CountGraph(provenance string) { graphEdges.WithLabelValues(provenance).Inc() }
+
+func CountTypecheck(reason string) { typechecks.WithLabelValues(reason).Inc() }
+
+func ObserveTypecheck(d time.Duration) { typecheckSeconds.Observe(d.Seconds()) }
 
 // SetFloor publishes the floor an operator is running with and whether anyone
 // measured it. Called at boot, so the pair is on the dashboard before the
