@@ -142,7 +142,7 @@ Each of these is a constraint on the design, not context.
 - **Tasks 1, 2 and 5 are independent** and can be worked in parallel from `trunk`.
   - Task 1 creates `packages/shared/symbols` (AST only, no database, no `go/packages`) and moves one function in `chunk`.
   - Task 2 creates the migration, the models and `store.PutGraph`.
-  - Task 5 creates `packages/shared/store/graph.go` — the reads. It depends on Task 2's *schema* but not on its writer; work it against the migration once Task 2's migration file lands, or write the migration in whichever task lands first and rebase the other onto it.
+  - Task 5 creates `packages/shared/store/graph_read.go` — the reads. (Task 5's own file list says `graph_read.go` and this line said `graph.go`, which is Task 2's writer; corrected once Task 2 landed and took that name.) It depends on Task 2's *schema* but not on its writer; work it against the migration once Task 2's migration file lands, or write the migration in whichever task lands first and rebase the other onto it.
 - **Task 3** (the sandboxed type-check) depends on Task 1 for the call-site keys.
 - **Task 4** (indexer wiring) depends on 1, 2 and 3.
 - **Task 6** (gateway endpoints) depends on 5.
@@ -348,123 +348,150 @@ weaker claim, it is an empty one."
 - **`symbols` carries `start_line`/`end_line`.** Same reason, same deviation: §3's list would make a definition citable only through its span, and the sub-window hole means the biggest declarations have none.
 - **Ids include what makes the row unique and nothing else.** `SymbolID = hash(repo, path, start, kind, name)`: a file has one declaration starting at a given line, and `kind`/`name` are carried so that two declarations sharing a start line (`type A int; type B int` on one line is legal) do not collide. `EdgeID = hash(repo, from, path, offset, to_name)`: the offset is the call site, which is why Task 1 records it.
 
-- [ ] **Step 1: Verify the DDL against the pinned image before writing the migration**
+- [x] **Step 1: Verify the DDL against the pinned image before writing the migration**
 
-Against `pgvector/pgvector:pg17`, and **paste the output into the commit message**:
+Run against `pgvector/pgvector:pg17` before the migration was written, and the output is in the commit message. Two of the four probes behaved as the plan said and **the three-valued-logic check did not**:
 
-```sql
--- the pair constraint must be accepted, and must actually refuse:
-CREATE TEMP TABLE e (to_symbol_id TEXT, provenance TEXT,
-  CONSTRAINT pair CHECK ((to_symbol_id IS NOT NULL) = (provenance = 'resolved')));
-INSERT INTO e VALUES (NULL, 'resolved');   -- expect: violates check constraint
-INSERT INTO e VALUES ('x',  'syntactic');  -- expect: violates check constraint
-INSERT INTO e VALUES (NULL, 'syntactic');  -- expect: 1 row
-INSERT INTO e VALUES ('x',  'resolved');   -- expect: 1 row
--- and the partial index the approximate reader uses:
-EXPLAIN SELECT 1 FROM edges WHERE repo_id = 'r' AND to_name = 'Get' AND to_symbol_id IS NULL;
+```
+INSERT INTO e VALUES (NULL, 'resolved');   ERROR: violates check constraint "pair" (null, resolved)
+INSERT INTO e VALUES ('x',  'syntactic');  ERROR: violates check constraint "pair" (x, syntactic)
+INSERT INTO e VALUES (NULL, 'syntactic');  INSERT 0 1
+INSERT INTO e VALUES ('x',  'resolved');   INSERT 0 1
+INSERT INTO e VALUES (NULL, NULL);         INSERT 0 1   <- accepted
+INSERT INTO e VALUES ('x',  NULL);         INSERT 0 1   <- accepted
 ```
 
-Record what the `NULL = NULL` case does: the constraint's left side is `to_symbol_id IS NOT NULL`, which is never NULL, so there is no three-valued-logic hole — **verify that rather than assuming it**, because a CHECK that evaluates to NULL passes.
+> **PLAN DEFECT — the hole is real, and it is on the side the plan did not look at.** The plan reasoned that "the constraint's left side is `to_symbol_id IS NOT NULL`, which is never NULL, so there is no three-valued-logic hole". The left side is indeed never NULL. The **right** side is: `provenance = 'resolved'` evaluates to NULL when `provenance` is NULL, the equality is then NULL, and a CHECK evaluating to NULL passes. Both `(NULL, NULL)` and `('x', NULL)` were accepted. `provenance TEXT NOT NULL` is what closes it — verified the same way, both rows then refused with `null value in column "provenance" ... violates not-null constraint` — and `TestTheSchemaRefusesAnEdgeWithNoProvenanceLive` plus M14 pin it. The enum values are a CHECK too (`kind IN (…)`, `provenance IN (…)`), because the pair constraint alone accepts `provenance = 'guessed'` beside a null target.
 
-- [ ] **Step 2: Write the failing live tests**
+Also measured, each one a comment in the migration only because the counterfactual was run first:
 
-Every live suite in `store` is `package store` (external test packages cannot reach `s.pool`, and several of these fixtures need direct `INSERT`s that `PutGraph` cannot produce). Follow `store_live_test.go`'s `TestMain` verbatim.
+- **The lock claim is true.** Reading `pg_locks` inside the migration's own transaction: each FK-bearing `CREATE TABLE` takes `ShareRowExclusiveLock` (plus `AccessShareLock`) on `repos`, `files` and `spans`.
+- **`ON DELETE SET NULL` on `to_symbol_id` would fail the delete, not orphan it:** `ERROR: new row for relation "eg" violates check constraint "pair" … CONTEXT: SQL statement "UPDATE ONLY … SET "to_symbol_id" = NULL …"`. Cascade is the only option consistent with the invariant, as the plan said, and now for a reason that was executed.
+- **The partial index is used:** `Index Only Scan using edges_approx_idx … Index Cond: ((repo_id = 'r1') AND (to_name = 'Get'))` — with `enable_seqscan = off`, since the probe table held two rows.
+- **One `DELETE FROM repos` leaves 0 symbols and 0 edges.**
 
-```go
-func TestPutGraphWritesSymbolsAndEdges(t *testing.T)
-func TestPutGraphReplacesAnEarlierGraphForTheSameRepo(t *testing.T)   // fewer edges the second time
-func TestPutGraphIsIdempotentAcrossTwoIdenticalRuns(t *testing.T)     // identical ids, identical rows
-func TestPutGraphLeavesAnotherReposGraphAlone(t *testing.T)           // two repos
-func TestPutGraphRefusesARowFromAnotherRepo(t *testing.T)
-func TestPutGraphNamesTheEdgeWhoseProvenanceAndTargetDisagree(t *testing.T)
-func TestTwoCallsOnOneLineAreTwoRows(t *testing.T)                    // the EdgeID key
-func TestARerunUpgradesASyntacticEdgeToResolved(t *testing.T)         // the DO NOTHING trap
-func TestTheSchemaRefusesAResolvedEdgeWithNoTargetLive(t *testing.T)  // direct INSERT
-func TestTheSchemaRefusesASyntacticEdgeWithATargetLive(t *testing.T)  // direct INSERT
-func TestEvictingARepoTakesItsGraphWithIt(t *testing.T)               // the cascade Evict's comment promises
-func TestReplacingASpanLeavesTheSymbolWithANullLink(t *testing.T)     // ON DELETE SET NULL
-```
+- [x] **Step 2: Write the failing live tests**
 
-`TestEvictingARepoTakesItsGraphWithIt` is the one that would otherwise be nobody's job: `Evict`'s doc comment already promises "whatever P3's symbol graph adds by declaring the same reference", and a `REFERENCES repos(id)` written without `ON DELETE CASCADE` fails eviction with a foreign-key violation rather than orphaning — which is a *different* bug and a different message. Assert the row counts, not the absence of an error.
+As listed, plus four the mutation round earned: `TestADuplicateCallSiteInOneWriteKeepsTheResolvedLabelLive` and `TestADuplicateSymbolInOneWriteKeepsTheLastRowLive` (the only fixtures that reach `ON CONFLICT` at all — see M1), `TestTheSchemaRefusesAnEdgeWithNoProvenanceLive` (the hole above), and `TestTheSchemaRefusesAKindOrProvenanceOutsideTheSetLive` (§3's two closed sets). `TestMigration0010AppliesToAPopulatedDatabaseTwiceLive` follows P3's shape: drop both tables, seed real `repos`/`files`/`spans` rows, run the body twice, and write graph rows *between* the runs so a migration that dropped and re-created its tables would erase them while still applying cleanly. `store_live_test.go`'s `TestSchemaShapeLive` grows both tables' column lists.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
-`0010_symbol_graph.sql` — every statement `IF NOT EXISTS`, no `CONCURRENTLY` (the ledger runs in one transaction under `pg_advisory_xact_lock`), and a header comment recording that the two FK-bearing `CREATE TABLE`s take a `SHARE ROW EXCLUSIVE` lock on `repos`, `files` and `spans` for the length of the migration, which is what "safe on a populated database" costs here.
+`0010_symbol_graph.sql`, `packages/shared/store/graph.go`, and `models.Symbol`/`models.Edge`/`Provenance`/`EdgeKind`. `Evict`'s doc comment said "whatever P3's symbol graph adds" and `store.go`'s package doc said "(from P3) the symbol graph"; the symbol graph is P4 and both were corrected in the same commit.
 
-- [ ] **Step 4: Commit, then prove the tests discriminate**
+> **A third deviation from §3, which Open question 6 does not list: `symbols.path`.** It is denormalised beside `file_id` exactly as `spans.path` already is, `SymbolID` hashes it (the plan's own signature says so), and without it Task 5's `Caller` cannot cite a definition without joining `files`. Recorded in the migration header with the other two.
+
+- [x] **Step 4: Commit, then prove the tests discriminate**
+
+Fifteen mutations, all fifteen killed, each with the observed message rather than the prediction. M1 is the plan's own predicted survivor and it survived the fixture the plan named; the fixture that kills it is new.
 
 **M1 — `ON CONFLICT (id) DO UPDATE` → `DO NOTHING` on the edge insert.**
 - *Why the code exists:* ids are deterministic, so the second run's rows collide with the first's by design; `DO NOTHING` keeps the older row's `provenance` and `to_symbol_id`.
-- *Fixture that separates mutant from original:* `TestARerunUpgradesASyntacticEdgeToResolved` — the same repo written twice, syntactic then resolved, **with the delete-then-insert path defeated in the test by writing through a path that keeps the row**. Verify this: with the wholesale `DELETE` in place, the second insert has nothing to conflict with and the mutant survives. If it does, the honest fix is to record M1 as a survivor *of the delete*, and to note that `DO NOTHING` is only reachable if the delete is ever narrowed — then keep the mutation as a pair with M2.
-- *Must fail:* `TestARerunUpgradesASyntacticEdgeToResolved`
-- *Expected (verify and correct):* `edge a->Get is syntactic after the second write, want resolved` — **or a survivor; run it before believing either.**
+- *Fixture that separates mutant from original:* **not** `TestARerunUpgradesASyntacticEdgeToResolvedLive` — the plan's warning was right and is now measured: with the wholesale `DELETE` in place the second write has nothing to conflict with, and that test **passes under the mutant**. The fixture that separates them is `TestADuplicateCallSiteInOneWriteKeepsTheResolvedLabelLive`: two rows for one call site *inside one write*, syntactic then resolved, which is the shape a type-check pass produces if it appends its upgrades. The deletes cannot help there.
+- *Must fail:* `TestADuplicateCallSiteInOneWriteKeepsTheResolvedLabelLive`
+- *Observed — killed:* `edge ee66acefb238092c97e5458881139976 read back as {… ToSymbolID: … Provenance:syntactic …}, want {… ToSymbolID:526348350e3e3e260ac75655c5a8bb80 … Provenance:resolved …}`. The rerun test passed in the same run, which is the survivor recorded as a survivor.
 - *Compiles and vets:* yes.
 
 **M2 — the two `DELETE`s dropped (the writer becomes insert-only).**
 - *Why the code exists:* re-indexing must converge, and a graph that only grows keeps edges from a call site that has since been deleted.
-- *Fixture that separates mutant from original:* `TestPutGraphReplacesAnEarlierGraphForTheSameRepo`, whose second write has **fewer** edges than the first. A second write with the same or more edges cannot see this.
-- *Must fail:* `TestPutGraphReplacesAnEarlierGraphForTheSameRepo`
-- *Expected (verify and correct):* `repo has 5 edges after the second write, want 3`
+- *Fixture that separates mutant from original:* `TestPutGraphReplacesAnEarlierGraphForTheSameRepoLive`, whose second write has **fewer** edges than the first.
+- *Must fail:* `TestPutGraphReplacesAnEarlierGraphForTheSameRepoLive`
+- *Observed — killed:* `unexpected edge to Println at a.go:8 (b085523c…), provenance syntactic` and `unexpected edge to Close at a.go:4 (d8a861d4…), provenance syntactic`. The assertion names *which* edges outlived their call sites; a count would have said "3, want 1" and left a reader guessing.
 - *Compiles and vets:* yes.
 
 **M3 — the deletes lose their repo scope (`WHERE repo_id = $1 OR TRUE`).**
 - *Why the code exists:* the corpus holds up to `KEEP_REPOS` repositories and each is written independently.
-- *Fixture that separates mutant from original:* `TestPutGraphLeavesAnotherReposGraphAlone`, which writes repo B **first** and asserts B's rows survive a write to A. Written the other way round it proves nothing.
-- *Must fail:* `TestPutGraphLeavesAnotherReposGraphAlone`
-- *Expected (verify and correct):* `repo B has 0 symbols after writing repo A, want 2`
-- *Compiles and vets:* yes, and `$1` stays bound — deleting the clause outright is the void mutation P1 shipped twice.
+- *Fixture that separates mutant from original:* `TestPutGraphLeavesAnotherReposGraphAloneLive`, which writes repo B **first**, with a symbol of the *same name* as A's and *more* edges than A has.
+- *Must fail:* `TestPutGraphLeavesAnotherReposGraphAloneLive`
+- *Observed — killed:* `symbol c10b1d31… (Store.Get a.go:3) is not in the table`, `symbol f1183aec… (Caller a.go:7) is not in the table`, and all three of B's edges likewise.
+- *Compiles and vets:* yes, and `$1` stays bound.
 
 **M4 — `SymbolID` drops `start` from the hash.**
-- *Why the code exists:* a name is not unique in a file — two `init()` functions in one file are legal, and so is the same method name on two types.
-- *Fixture that separates mutant from original:* `twoget`-shaped rows: `Store.Get` and `Cache.Get` are different names, so they do **not** separate this; the fixture needs **two `init` functions in one file**, or the same name at two start lines. Add it — as listed, no test in this task can kill M4.
-- *Must fail:* `TestPutGraphWritesSymbolsAndEdges` once its fixture holds two `init`s.
-- *Expected (verify and correct):* `wrote 3 symbols, read back 2`
+- *Why the code exists:* a name is not unique in a file — two `init()` functions in one file are legal.
+- *Fixture that separates mutant from original:* the plan was right that nothing in its own list could kill this. `TestPutGraphWritesSymbolsAndEdgesLive`'s fixture is **two `init` functions in one file** plus `Store.Get`, and it asserts the two ids are distinct in the test body before it asserts anything about rows.
+- *Must fail:* `TestPutGraphWritesSymbolsAndEdgesLive`
+- *Observed — killed:* `both init definitions hash to 89570713042d5dc907dd61217cbdf21a: a symbol id that drops the start line cannot tell two same-named declarations in one file apart`. The row-level assertion is a second, independent kill: the surviving row keeps `start_line 3` where the fixture's second `init` wants 7.
 - *Compiles and vets:* yes.
 
-**M5 — `EdgeID` uses the line instead of the offset.**
+**M5 — `EdgeID` no longer separates two calls in one declaration (the offset dropped from the hash).**
 - *Why the code exists:* two calls on one line are two edges, and the id is what makes them two rows.
-- *Fixture that separates mutant from original:* `TestTwoCallsOnOneLineAreTwoRows`, whose fixture is `a(b(), b())`. Every other fixture has one call per line.
-- *Must fail:* `TestTwoCallsOnOneLineAreTwoRows`
-- *Expected (verify and correct):* `repo has 1 edge to b, want 2`
-- *Compiles and vets:* yes.
+- *Plan defect, minor:* the mutation as written — "`EdgeID` uses the line instead of the offset" — cannot be spelled inside the function under test, because `EdgeID` takes the offset as a parameter and never sees a line. Dropping the offset from the hash is the same behaviour for the fixture that matters and is a one-token edit.
+- *Fixture that separates mutant from original:* `TestTwoCallsOnOneLineAreTwoRowsLive`, whose fixture is `a(b(), b())`. Every other fixture has one call per line.
+- *Must fail:* `TestTwoCallsOnOneLineAreTwoRowsLive`
+- *Observed — killed:* `both calls to b on line 4 hash to e39084ab0dd0ced877d395996e47bd6f: an edge id keyed on the line cannot tell two calls on one line apart`.
+- *Compiles and vets:* yes — `strconv` keeps its other use in `SymbolID`, so nothing is left unimported.
 
 **M6 — the Go-side provenance/target check deleted.**
 - *Why the code exists:* it turns a constraint violation on an anonymous row into an error naming the edge.
-- *Fixture that separates mutant from original:* `TestPutGraphNamesTheEdgeWhoseProvenanceAndTargetDisagree`, which asserts the error **mentions the edge's `to_name` and its call site**, not merely that an error happened. An assertion of `err != nil` passes under the mutant, because the constraint still fires — this is precisely the "assert which reason, not that it failed" rule.
-- *Must fail:* `TestPutGraphNamesTheEdgeWhoseProvenanceAndTargetDisagree`
-- *Expected (verify and correct):* `error was "ERROR: new row for relation \"edges\" violates check constraint \"edges_provenance_target\"", want it to name the edge`
+- *Fixture that separates mutant from original:* `TestPutGraphNamesTheEdgeWhoseProvenanceAndTargetDisagreeLive`, which asserts the error **names the edge's `to_name`, its call site and its label**.
+- *Must fail:* `TestPutGraphNamesTheEdgeWhoseProvenanceAndTargetDisagreeLive`
+- *Observed — killed, six assertions across two sub-tests:* `error "edges 0-0: ERROR: new row for relation \"edges\" violates check constraint \"edges_provenance_target\" (SQLSTATE 23514)" does not name "Get"` / `"a.go:8"` / `"resolved"`, and the same three for the syntactic-with-a-target case. This is the rule in one screenful: `err != nil` passes under the mutant, because the constraint still fires.
 - *Compiles and vets:* yes.
 
 **M7 — the CHECK constraint dropped from the migration.**
 - *Why the code exists:* it is §3's invariant, made true by construction rather than by convention.
-- *Fixture that separates mutant from original:* the two direct-`INSERT` tests, which do not go through `PutGraph` at all. Nothing that writes through `PutGraph` can see this, because M6's Go check refuses first — which is why both exist.
-- *Must fail:* `TestTheSchemaRefusesAResolvedEdgeWithNoTargetLive` and `TestTheSchemaRefusesASyntacticEdgeWithATargetLive`
-- *Expected (verify and correct):* `INSERT succeeded, want a check constraint violation`
-- *Compiles and vets:* yes — it is a migration edit; note that the live suite creates a fresh database per run so the ledger re-runs from empty and the mutated file takes effect. **Verify that**: if the suite reuses a database, the mutation is invisible and the mutation is void.
+- *Fixture that separates mutant from original:* the direct-`INSERT` tests, which do not go through `PutGraph` at all.
+- *Must fail:* `TestTheSchemaRefusesAResolvedEdgeWithNoTargetLive`, `TestTheSchemaRefusesASyntacticEdgeWithATargetLive`, `TestMigration0010AppliesToAPopulatedDatabaseTwiceLive`
+- *Observed — killed:* `the INSERT succeeded, want violates check constraint "edges_provenance_target"` twice, and `run 1: a resolved edge with no target was accepted` / `run 2: …` from the migration test.
+- *Compiles and vets:* yes. **And the plan's "verify that" is verified:** the mutated migration took effect, so `testdb` does create a database per run and the ledger does re-run from empty — the mutation is not invisible.
 
 **M8 — `symbols.repo_id` declared without `ON DELETE CASCADE`.**
-- *Why the code exists:* spec §3 — "Eviction is one `DELETE`" — and `Evict`'s doc comment names this as a contract P4 must join.
-- *Fixture that separates mutant from original:* `TestEvictingARepoTakesItsGraphWithIt`. Note the failure shape flips: without the cascade, eviction **errors** rather than orphaning, so assert on `Evict`'s error *and* the row counts.
-- *Must fail:* `TestEvictingARepoTakesItsGraphWithIt`
-- *Expected (verify and correct):* `Evict returned "update or delete on table \"repos\" violates foreign key constraint … on table \"symbols\""`
+- *Why the code exists:* spec §3 — "Eviction is one `DELETE`".
+- *Fixture that separates mutant from original:* `TestEvictingARepoTakesItsGraphWithItLive`, which asserts `Evict` returns no error *and* the row counts, for both the evicted repo and a kept one.
+- *Must fail:* `TestEvictingARepoTakesItsGraphWithItLive`
+- *Observed — killed:* `Evict returned ERROR: update or delete on table "repos" violates foreign key constraint "symbols_repo_id_fkey" on table "symbols" (SQLSTATE 23503): eviction is one DELETE and the graph has to go with it, not block it`.
+- *Prediction that was wrong, recorded:* this task predicted M8 would **survive**, on the reasoning that `symbols.file_id`'s cascade would delete the rows before `symbols.repo_id`'s NO ACTION check ran. It does not: Postgres raises the FK violation regardless of the other cascade. The plan's expected message was right and the prediction against it was wrong.
 - *Compiles and vets:* yes.
 
 **M9 — `span_id` declared `ON DELETE CASCADE` instead of `SET NULL`.**
 - *Why the code exists:* `PutSpans` deletes a repo's spans on every re-index; a cascade would delete the repo's symbols as a side effect of re-chunking.
-- *Fixture that separates mutant from original:* `TestReplacingASpanLeavesTheSymbolWithANullLink`, which writes a graph, then calls `PutSpans` again, then reads the symbols back. No test that writes spans *before* the graph can see it.
-- *Must fail:* `TestReplacingASpanLeavesTheSymbolWithANullLink`
-- *Expected (verify and correct):* `repo has 0 symbols after re-writing spans, want 2 with null span_id`
+- *Fixture that separates mutant from original:* `TestReplacingASpanLeavesTheSymbolWithANullLinkLive`, which writes spans, then the graph, then spans again.
+- *Must fail:* `TestReplacingASpanLeavesTheSymbolWithANullLinkLive`
+- *Observed — killed:* `symbol c412766b1ac7c58a26e700fb4933b117 (A a.go:3) is not in the table` — and the assertion names *which* symbol went, with the unlinked one still present, so a mutant that deleted everything and one that deleted the linked row read differently.
 - *Compiles and vets:* yes.
 
-- [ ] **Step 5: Commit**
+**M10 — `edges.repo_id` declared without `ON DELETE CASCADE`.** *(new: M8 pins only the symbols half of the cascade)*
+- *Why the code exists:* the same `DELETE` has to reach edges, and edges' own cascade from `from_symbol_id` is not the same reference.
+- *Fixture that separates mutant from original:* `TestEvictingARepoTakesItsGraphWithItLive`.
+- *Observed — killed:* `Evict returned ERROR: update or delete on table "repos" violates foreign key constraint "edges_repo_id_fkey" on table "edges" (SQLSTATE 23503): …`.
+- *Compiles and vets:* yes.
 
-**Definition of Done**
-- `symbols` and `edges` exist, cascade from `repos`, and the pair invariant is a constraint rather than a convention — proven by two direct `INSERT`s that the constraint refuses.
+**M11 — `nullable` returns `&s` unconditionally, so `""` reaches the column instead of NULL.** *(new: the ""↔NULL mapping is otherwise a write nothing reads back)*
+- *Why the code exists:* `models` has no pointers, so a symbol with no span and an edge with no target both carry `""`, and one conversion at the boundary is the trade.
+- *Fixture that separates mutant from original:* `TestPutGraphWritesSymbolsAndEdgesLive`, whose claim is stated as a claim — "a symbol with no span and an edge with no target are ordinary rows, not errors" — so the mutant fails an assertion rather than tripping a bare `t.Fatal(err)`.
+- *Observed — killed:* `PutGraph returned symbols 0-2: ERROR: insert or update on table "symbols" violates foreign key constraint "symbols_span_id_fkey" (SQLSTATE 23503): a symbol with no span and an edge with no target are ordinary rows, not errors`.
+- *Compiles and vets:* yes.
+
+**M12 — the `kind IN ('calls','imports','references')` CHECK dropped.** *(new)*
+- *Why the code exists:* §3's enum is a closed set, and a value outside it is a row every later query would need a case for.
+- *Fixture:* `TestTheSchemaRefusesAKindOrProvenanceOutsideTheSetLive/kind`, a direct `INSERT` of `kind = 'invokes'`.
+- *Observed — killed:* `the INSERT succeeded, want edges_kind_check`.
+
+**M13 — the `provenance IN ('resolved','syntactic')` CHECK dropped.** *(new)*
+- *Why the code exists:* the pair constraint alone accepts `('guessed', NULL)` — it only tests equality with `'resolved'`.
+- *Fixture:* `TestTheSchemaRefusesAKindOrProvenanceOutsideTheSetLive/provenance`.
+- *Observed — killed:* `the INSERT succeeded, want edges_provenance_check`.
+
+**M14 — `provenance` loses its `NOT NULL`.** *(new: this is the defect Step 1 found, made into a test)*
+- *Why the code exists:* it is the only thing closing the pair constraint's three-valued-logic hole. With it gone, both CHECKs on the row evaluate to NULL and both pass.
+- *Fixture:* `TestTheSchemaRefusesAnEdgeWithNoProvenanceLive`, a direct `INSERT` of a NULL provenance.
+- *Observed — killed:* `the INSERT succeeded, want null value in column "provenance"`.
+
+**M15 — the symbol upsert stops updating `span_id` (`DO UPDATE SET … end_line = EXCLUDED.end_line` only).** *(new: the upsert's column list is otherwise unread)*
+- *Why the code exists:* the columns the id does not determine are exactly the ones that have to move when one write carries a definition twice — a file walked twice, or a caller that appends its span links.
+- *Fixture:* `TestADuplicateSymbolInOneWriteKeepsTheLastRowLive`, whose two entries share an id and differ in `span_id` and `end_line`.
+- *Observed — killed:* `symbol 39bc960c… read back as {… SpanID:}, want {… SpanID:72983081845b3c4371fb306609f6aa5e}`.
+
+*Considered and excluded:* a `graphBatchSize` mutation (a different number of round trips is not a behaviour change), and reversing the symbol/edge insert order (an FK violation on the way to every assertion — an incident, not a kill).
+
+- [x] **Step 5: Commit**
+
+**Definition of Done** — all met.
+- `symbols` and `edges` exist, cascade from `repos` (M8 and M10, one per table), and the pair invariant is a constraint rather than a convention — proven by two direct `INSERT`s the constraint refuses, plus a third for the NULL-provenance hole the plan had reasoned away.
 - `PutGraph` replaces a repo's graph wholesale in one transaction, converges across two identical runs, and touches no other repo.
-- A re-index upgrades an edge's provenance rather than keeping the old label.
-- Eviction takes the graph with it, asserted by row counts.
+- A re-index upgrades an edge's provenance rather than keeping the old label — and the mechanism is the wholesale delete, not `ON CONFLICT`, which M1 is what proves.
+- Eviction takes the graph with it, asserted by row counts on the evicted repo *and* on a kept one.
 - Re-writing spans leaves symbols with a null link, not with no symbols.
-- M1–M9 recorded with observed output, M1's survivor status resolved either way.
+- M1–M15 recorded with observed output; M1's survivor status resolved by naming the fixture that reaches `ON CONFLICT` at all.
 
 ---
 
@@ -1347,7 +1374,7 @@ Nothing here is blocking. Each is something the spec does not settle, with the t
 5. **What `pkg` means.** §3 lists the column and never defines it.
    *Recommendation:* the **package clause name** from the AST (`store`), not the import path. The import path needs a module-aware load, which is the thing that is allowed to fail; a column whose meaning depended on whether the type-check ran would be a per-package fact leaking into a per-row column, which is the failure §6 is written against. Two packages named `store` in one repository are distinguished by `path`. Revisit if a console needs import paths.
 
-6. **`edges` and `symbols` carry columns §3 does not list** — `path` and `line` on an edge, `start_line` and `end_line` on a symbol.
+6. **`edges` and `symbols` carry columns §3 does not list** — `path` and `line` on an edge, `start_line`, `end_line` **and `path`** on a symbol. (`symbols.path` was missing from this list while the plan's own `SymbolID` signature hashed it; Task 2 added it and recorded it. It is denormalised beside `file_id` exactly as `spans.path` already is, and without it a caller row cannot cite a definition without joining `files`.)
    *Recommendation:* add them, and say so. Without the edge's location, "who calls this" answers with a symbol and no `file:line`, in a product whose first sentence is that its answers cite `file:line`. Without the symbol's range, a definition with no span is uncitable. The alternative — deriving both by joining spans — fails for exactly the rows where the link is null.
 
 7. **`imports` and `references` edges.** §3's `kind` enum has three values; §6 describes only calls.
