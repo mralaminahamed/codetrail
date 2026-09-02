@@ -1201,6 +1201,12 @@ Spec §8 names `definition_of` and `callers_of` as tools for P7's loop. This tas
 | `GET /api/repos/:repo/symbols/:symbol` | one definition with its citation |
 | `GET /api/repos/:repo/symbols/:symbol/callers?depth=&limit=` | the resolved callers, and separately the approximate ones |
 
+> **Plan defect, corrected in the implementation.** This table advertises `pkg=` and Task 5's `Definitions` has no parameter for it. Shipping it as written would have accepted a field that changed nothing — the exact defect P3 shipped with `mode`, which this task's own preamble names. Filtering after the store read is not the fix either: `LIMIT` applies in SQL, so a post-filter answers 3 of 5 while reporting a bound of 20. `Definitions` gained a `pkg` predicate (`($4 = '' OR s.pkg = $4)`) and the store's read fixture gained a second package clause, since two `Get` methods in *one* package cannot tell a predicate from an ignored one. Task 6's Files list therefore also modifies `packages/shared/store/graph_read.go`.
+>
+> **Second plan defect.** Neither this table nor the shapes below say *which name* the approximate query is given. `symbols.name` spells a method `Store.Get`; an edge's `to_name` is the callee's **last identifier** (`Get`), because spec:84's "it calls something named `Close`" is all the AST knows. Passing `sy.Name` matches no syntactic edge in any corpus, so the approximate set would be **silently empty for every method** — and an empty set is exactly what "nothing else calls this" looks like. `approxName` takes the last segment; M13 is the mutation.
+>
+> **A cost, not a defect.** A citation is built from the span a definition links to, and `Reader` has only `GetSpan`, so a caller list of *n* rows costs up to *n* point lookups by primary key. Deduplicated per span id within one response and bounded by `limit`, so the worst case is 100 at `?limit=50`. Left as it is because the plan's Files list puts no store change in this task and the endpoint has no consumer until P5; the fix, if a console makes it matter, is one batched `WHERE id = ANY($2)` read rather than anything about these handlers.
+
 **Decisions, with their reasoning:**
 
 - **`GET`, not `POST`.** P3 put search and ask behind `POST` because a *question* is prose that must not reach a proxy's access log. A symbol name is an identifier — it is already in the URL of every permalink this product renders — so the rule does not extend here, and a `GET` is cacheable and linkable, which is what a console will want in P5. Recorded because the difference from P3 is deliberate and would otherwise look like an oversight.
@@ -1211,7 +1217,7 @@ Spec §8 names `definition_of` and `callers_of` as tools for P7's loop. This tas
 - **Every caller carries the call site and a citation.** A caller without `file:line` fails spec:5's one-sentence description of the product. The citation is built from the *span* the symbol links to, so it carries a digest; when `span_id` is null the response carries the location and **no permalink-backed citation**, and says so with `"citation": null` rather than inventing one. That is P3's rule for an unknown forge, applied to an unknown span.
 - **The repo view gains `symbols`, `edges`, `edges_resolved`, `edges_syntactic`.** One place a reader can see how much of a repository's graph is precise. It is an aggregate over a per-row column, not a per-repo label.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Hermetic, against a fake `Reader` — and **every error path of that fake is set by a test in this list**, which is the second of P3's two survivor shapes:
 
@@ -1233,118 +1239,185 @@ func TestAStoreErrorIsFiveHundredWithARequestIdAndNoDetail(t *testing.T)
 func TestTheGraphRoutesTouchNoAnswerOrRefusalCounter(t *testing.T)
 ```
 
-- [ ] **Step 2: Implement**
+- [x] **Step 2: Implement**
 
-Shapes, fixed here rather than discovered:
+Shapes, fixed here rather than discovered — corrected against what shipped:
 
 ```
-GET …/symbols        → {"repo_id":…,"count":n,"matched":"exact"|"suffix",
-                        "symbols":[{"id","name","pkg","kind","path","start_line","end_line","span_id"}]}
+GET …/symbols        → {"repo_id":…,"count":n,"matched":"exact"|"suffix","truncated":false,
+                        "symbols":[{"id","name","pkg","kind","path","start_line","end_line","span_id"}],
+                        "staleness":{…}}
 GET …/symbols/:id    → {"symbol":{…},"citation":{…}|null,"staleness":{…}}
 GET …/symbols/:id/callers
-                     → {"repo_id":…,"symbol":{…},"depth":d,
+                     → {"repo_id":…,"symbol":{…},"depth":d,"truncated":false,
                         "callers":[{"symbol":{…},"depth":1,"provenance":"resolved",
                                     "call":{"path":"x.go","line":42},"citation":{…}|null}],
-                        "approximate":{"matched_on":"name","count":n,
+                        "approximate":{"matched_on":"name","count":n,"truncated":false,
+                                       "failed":false,
                                        "callers":[{"symbol":{…},"to_name":"Get",
-                                                   "provenance":"syntactic","call":{…}}]}}
+                                                   "provenance":"syntactic","call":{…},
+                                                   "citation":{…}|null}]}}
 ```
 
-- [ ] **Step 3: Commit, then prove the tests discriminate**
+Four fields the plan's shape did not have, each because something the plan *does* say requires it:
+
+- **`truncated`, per list.** Open question 1: "The `LIMIT` is the second bound and the response says when it truncated." Without it a truncated answer and a complete one are the same payload. Read one over the bound and slice; the request never returns more than the caller asked for. M16.
+- **`approximate.failed`.** Open question 14 says to decide this in Task 6 and give it a test, or the sweep finds it. The precise callers are what was asked for, so a failure of the guess beside them is reported in its own block and logged, never turned into a `500` that discards a correct answer. M14.
+- **`staleness` on the listing.** Every row there is a path and a line range at one commit, and it carries no digest, so staleness is the only thing that can qualify it. Without it this route was the one repo-scoped route that *degraded* a failed `NewerCommit` to silence — P3's `TestAStalenessQueryThatFailedIsNeverAFreshnessClaim` caught it the moment the route joined `repoRoutes()`. M19.
+- **`citation` on an approximate row.** The DoD below says "every caller carries … either a real citation or `null`", and an approximate row is a caller. The shape block omitted it; the DoD wins.
+
+- [x] **Step 3: Commit, then prove the tests discriminate**
 
 **M1 — an unknown symbol answers `200` with an empty list.**
 - *Why the code exists:* §10 — an unknown thing is a `404`, and an empty answer for something that does not exist is indistinguishable from "nothing calls it".
 - *Fixture that separates mutant from original:* the fake's `ErrNotFound`, and separately a **real symbol with no callers**. Both are needed: with only the first, a `404`-for-everything mutant also passes.
 - *Must fail:* `TestAnUnknownSymbolIsFourOhFour`
-- *Expected (verify and correct):* `status 200, want 404`
+- *Observed:* `/api/repos/repo-1/symbols/nosuchsymbol/callers: want 404, got 200: {"repo_id":"repo-1","symbol":{"id":"","name":"",…},"depth":1,"callers":[],"approximate":{…"count":0…}}` and `the 404 does not say what was missing: ""`. **Killed.** The prediction was right about the status and understated the payload: the mutant answers with a *zero symbol*, which is the shape that makes "no such symbol" and "nothing calls it" the same response.
 - *Compiles and vets:* yes.
 
 **M2 — `lookupRepo`'s order inverted, so an evicted repo answers `404`.**
 - *Why the code exists:* §10 — "an evicted repo answers `410 Gone`, not `404` — it existed, and that is a different fact".
 - *Fixture that separates mutant from original:* the tombstoned repo id in the fake. P3's `read_test.go` already has one; reuse it rather than building a second.
 - *Must fail:* `TestAnUnknownRepoIsFourOhFourAndAnEvictedOneIsFourTen`
-- *Expected (verify and correct):* `evicted repo answered 404, want 410`
+- *Observed:* `/api/repos/repo-1/symbols?name=Get: a live repository with a tombstone answered 410` on all three graph routes, plus all seven routes of `TestALiveRepoIsNeverGoneEvenWithATombstone`. **Killed.**
+- **The predicted output was wrong, and so was the rationale it came from.** Inverting the order cannot make an evicted repo answer `404`: `RepoGone` still says gone, so the evicted case is unchanged. What the order protects is the *opposite* direction — a **live** repository whose tombstone from a previous eviction at the same commit is still there, which answers `410` while serving traffic. That is the third false rationale this project has recorded and the reason the fixture that matters is `gone[fixtureRepoID] = true` on a repo that also exists, not a tombstone on one that does not.
 - *Compiles and vets:* yes.
 
 **M3 — `depth` clamped to the range instead of refused.**
 - *Why the code exists:* the same rule P3 fixed for `limit`; a clamp hides a caller's misunderstanding.
 - *Fixture that separates mutant from original:* `depth=40` and `depth=0`. Only the second separates a clamp-to-max from a clamp-to-min, and a mutant might do either.
 - *Must fail:* `TestDepthOutsideOneToFiveIsFourHundredNamingTheRule`
-- *Expected (verify and correct):* `depth=40 answered 200 with 5 levels, want 400`
+- *Observed:* `depth=40 answered 200 with depth 5, want 400`; `depth=0 answered 200 with depth 1, want 400`; `depth=-1 answered 200 with depth 1`; `depth=6 answered 200 with depth 5`; and `a refused depth reached the store as 5`. **Killed**, and the two ends land on different numbers, which is why the plan asked for both.
+- *Note:* the test first printed the whole response body on this failure — five of them, each carrying two full citations. It now prints the depth it served, which is the discriminating fact.
 - *Compiles and vets:* yes.
 
 **M4 — the `400` names a different rule (`"q must not be empty"` in place of the depth detail).**
 - *Why the code exists:* §10 — "naming **which rule** failed, never a generic refusal".
 - *Fixture that separates mutant from original:* the depth case, asserting the response's `error` **string** and `rule` field. A test asserting only the status code passes.
 - *Must fail:* `TestDepthOutsideOneToFiveIsFourHundredNamingTheRule`
-- *Expected (verify and correct):* `error "q must not be empty", want it to name depth`
+- *Observed:* `depth=40: the 400 says "q must not be empty", want it to name depth and its bounds` — for all five refused values. **Killed.**
 - *Compiles and vets:* yes.
 
 **M5 — the approximate callers appended to `callers`.**
 - *Why the code exists:* spec:84 and §6. This is the mutation the whole "what §6 decides" section was written for, expressed at the boundary a client sees.
 - *Fixture that separates mutant from original:* a fake returning one resolved caller and two approximate ones with a `provenance` a client could otherwise use to tell them apart — so the assertion is on the **field they arrive in**, not on the label they carry.
 - *Must fail:* `TestApproximateCallersAreASeparateFieldWithTheirOwnCount`
-- *Expected (verify and correct):* `callers has 3 entries and approximate.count is 0, want 1 and 2`
+- *Observed:* `callers 3, approximate.count 0, want 1 and 2` (`TestApproximateCallersAreASeparateFieldWithTheirOwnCount`), and four other tests with it. **Killed**, exactly as predicted.
 - *Compiles and vets:* yes.
 
 **M6 — `provenance` dropped from the caller view.**
 - *Why the code exists:* it is the per-row label §6 exists to make visible; without it the API has the graph and not the honesty.
 - *Fixture that separates mutant from original:* any caller list, asserting the field is present and equal to `"resolved"`.
 - *Must fail:* `TestCallersCarryTheirCallSiteAndACitation`
-- *Expected (verify and correct):* `caller view has no "provenance" field`
-- *Compiles and vets:* yes — an unused struct field does not break the build, and `go vet` does not object either. **Verify:** if the field is removed rather than left unmarshalled, its assignment is a build break and the mutation must be spelled as `json:"-"`.
+- *Observed:* `provenance "", want "resolved"`. **Killed.**
+- *Compiles and vets:* yes. Spelled as `json:"-"`, as the block's own note requires — removing the field is a build break at its assignment.
 
 **M7 — a `nil` span link renders a citation with an empty digest.**
 - *Why the code exists:* a digest is a claim about text; a citation with an empty one is a claim that cannot be checked, presented as one that can. P3 refused to render a permalink for an unknown forge for the same reason.
 - *Fixture that separates mutant from original:* a symbol with a null `span_id` — which is the sub-windowed-declaration case from Task 2 and is otherwise easy to have no fixture for.
 - *Must fail:* `TestASymbolWithNoSpanCarriesANullCitationRatherThanAGuess`
-- *Expected (verify and correct):* `citation rendered with digest "", want null`
+- *Observed:* `citation serialised as {…"path":"cache/cache.go","start_line":3,"end_line":40,"digest":"","permalink":"https://github.com/rs/zerolog/blob/dfd11cc…/cache/cache.go#L3-L40"…}, want null`. **Killed** — and the mutant renders a *permalink* beside the empty digest, which is the part that makes it read as checkable.
 - *Compiles and vets:* yes.
 
 **M8 — `metrics.CountAnswer("answered")` added to the callers handler.**
 - *Why the code exists:* §10's answer counters describe the ask path; a graph read is neither an answer nor a refusal, and mixing them would make the answer-outcome ratio meaningless the moment a console starts walking the graph.
 - *Fixture that separates mutant from original:* `TestTheGraphRoutesTouchNoAnswerOrRefusalCounter`, which reads **every** series of both vectors before and after. A test that checks one series passes.
 - *Must fail:* `TestTheGraphRoutesTouchNoAnswerOrRefusalCounter`
-- *Expected (verify and correct):* `codetrail_answer_total{outcome="answered"} moved by 1, want the whole vector unchanged`
-- *Compiles and vets:* yes.
+- *Observed:* `the graph routes moved map[codetrail_answer_total{outcome="answered"}:1]`. **Killed**, and the message names the whole movement rather than the series the test expected.
+- *Compiles and vets:* yes — the mutation adds the `metrics` import, which is a behaviour change and not a build break.
 
 **M9 — `h.touch` removed from the graph handlers.**
 - *Why the code exists:* `last_queried_at` is the LRU clock, and a repository whose only traffic is graph queries would be evicted as cold while in use.
 - *Fixture that separates mutant from original:* `TestAGraphReadWindsTheLRUClock`, asserting the fake's `TouchRepo` was called **with the repo id**. Asserting a call count alone passes under a mutant that touches the wrong repo.
 - *Must fail:* `TestAGraphReadWindsTheLRUClock`
-- *Expected (verify and correct):* `TouchRepo called 0 times, want once with "abc123"`
+- *Observed:* `/api/repos/repo-1/symbols?name=Get&suffix=true: touched [], want [repo-1]` on all three routes, plus `TestASuccessfulReadWindsTheLRUClock` and `TestATouchFailureIsLoggedAndNotReturned`. **Killed.**
 - *Compiles and vets:* yes.
 
 **M10 — a `TouchRepo` failure returned to the caller.**
 - *Why the code exists:* the touch is a hint for a future eviction, not part of the answer; failing a correct read because a bookkeeping write failed trades a good answer for a `500`.
 - *Fixture that separates mutant from original:* the fake's `TouchRepo` error, **which is a fake error path and therefore in the ledger**: `TestATouchFailureIsLoggedAndNotReturned` is the test that sets it, and without that test M10 survives.
 - *Must fail:* `TestATouchFailureIsLoggedAndNotReturned`
-- *Expected (verify and correct):* `status 500, want 200 with the callers`
+- *Observed:* `status 500, want 200: {"error":"internal error","request_id":"HWZzRUrqfvcrpkxfChZwSwYxszPbGUqF"}`. **Killed**, exactly as predicted.
 - *Compiles and vets:* yes.
 
 **M11 — `h.fail` replaced by returning the store error to the caller.**
 - *Why the code exists:* §10 — a `500` is opaque with a request id; a store error names tables, columns and sometimes values.
 - *Fixture that separates mutant from original:* the fake's generic error, asserting the body **contains a request id and does not contain the error's text**. Asserting the status alone passes.
 - *Must fail:* `TestAStoreErrorIsFiveHundredWithARequestIdAndNoDetail`
-- *Expected (verify and correct):* `body was {"error":"graph: relation \"edges\" does not exist"}, want the opaque form`
+- *Observed:* `body {"error":"graph: could not read the edges table"}`, `no request id to quote`, `the response names a table`, `the real error was not logged`. **Killed.**
+- *Note:* the fixture error originally carried escaped quotes (`relation \"edges\"`), and zerolog re-escapes them in JSON, so the "the real error was logged" assertion failed against the *original* code. The detail string is now quote-free — a fixture that cannot be found in a log line tests the log's escaping, not the handler.
 - *Compiles and vets:* yes.
 
 **M12 — `suffix` ignored, so matching is always exact.**
 - *Why the code exists:* the opt-in is what makes exact matching safe to default to.
 - *Fixture that separates mutant from original:* the two-`Get` fixture with `suffix=true`, asserting both rows come back **and** that `matched` says `suffix`.
 - *Must fail:* `TestSuffixMatchingIsOptInAndLabelled`
-- *Expected (verify and correct):* `suffix=true returned 0 symbols and matched "exact", want 2 and "suffix"`
+- *Observed:* `suffix=true returned [], want [Cache.Get Store.Get]` and `matched "exact" count 0, want "suffix" and 2`. **Killed**, exactly as predicted — `matched` is derived from the flag that reaches the store, so one mutation moves both.
 - *Compiles and vets:* yes.
 
-- [ ] **Step 4: Commit**
+Eight more, none in the plan. The first five are the decisions this task had to make; the last three are the sweep for P3's two survivor shapes, and **two of them survived.**
+
+**M13 — the approximate query is given the symbol's whole name (`sy.Name`) instead of its last identifier.**
+- *Why the code exists:* `symbols.name` spells a method `Store.Get`, an edge's `to_name` is `Get` (spec:84 — the AST cannot tell a receiver from a package qualifier), so the two never match for a method.
+- *Fixture that separates mutant from original:* `Store.Get`, whose two approximate call sites are recorded under `Get`. A fixture of plain functions cannot separate them, because their name *is* their last segment — which is why the fixture also asks for `g` and asserts the name was **not** truncated.
+- *Must fail:* `TestTheApproximateSetIsMatchedOnTheCalleesLastIdentifier`
+- *Observed:* `the approximate query was asked for "Store.Get", want "Get"` and `approximate.count 0 for Store.Get, want 2`. **Killed.** Note the failure mode this catches: the mutant answers `200` with a well-formed, empty approximate block, which reads as "nothing else calls this".
+- *Compiles and vets:* yes; `approxName` becomes an unused function, which is legal.
+
+**M14 — a failed approximate query fails the whole request.**
+- *Why the code exists:* Open question 14. The precise callers are what was asked for.
+- *Fixture that separates mutant from original:* the fake's `approxErr`, which is a fake error path and therefore in the ledger.
+- *Must fail:* `TestAFailedApproximateQueryDoesNotCostThePreciseAnswer`
+- *Observed:* `status 500, want 200: {"error":"internal error","request_id":"rMcYFohhfNwUlXJaIIVCcfwgTMBZGWGB"}`. **Killed.**
+- *Compiles and vets:* yes.
+
+**M15 — `pkg` ignored, so the listing is never narrowed.**
+- *Why the code exists:* the route table advertises it, and a field that changes nothing is P3's `mode` defect.
+- *Fixture that separates mutant from original:* `Store.Get` in `store` and `Cache.Get` in `cache` — two definitions sharing a last segment in two packages, which is also fixture rule 4's shape.
+- *Must fail:* `TestSuffixMatchingIsOptInAndLabelled`
+- *Observed:* `pkg=cache returned [Cache.Get Store.Get], want [Cache.Get]`. **Killed.**
+- *Compiles and vets:* yes.
+
+**M16 — `truncated` is always false.**
+- *Why the code exists:* Open question 1 — the `LIMIT` is the second bound and the response says when it bit.
+- *Fixture that separates mutant from original:* two definitions read at `limit=1`, and the same limit against a *one*-member precise list, so "the flag is hard-wired true" and "the two lists share one flag" both fail too.
+- *Must fail:* `TestATruncatedListSaysSo`
+- *Observed:* `limit=1 over two definitions: truncated false count 1` and `approximate at limit=1: truncated false count 1`. **Killed.**
+- *Compiles and vets:* yes.
+
+**M17 — the store's `pkg` predicate is `OR TRUE` (live).**
+- *Why the code exists:* the predicate is what makes `?pkg=` a filter rather than a decoration.
+- *Fixture that separates mutant from original:* Task 5's read fixture, given a second package clause in this task.
+- *Must fail:* `TestDefinitionsCanBeNarrowedToOnePackageLive`
+- *Observed:* `pkg=cache: [Cache.Get@cache Store.Get@p], want [Cache.Get@cache]`, and the same for `pkg=p` and `pkg=nosuchpkg`. **Killed.** Spelled `OR TRUE` rather than by deletion, per rule 2 — a deleted parameter is a pgx protocol error and tests pgx.
+- *Compiles and vets:* yes.
+
+**M18 — `repo_id` dropped from the callers response (`json:"-"`). SURVIVOR.**
+- *Why the code exists:* it is the only field in that response that names the corpus the answer came from — a caller row with no span has no citation to carry one.
+- *What it revealed:* shape (a), a field nothing reads back. Every assertion in the file passed with the corpus unnamed. Closed by asserting `repo_id` in `TestCallersCarryTheirCallSiteAndACitation`; re-run **observed** `repo_id "", want "repo-1"`.
+- *Compiles and vets:* yes.
+
+**M19 — the listing degrades a failed staleness query instead of failing (`newer, _ := h.newer(…)`).**
+- *Why the code exists:* a claim that nothing moved, made because the query that would have noticed failed, is a freshness claim from no evidence.
+- *Fixture that separates mutant from original:* the fake's `newerErr`, on a route that reaches `NewerCommit`. This is why the listing carries staleness at all: added, it joins `repoRoutes()` and P3's existing test covers it.
+- *Must fail:* `TestAStalenessQueryThatFailedIsNeverAFreshnessClaim` and `TestAStoreErrorIsFiveHundredWithARequestIdAndNoDetail/staleness_behind_the_listing`
+- *Observed:* `a failed staleness query still served one: {…"staleness":{"state":"unknown",…"note":"Correct at commit dfd11cc, indexed 3 days ago…"}}`. **Killed.**
+- *Compiles and vets:* yes. The first spelling — replacing the rendered value with `rag.Staleness{}` — was **void**: `newer` becomes unused and the build breaks.
+
+**M20 — the citation memo is keyed on the repository instead of the span. SURVIVOR.**
+- *Why the code exists:* a caller list is up to twice the limit in rows, so the span behind each citation is read once per span id rather than once per row.
+- *What it revealed:* shape (a) again, and the worst kind: with the key wrong, the *first* citation rendered is served to every later row. The approximate callers came back carrying the precise caller's `store/use.go` digest and permalink — a citation for a fact the row is not reporting — and nothing in the file noticed, because only the precise caller's digest was ever asserted. Closed by asserting each approximate row cites `cache/use.go`'s own span; re-run **observed** `approximate caller f cites &{…Path:store/use.go…Digest:8609dd46…}, want cache/use.go 57846c40…`.
+- *Compiles and vets:* yes.
+
+- [x] **Step 4: Commit**
 
 **Definition of Done**
-- Three routes, mounted in the existing group, with `lookupRepo`'s 404/410 distinction and `h.touch` on every successful read.
-- The approximate set is a separate field with its own count and `matched_on`.
-- Every caller carries `provenance`, a call site, and either a real citation or `null`.
-- `depth`, `limit` and `name` are validated at the edge, each `400` naming its own rule.
-- The answer and refusal counters are untouched by these routes, asserted over the whole series set.
-- M1–M12 recorded with observed output.
+- [x] Three routes, mounted in the existing group, with `lookupRepo`'s 404/410 distinction and `h.touch` on every successful read. *(They joined `repoRoutes()` rather than getting a second list, so P3's 404, 410, live-with-tombstone, LRU and staleness tests cover them; the graph-specific 404/410 test also pins the 410's wording and the live-repo direction.)*
+- [x] The approximate set is a separate field with its own count and `matched_on`. *(And a `failed` flag, and its own `truncated`.)*
+- [x] Every caller carries `provenance`, a call site, and either a real citation or `null` — the approximate rows included, which the shape block omitted and this line requires.
+- [x] `depth`, `limit` and `name` are validated at the edge, each `400` naming its own rule. *(`suffix` too: an unparseable flag is refused rather than read as false.)*
+- [x] The answer and refusal counters are untouched by these routes, asserted over the whole series set — across a 200, a 404, a 400, a 410 and a 500.
+- [x] M1–M12 recorded with observed output, plus M13–M20. **Two survivors, both found and closed:** M18 (`repo_id` read by nothing) and M20 (the citation memo could serve one caller another's digest). Two prediction corrections: M2's expected output and the rationale behind it were wrong, and M19's first spelling was void.
 
 ---
 
@@ -1471,8 +1544,8 @@ New section, in the register the existing README uses. It must say, in these ter
 - [x] The type-check runs inside the sandbox, on the job's own remaining budget, with an environment allowlist that a hostile parent environment cannot widen and that makes a recording proxy receive zero requests. *(Task 3. The zero is paired with a control that fetches, so it is evidence rather than an absence.)*
 - [x] A type-check failure — missing toolchain, absent module, expired budget, disabled by knob — produces a complete graph of syntactic edges, a distinct counted reason, a log line, and a `done` job. *(Task 4, five reasons, each asserting the whole counter delta.)*
 - [x] "Who calls this" is a recursive CTE that terminates on self-calls, cycles and diamonds, reports depth and call sites, and never traverses a name. *(Task 5. The cycle guard turned out to be unobservable in the answer — `min(depth)` is the BFS distance — so what pins it is the traversal's own row count under `EXPLAIN (ANALYZE)`: 19 guarded, 46 unguarded.)*
-- [ ] Approximate, name-matched callers are a separate labelled set at depth 1, with their own count. *(Task 5 ships the set, proven separate and free of resolved edges; the count is a field in a response and belongs to Task 6.)*
-- [ ] Graph endpoints answer `404` for an unknown symbol, `410` for an evicted repo, `400` naming the rule for a bad `depth`, `limit` or `name`, and `500` opaquely with a request id; none of them touch the answer or refusal counters.
+- [x] Approximate, name-matched callers are a separate labelled set at depth 1, with their own count. *(Task 5 ships the set; Task 6 ships the count, `matched_on`, a `failed` flag and the per-row `provenance`, and pins that the two lists never merge. Task 6 also found the name the set has to be queried with: the callee's last identifier, not `symbols.name`, or every method's approximate set is silently empty.)*
+- [x] Graph endpoints answer `404` for an unknown symbol, `410` for an evicted repo, `400` naming the rule for a bad `depth`, `limit` or `name`, and `500` opaquely with a request id; none of them touch the answer or refusal counters. *(Task 6, hermetic and live. `depth` is clamped nowhere: default 1, 1..5, out of range is a 400 naming the bound and moving no counter.)*
 - [x] Eviction takes the graph with it, in one `DELETE`. *(Task 2 at the schema, Task 4 end to end through a real job.)*
 - [ ] Every mutation recorded with observed output; every survivor recorded as a survivor with what it revealed; the whole-branch sweep run after the last merge.
 
@@ -1485,7 +1558,7 @@ New section, in the register the existing README uses. It must say, in these ter
 Nothing here is blocking. Each is something the spec does not settle, with the tradeoff and a recommendation, so a reviewer can disagree with a decision rather than discover it.
 
 1. **How deep "who calls this" goes.** §8 names `callers_of` and gives no depth.
-   *Recommendation:* a `depth` parameter, **default 1, maximum 5**, out of range refused with a `400`. Direct callers are what the question usually means; the maximum exists because fan-out in a call graph is multiplicative and an unbounded traversal on a real repository is a query that returns a repository. Five is not measured — it is a bound chosen to be obviously finite, and P6/P7 can raise it with a corpus in front of them. The `LIMIT` is the second bound and the response says when it truncated.
+   *Shipped in Task 6 exactly as recommended, with the truncation flag the last sentence promises and the plan's own shape block had left out.* A `depth` parameter, **default 1, maximum 5**, out of range refused with a `400`. Direct callers are what the question usually means; the maximum exists because fan-out in a call graph is multiplicative and an unbounded traversal on a real repository is a query that returns a repository. Five is not measured — it is a bound chosen to be obviously finite, and P6/P7 can raise it with a corpus in front of them. The `LIMIT` is the second bound and the response says when it truncated.
 
 2. **What happens to edges when a repo is re-indexed at a new commit.** §3 makes `repo = hash(remote, commit)`, so nothing needs to happen: a new commit is a new repository row with its own graph, and the old one is removed by LRU eviction with its files, spans, symbols and edges.
    *Recommendation:* keep exactly that, and do not add a "same repository, newer commit" link in P4. The alternative — graph diffing across commits — is a feature (what changed about who calls this) and belongs with incremental re-index in P7. What P4 does owe is convergence *within* one repo id, which `PutGraph`'s wholesale replace and deterministic ids provide.
@@ -1517,15 +1590,17 @@ Nothing here is blocking. Each is something the spec does not settle, with the t
 
 11. **Last-segment matching for `definition_of`.** P3's lexical arm reaches `Store.Get` through its parts, so a user who found a method by searching will type `Get`.
     *Recommendation:* exact by default, `suffix=true` to opt in, and the response says which match it made. A silent fallback would answer a different question than the one asked and would be indistinguishable in the payload. Revisit in P5 when the console knows what a user actually types.
+   *Answered in Task 6.* `matched` is on the response, derived from the flag that reaches the store rather than from the query string, so it reports the answer and not the question. Two more things fell out: `?pkg=` is what a caller does next with two matches, and it needed a store predicate the plan had not given it; and `?suffix=` is refused when unparseable, because a flag whose bad value quietly means "off" is the `mode` defect again.
 
 12. **Where the graph pass gets its bytes.** The chunker may read *stripped* source; `go/packages` reads from disk.
     *Recommendation as written was wrong and Task 1 measured it so.* `StripDocs` removes the prose bytes and keeps only their line terminators: line numbers are invariant, **byte offsets are not**. The answer is still "both, unchanged, with no `ParseFile` hook", for a different reason — **the graph pass must parse the same bytes `go/packages` reads, which are the ones on disk**. That is a constraint on the *caller*, so a hook cannot enforce it; Task 3 pins it with `TestResolutionKeysAreOffsetsIntoTheBytesOnDisk`, which asserts that raw offsets hit and stripped ones do not, and Task 4 must pass the indexer's raw `body`.
 
-13. **Whether the repo view should carry graph counts.** §3 says nothing.
+13. **Whether the repo view should carry graph counts.** §3 says nothing. *(Shipped in Task 6: four keys on `GET /api/repos/:repo`, present as zeros before a graph exists so a client can tell "no graph" from "this build does not report one".)*
     *Recommendation:* yes — `symbols`, `edges`, `edges_resolved`, `edges_syntactic` on `GET /api/repos/:repo`. It is the only place a user can see how much of a repository's graph is precise, and it is an aggregate over a per-row column rather than a per-repo label. The risk to watch is a client treating the aggregate as the label, which is why the per-edge field exists in every caller row too.
 
 14. **What a failure of the approximate query alone should do.** Surfaced by the fakes ledger in Task 7.
     *Recommendation:* return the precise answer with the approximate block marked as failed, rather than failing the whole request. The precise half is what was asked for. Decide it in Task 6 and give it a test, or M-sweep-3 finds it.
+   *Decided in Task 6 as recommended:* `approximate.failed` is on the wire, the error is logged with the repo id, and M14 is the mutation that returns it instead. The block still reports `matched_on`, so a client reading an empty approximate set can tell "nothing matched" from "the query did not run".
 
 ---
 
