@@ -9,9 +9,9 @@ import (
 // each one, and returns how many went.
 //
 // One DELETE, letting the schema's ON DELETE CASCADE take the dependent rows —
-// files and spans today, and whatever P3's symbol graph adds by declaring the
-// same reference. An orphan sweep would be a second system to disagree with
-// this one.
+// files, spans, and since P4 the symbols and edges of the graph, which join by
+// declaring the same reference. An orphan sweep would be a second system to
+// disagree with this one.
 //
 // The tombstone is written by that same statement, through the DELETE's
 // RETURNING, because spec §10 wants an evicted repo to answer 410 rather than

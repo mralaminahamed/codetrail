@@ -129,6 +129,15 @@ func TestSchemaShapeLive(t *testing.T) {
 		"files": {"id", "repo_id", "path", "blob", "lang", "lines"},
 		"spans": {"id", "repo_id", "file_id", "path", "kind", "symbol",
 			"start_line", "end_line", "text", "digest", "embed_model", "embed_dim", "embedding"},
+		// path, start_line and end_line are P4's deviation from spec §3's
+		// column list: without them a definition whose declaration is too long
+		// for one span has no citable location at all.
+		"symbols": {"id", "repo_id", "file_id", "path", "name", "pkg", "kind",
+			"start_line", "end_line", "span_id"},
+		// path and line likewise: "who calls this" has to answer with a
+		// file:line, not with a name.
+		"edges": {"id", "repo_id", "from_symbol_id", "to_symbol_id", "to_name",
+			"kind", "provenance", "path", "line"},
 	} {
 		have := map[string]bool{}
 		rows, err := s.pool.Query(ctx,
