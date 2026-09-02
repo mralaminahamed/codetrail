@@ -257,10 +257,13 @@ func TestCallersOfTerminatesOnATwoNodeCycleLive(t *testing.T) {
 	}
 }
 
-// The cycle guard cannot change the rows this query returns — min(depth) is the
-// BFS distance and a walk that revisits a node is never shorter than the path
-// that does not — so nothing in the result set can read it back. What it
-// changes is how much work the traversal does, and that is a number.
+// The cycle guard changes almost nothing about the rows this query returns —
+// min(depth) is the BFS distance and a walk that revisits a node is never
+// shorter than the path that does not — so on this fixture, whose target is not
+// on the cycle, nothing in the result set can read it back. (On a real cyclic
+// graph it does change one row, the queried symbol's own; see graph_read.go.)
+// What it changes here is how much work the traversal does, and that is a
+// number.
 //
 // Asserted as an absolute first, so a traversal that stopped bounding itself
 // fails with a count rather than with a comparison against a second query the
