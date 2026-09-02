@@ -197,6 +197,12 @@ func TestCallersOfWalksTheChainAndReportsDepthLive(t *testing.T) {
 		t.Fatal("fixture: depth order and id order agree, so the ORDER BY asserts nothing")
 	}
 
+	// A caller row carries the whole definition, not a name and a depth: Task
+	// 6 serialises it and a half-filled symbol is uncitable.
+	if cs := f.callers(t, 5, 50); cs[0].Symbol != f.sym["b"] {
+		t.Errorf("the nearest caller reads back as %+v, want %+v", cs[0].Symbol, f.sym["b"])
+	}
+
 	// With a LIMIT below the result size the order decides membership, not
 	// presentation: the four nearest callers, not four arbitrary ones.
 	if got, want := callerNames(f.callers(t, 5, 4)), want[:4]; !slices.Equal(got, want) {
