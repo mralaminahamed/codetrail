@@ -85,18 +85,24 @@ type fakeStore struct {
 	spans map[string]models.Span
 	gone  map[string]bool
 	newer rag.Newer
-	err   error
 
-	touched  []string
-	touchErr error
+	// One error hook per read, not one for the store. The failures worth
+	// covering are the ones behind a call that already succeeded — NewerCommit
+	// only reaches the handler when GetRepo answered, and RepoGone is only
+	// asked when it did not — and a single store-wide error never gets past the
+	// first call. That is why the one that used to be here could be wired into
+	// every method and assigned by nothing.
+	listErr, repoErr, goneErr, statsErr, spanErr, newerErr, touchErr error
+	// embedderErr is what a repository with no spans answers: the real store
+	// reports that as ErrNotFound, and it is the one read failure the handler
+	// must not read as a failure at all.
+	embedderErr error
+
+	touched []string
 
 	vector, lexical []models.Cite
 	model           string
 	dim             int
-	// embedderErr is what a repository with no spans answers: the real store
-	// reports that as ErrNotFound, and it is the one arm failure the handler
-	// must not read as a failure at all.
-	embedderErr error
 }
 
 func newStore() *fakeStore {
@@ -114,13 +120,19 @@ func newStore() *fakeStore {
 	}
 }
 
+// A failing read returns the zero value with its error, as the real store does:
+// a handler that swallows one then serves that zero value, which is the shape
+// of the mistake worth catching.
 func (f *fakeStore) ListRepos(context.Context, int) ([]store.RepoRow, error) {
-	return f.rows, f.err
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	return f.rows, nil
 }
 
 func (f *fakeStore) GetRepo(_ context.Context, id string) (models.Repo, error) {
-	if f.err != nil {
-		return models.Repo{}, f.err
+	if f.repoErr != nil {
+		return models.Repo{}, f.repoErr
 	}
 	r, ok := f.repos[id]
 	if !ok {
@@ -133,16 +145,22 @@ func (f *fakeStore) GetRepo(_ context.Context, id string) (models.Repo, error) {
 // carries (a NOT EXISTS against repos) is deliberately absent here, so a
 // handler that asks in the wrong order is visible rather than covered for.
 func (f *fakeStore) RepoGone(_ context.Context, id string) (bool, error) {
-	return f.gone[id], f.err
+	if f.goneErr != nil {
+		return false, f.goneErr
+	}
+	return f.gone[id], nil
 }
 
 func (f *fakeStore) RepoStats(context.Context, string) (store.Stats, error) {
-	return f.stats, f.err
+	if f.statsErr != nil {
+		return store.Stats{}, f.statsErr
+	}
+	return f.stats, nil
 }
 
 func (f *fakeStore) GetSpan(_ context.Context, _, spanID string) (models.Span, error) {
-	if f.err != nil {
-		return models.Span{}, f.err
+	if f.spanErr != nil {
+		return models.Span{}, f.spanErr
 	}
 	s, ok := f.spans[spanID]
 	if !ok {
@@ -152,7 +170,10 @@ func (f *fakeStore) GetSpan(_ context.Context, _, spanID string) (models.Span, e
 }
 
 func (f *fakeStore) NewerCommit(context.Context, string) (string, time.Time, error) {
-	return f.newer.Commit, f.newer.IndexedAt, f.err
+	if f.newerErr != nil {
+		return "", time.Time{}, f.newerErr
+	}
+	return f.newer.Commit, f.newer.IndexedAt, nil
 }
 
 func (f *fakeStore) TouchRepo(_ context.Context, id string) error {
@@ -161,18 +182,18 @@ func (f *fakeStore) TouchRepo(_ context.Context, id string) error {
 }
 
 func (f *fakeStore) VectorSearch(context.Context, string, []float32, int) ([]models.Cite, error) {
-	return f.vector, f.err
+	return f.vector, nil
 }
 
 func (f *fakeStore) LexicalSearch(context.Context, string, []string, int) ([]models.Cite, error) {
-	return f.lexical, f.err
+	return f.lexical, nil
 }
 
 func (f *fakeStore) SpanEmbedder(context.Context, string) (string, int, error) {
 	if f.embedderErr != nil {
 		return "", 0, f.embedderErr
 	}
-	return f.model, f.dim, f.err
+	return f.model, f.dim, nil
 }
 
 type retrieverCall struct {
@@ -735,6 +756,112 @@ func repoRoutes() []repoRoute {
 		{http.MethodGet, func(r string) string { return "/api/repos/" + r + "/spans/span-c" }, ""},
 		{http.MethodPost, func(r string) string { return "/api/repos/" + r + "/search" }, `{"q":"sampler"}`},
 		{http.MethodPost, func(r string) string { return "/api/repos/" + r + "/ask" }, `{"q":"sampler"}`},
+	}
+}
+
+// down is a live Postgres answering something other than a row: the failure
+// every read below has to report as ours rather than as a fact about the
+// corpus.
+func down() error { return errors.New("connection refused: postgres://codetrail@db:5432") }
+
+// A store failure inside the repo lookup is a 500 and never a 404. Reading one
+// as "no such repository" is the same error/refusal collapse spec §10 forbids,
+// one layer down, and it is unfalsifiable from the outside: a caller is told a
+// repository that is right there does not exist, and no counter says otherwise.
+func TestAFailedRepoLookupIsFiveHundredAndNotAMissingRepository(t *testing.T) {
+	for _, tc := range []struct {
+		name, repo string
+		hook       func(*fakeStore)
+	}{
+		{"the repo read fails", fixtureRepoID, func(st *fakeStore) { st.repoErr = down() }},
+		// The tombstone is only read when repos held nothing, so this one asks
+		// about a repository that is genuinely not there: the 404 it would
+		// otherwise get is the right answer for the wrong reason.
+		{"the tombstone read fails", "nobody", func(st *fakeStore) { st.goneErr = down() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, r := range repoRoutes() {
+				st, rt := newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)}
+				tc.hook(st)
+				rec := do(mount(hermeticHandler(st, rt)), r.method, r.path(tc.repo), r.body)
+				if rec.Code != http.StatusInternalServerError {
+					t.Errorf("%s %s: want 500, got %d: %s", r.method, r.path(tc.repo), rec.Code, rec.Body)
+					continue
+				}
+				out := body(t, rec)
+				if out["error"] != "internal error" || out["request_id"] == "" {
+					t.Errorf("%s: 500 body %s", r.path(tc.repo), rec.Body)
+				}
+				if strings.Contains(rec.Body.String(), "postgres://") {
+					t.Errorf("%s: the 500 body carries the underlying error: %s", r.path(tc.repo), rec.Body)
+				}
+			}
+		})
+	}
+}
+
+// The reads behind a lookup that succeeded. Each one is a query whose failure
+// has an inviting empty value to fall back on — no repositories, zero spans, no
+// such span — and every one of those would be served as a 200 stating something
+// false about the corpus.
+func TestAFailedReadBehindTheLookupIsFiveHundred(t *testing.T) {
+	for _, tc := range []struct {
+		name, path string
+		hook       func(*fakeStore)
+	}{
+		{"the corpus listing fails", "/api/repos", func(st *fakeStore) { st.listErr = down() }},
+		{"the stats read fails", "/api/repos/repo-1", func(st *fakeStore) { st.statsErr = down() }},
+		// Not a 404: this span exists, and the read of it failed.
+		{"the span read fails", "/api/repos/repo-1/spans/span-c", func(st *fakeStore) { st.spanErr = down() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st, rt := newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)}
+			tc.hook(st)
+			rec := do(mount(hermeticHandler(st, rt)), http.MethodGet, tc.path, "")
+			if rec.Code != http.StatusInternalServerError {
+				t.Fatalf("want 500, got %d: %s", rec.Code, rec.Body)
+			}
+			if out := body(t, rec); out["error"] != "internal error" || out["request_id"] == "" {
+				t.Errorf("500 body %s", rec.Body)
+			}
+		})
+	}
+}
+
+// newer()'s comment says a failed staleness query fails the request rather than
+// degrading to "not superseded", because a citation that says nothing moved
+// because the query that would have noticed failed is a freshness claim made
+// from no evidence. Nothing exercised it, so the behaviour the comment defends
+// was the behaviour no test could see. It is true, and this is what makes it
+// falsifiable: every route that dates a citation fails, and none of them serves
+// a citation built without it.
+func TestAStalenessQueryThatFailedIsNeverAFreshnessClaim(t *testing.T) {
+	for _, r := range repoRoutes() {
+		st, rt := newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)}
+		st.newerErr = down()
+		rec := do(mount(hermeticHandler(st, rt)), r.method, r.path(fixtureRepoID), r.body)
+		if rec.Code != http.StatusInternalServerError {
+			t.Errorf("%s %s: want 500, got %d: %s", r.method, r.path(fixtureRepoID), rec.Code, rec.Body)
+		}
+		// And the check that names the defect rather than the status: a handler
+		// that degraded to "not superseded" serves a citation whose staleness is
+		// a claim with no evidence behind it, and this is the assertion that
+		// reads it back.
+		if strings.Contains(rec.Body.String(), "staleness") {
+			t.Errorf("%s: a failed staleness query still served one: %s", r.path(fixtureRepoID), rec.Body)
+		}
+	}
+
+	// On ask it is an answer error and only that: a failed staleness query is
+	// ours, so it must not reach the refusal counters spec §10 keeps apart.
+	st, rt := newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)}
+	st.newerErr = down()
+	before := counters(t)
+	do(mount(hermeticHandler(st, rt)), http.MethodPost, "/api/repos/repo-1/ask", `{"q":"sampler"}`)
+	moved := movedSince(t, before)
+	want := map[string]float64{`codetrail_answer_total{outcome="error"}`: 1}
+	if !maps.Equal(moved, want) {
+		t.Errorf("counters moved %v, want %v", moved, want)
 	}
 }
 
