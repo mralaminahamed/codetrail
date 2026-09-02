@@ -215,9 +215,12 @@ func hermeticHandler(st *fakeStore, rt Retriever) *Handler {
 }
 
 // mount carries the middleware server.New does, because the 500 path's promise
-// is a request id a caller can quote and without RequestID it is empty.
+// is a request id a caller can quote and without RequestID it is empty — and
+// because a handler that panics answers 500 in production, not by unwinding
+// into the test binary.
 func mount(h *Handler) *echo.Echo {
 	e := echo.New()
+	e.Use(middleware.Recover())
 	e.Use(middleware.RequestID())
 	Mount(e, h)
 	return e
