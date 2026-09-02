@@ -1888,11 +1888,15 @@ accident."
 ### Task 8: End to end on a live database, CI, and the README
 
 **Files:**
-- Create: `apps/gateway/internal/handler/read_live_test.go`, `assets/screenshots/ask.png`
-- Modify: `.github/workflows/ci.yml`, `README.md`, `Makefile`, `infra/docker-compose.yml` (gateway's embedder env)
+- Create: `apps/gateway/internal/handler/read_live_test.go`, `assets/screenshots/ask.png` (+ `ask.svg`, as P1's and P2's captures are kept)
+- Modify: `.github/workflows/ci.yml`, `README.md`
 - Test: as above
 
-- [ ] **Step 1: Write the end-to-end live tests**
+**Two entries in that list had no work behind them, corrected against the tree.** `infra/docker-compose.yml` has **no gateway service** — it runs Postgres and, behind the `ai` profile, Ollama, and the binaries are run from `bin/` — so there is no "gateway's embedder env" there to set. The `Makefile` needed nothing either: `make build`, `make up` and `make test` already cover what the new README section tells a reader to run, and adding a target that wraps two `./bin/` invocations would be a third place for the DSN to drift. Both are recorded rather than satisfied with a cosmetic edit.
+
+**A third correction, to Step 1's method.** "Index a fixture repository through the real indexer path" is not available to this package: `walk` and `clone` live under `apps/indexer/internal`, which Go's internal rule forbids the gateway from importing — and that confinement *is* P1's deployment boundary, so importing them would be the defect, not the fix. The live suite therefore indexes the indexer's own committed fixture tree through the packages that decide a span's identity — `chunk`, `embed.FromEnv`, `store.PutRepo`/`PutSpans` — and asserts the corpus it produced (which paths bear spans, per strategy) rather than assuming it. The walk itself stays covered by `apps/indexer/cmd/index_live_test.go`, which is where it can be.
+
+- [x] **Step 1: Write the end-to-end live tests**
 
 Index a fixture repository through the real indexer path (as `apps/indexer/cmd/index_live_test.go` already does), then drive the handler over the result on the fake embedder:
 
@@ -1910,11 +1914,17 @@ func TestPackageDocProseIsUnretrievableUnderTheASTStrategy(t *testing.T)
 
 `TestAHighFloorRefusesTheSameQueryTheDefaultAnswers` is the test that proves the floor is a live mechanism without asserting anything about its value: the same query, the same corpus, two floors, two outcomes.
 
-- [ ] **Step 2: Extend CI**
+**Shipped, plus three the plan's four did not reach.** `TestARefusalAnErrorAndAValidationFailureAreThreeOutcomesLive` drives spec §10's three outcomes against a real database — a real `ErrModelMismatch` (a 768-component corpus queried by a 16-component embedder) for the error, and the whole set of counter series that moved for each. `TestEveryRetrievalModeRetrievesFromALiveCorpus` runs all three modes over one corpus and asserts which arm ranked what, and that lexical mode reports a `null` top score. And `TestPackageDocProseIsUnretrievableUnderTheASTStrategy` came back **corrected against measurement**: the plan predicted a refusal under the production strategy, and there is none. The vector arm returns its top candidates whatever they score, so a hybrid ask over the AST corpus answers *from other files*; the refusal is real only in lexical mode, where a term no span holds retrieves nothing. Both halves are asserted, because "answers from the wrong file" is what an operator actually gets and is the worse of the two to leave undocumented.
+
+- [x] **Step 2: Extend CI**
 
 The `live datastore tests` step already sets `EMBED_PROVIDER: fake`. Add the gateway's retrieval knobs to the same step so the composition under test is the one CI describes, and add a comment saying **CI cannot measure fusion** — the fake is a hashed bag of words over the same text the lexical arm indexes, so the two arms are near-duplicates there. A green build is a mechanics check (spec §9's banner), and this is where a reader of the build log will look.
 
-- [ ] **Step 3: Verify against a real repository, and record the numbers**
+**The knobs were deliberately not added, and the instruction is a plan defect.** `newRetriever` reads the *ambient* environment, and `apps/gateway/cmd`'s tests run in both the `test` and the `live datastore tests` steps. Measured: `RETRIEVAL_MODE=lexical go test ./apps/gateway/cmd/` fails `TestTheDefaultRetrieverIsHybridAtTheUncalibratedFloor` with `mode=lexical k=60 candidates=40 split=true`, and `ANSWER_SCORE_FLOOR=0.35` fails it with `floor {Value:0.35 Calibrated:false}`. So exporting the *shipped defaults* in CI would leave that test green while it asserted the workflow file instead of the code — and M1 below, which flips the default in `main.go`, then **survives**: measured, `RETRIEVAL_MODE=hybrid go test ./apps/gateway/cmd/` under the mutant prints `ok`. A step that disarms a mutation is worse than a step that says nothing, so the comment says what CI proves, what it cannot (fusion), and why the knobs are absent.
+
+**What CI gained instead: `go vet -tags=ollama ./...`.** The `ollama` suite needs a model so CI never runs it — and until this step nothing *compiled* it either, since `go vet ./...` skips a tagged file. An API change in `packages/shared/embed` could have broken the one check a fake cannot make and stayed green for as long as nobody ran it by hand. The step costs no model and no server. The skip guards themselves are unchanged and now cover the new suite too: every live `TestMain` exits 1 rather than skipping when `DATABASE_URL` is unset under `CI`, and `baseURL` in the `ollama` suite fails rather than skipping, tag or no tag.
+
+- [x] **Step 3: Verify against a real repository, and record the numbers**
 
 Not optional, and not a formality — P2 found four cross-task defects here that no per-task review caught.
 
@@ -1932,7 +1942,17 @@ Record, in the README and in the commit message:
 4. retrieval latency for each mode, so the cost of the second arm is a number rather than an impression;
 5. the same query with `RETRIEVAL_MODE=vector` and `=hybrid`, **reported as two result sets and not as a winner**.
 
-- [ ] **Step 4: Update the README**
+**Measured. `rs/zerolog` at `dfd11cca1143ba03ba0fc0ff14e5dbb4d61f6f0a`** — the same commit P2 recorded, still `master` — indexed through the real gateway and indexer against Ollama with `nomic-embed-text`: 99 files, 1,303 spans, `repo_id` `bee14320c329c3c67b2786f124cbd74b`, 87 files with spans. Every figure agrees with P2's table, which is itself the check that P3 changed nothing about indexing.
+
+1. **Top cosine similarity over seven real questions: 0.664 to 0.744.** A range, not a recommendation; P6 turns it into a floor by measuring it against a labelled golden set, and a histogram of the same quantity has no label for "was this hit correct".
+2. **The citation checks byte for byte.** `git show dfd11cca:sampler.go | sed -n '18,23p' | head -c -1 | sha256sum` → `a7a70e1ec9cb1aa09c1f380415bc637a38379d7c686a180ca8d0401f77c29833`, which is the `digest` the API returned, and the same hash the *answer's own rendered text* produces. **`head -c -1` is load-bearing and P2's recipe did not have it**: a span's text ends at the last byte of its last line, not at the newline after it, so `sed | sha256sum` alone gives `27763f89…` and no match. P2's screenshot showed the `sed` output and never piped it to `sha256sum`, so this went unnoticed for a phase.
+3. **The permalink was opened in a browser** — `https://github.com/rs/zerolog/blob/dfd11cca…/sampler.go#L18-L23` — and lands on lines 18–23, highlighted, with the same bytes.
+4. **Retrieval latency, mean over 21 asks per mode** (`codetrail_retrieval_seconds`, which is what an operator reads): `lexical` 5.3 ms, `vector` 24.0 ms, `hybrid` 33.7 ms. One `nomic-embed-text` embed on CPU measures ~16 ms alone, so the pgvector query is ~8 ms and the second arm costs ~10 ms at 1,303 spans. A cost, not a benefit.
+5. **Two result sets, no winner.** For "how does the sampler decide to drop an event", `vector` returns five `sampler.go` spans (0.7166 down to 0.5958); `hybrid` keeps `sampler.go:18-23` at rank 1 and then returns `event.go:202-210`, `event.go:191-200`, `event_test.go:279-318`, `event_test.go:159-198`. The mechanism is Open question 15, now confirmed on a real corpus: `simple` has no stopword list, so `event` is a live term, and `ts_rank_cd` rewards the test file that repeats it. **Which column serves a reader better is spec:316's experiment and is not answered here.**
+
+**A sixth thing, not asked for and worth recording: the plan's own `curl` in this step is a `400`.** Run verbatim — no `-H 'content-type: application/json'` — echo binds the body as a form, finds no `q` field, and the edge answers `{"error":"q must not be empty","rule":"form"}`. The README's version carries the header and says why.
+
+- [x] **Step 4: Update the README**
 
 Four edits are mandatory; the rest is new material.
 
@@ -1950,21 +1970,69 @@ Four edits are mandatory; the rest is new material.
 
 New material: a **Retrieval** section carrying the two arms, the fusion constant, the modes, the sentence that **nothing here claims fusion retrieves better** (spec:316), the per-arm ranks in the response, the knob list, the `410`/`404` distinction, the job retention window and the flood it does not bound, and the `doc.go` asymmetry as a *retrieval* limitation rather than only a chunking one.
 
-- [ ] **Step 5: Commit and prove the tests discriminate**
+- [x] **Step 5: Commit and prove the tests discriminate**
+
+**Eight mutations, eight kills, no survivors.** M1–M3 are the plan's; M4–M8 were added because the plan's three reach none of the code this task's live suite is built over. One defect was found by the round rather than by review, and is recorded under M5.
 
 **M1 — `RETRIEVAL_MODE` default flipped to `vector`.**
 - *Why the code exists:* §8 defines retrieval as hybrid; the default is spec conformance, not a quality claim.
+- *Fixture that separates mutant from original:* `boot()` with only `EMBED_PROVIDER` set, so the default is what is read. Any test that exports the knob cannot see this.
 - *Must fail:* `TestTheDefaultRetrieverIsHybridAtTheUncalibratedFloor` (Task 6)
+- *Observed:* killed — `main_test.go:385: mode=vector k=60 candidates=40 split=true`.
+- *And the finding this task exists to catch:* re-run as `RETRIEVAL_MODE=hybrid go test ./apps/gateway/cmd/`, the same mutant **survives** and prints `ok`. That is the measurement behind refusing Step 2's instruction to export the retrieval knobs in CI.
+- *Compiles and vets:* yes; a different constant of the same type.
 
-**M2 — `ANSWER_SCORE_FLOOR` default set to `0.35`.**
-- *Why the code exists:* spec:315.
-- *Fixture that separates mutant from original:* the live pair in `TestAHighFloorRefusesTheSameQueryTheDefaultAnswers`, plus Task 1's `TestTheShippedDefaultRefusesNothingOnScoreAlone`. **Expected to kill in Task 1 and to be visible here as a refusal on a query the default answers** — record whether the live test actually changes outcome, because it depends on the fake's scores, and if it does not, say so rather than claiming a kill.
+**M2 — `ANSWER_SCORE_FLOOR` default set to `0.35` (`DefaultFloor`).**
+- *Why the code exists:* spec:315 — a plausible default is a guess a reader cannot tell from a measurement.
+- *Fixture that separates mutant from original:* Task 1's `Decide` case at the worst possible cosine, and the live pair's payload assertion.
+- *Observed:* killed twice. `decide_test.go:58: the worst possible cosine gave refused/below_floor at the default floor`, and `read_live_test.go:494: floor {Value:0.35 Calibrated:false Applicable:true} on the wire, want -1 uncalibrated`.
+- *And the honesty the plan asked for:* **the live test does not change outcome, and this is not a kill on the outcome.** Probed by weakening the payload assertion to a `t.Logf`: under the mutant the same query is still answered, because the fake's top score on this fixture is **0.5477**, which is above 0.35. The live kill is the payload's alone. A floor of `1` is what the shipped test uses for the outcome pair, and it asserts the observed top score is `< 1` first so the pair cannot be a coincidence.
+- *Compiles and vets:* yes.
 
-**M3 — the end-to-end digest assertion weakened to "the digest is non-empty".**
+**M3 — the end-to-end digest assertion weakened, against a truncating assembler.**
 - *Why the code exists:* this test is the one that proves a citation is checkable, which is the project's second differentiating claim.
-- *Fixture that separates mutant from original:* the mutation is to the *test*, which is legitimate here: the question is whether the assertion is load-bearing. Apply a truncation to the assembler and confirm the weakened test passes while the real one fails.
+- *Fixture that separates mutant from original:* the mutation is to the *test*, which is legitimate here — the question is whether the assertion is load-bearing rather than shadowed by its neighbour. `render` was mutated to cut every span to 40 characters under its own digest.
+- *Observed, in all four combinations, which is what makes this evidence:*
+  - **Neither weakened:** killed on both halves, for every citation. `citation 1 (calc/calc.go:14-17): the answer's text hashes to 8cb473c4…, the citation claims 4789a75d…` and `citation 1: lines 14-17 of calc/calc.go are not the bytes the answer shows`.
+  - **Digest weakened to "non-empty":** still fails, through `bracketsExactly`. So the range check is load-bearing.
+  - **`bracketsExactly` weakened to "the file is non-empty":** still fails, through the digest. So the digest check is load-bearing.
+  - **Both weakened:** `ok`. So nothing else in the test catches a truncated span, and the two assertions together are the whole guard.
+- *Compiles and vets:* yes.
 
-- [ ] **Step 6: Commit**
+**M4 — the cited line range shifted by one in both arms' SQL (`start_line + 1`).**
+- *Why the code exists:* the range is the citation. A digest proves the text was not altered; only the range says *where* that text lives, and an off-by-one is a citation pointing at the wrong code (models.Span says so).
+- *Fixture that separates mutant from original:* the committed fixture file, read from disk — the one input the pipeline did not produce. Both arms are mutated together on purpose: `spansOf` merges them and the lexical row would otherwise overwrite the shifted one, and shifting both keeps the answer's own header agreeing with the citation, so the *only* assertion left to fail is the range one.
+- *Must fail:* `TestAskOverARealIndexReturnsACitationWhoseDigestMatchesTheSpan`
+- *Observed:* killed, with the digest assertion passing — `read_live_test.go:390: citation 1: lines 15-17 of calc/calc.go are not the bytes the answer shows`. That is M3's isolation repeated against a mutation of the *code* rather than of the test.
+- *Compiles and vets:* yes; valid SQL returning the same rows in the same order with a different value, which is what rule 2 requires of a SQL mutation.
+
+**M5 — the repo filter defeated in both arms (`repo_id = $1 OR true`).**
+- *Why the code exists:* retrieval is scoped to one repository; a missing filter serves another repository's code to a caller who named this one.
+- *Fixture that separates mutant from original:* two repositories over the same tree — the AST corpus and the window corpus — where the window one holds a *strictly better* match for the doc-prose query, since `doc.go` produces no AST spans at all.
+- *Observed, and this is the defect the round found:* the first run killed only `TestPackageDocProseIsUnretrievableUnderTheASTStrategy` (`the AST corpus cited doc.go at 1-5; it has no spans there`, and the lexical case answered instead of refusing). **`TestAskOverARealIndex…` stayed green, and its scope assertion was vacuous**: it compared `citation.repo_id`, which `NewCitation` fills from the repository the *route* named — so a leaked span arrives carrying the right repo id. Fixed in its own commit before re-running: the test now reads each cited span back through the repo-scoped `GetSpan` and compares the served digest against the stored row. Re-run under the same mutant: killed — `citation 1 cites span 045c897b…, which is not in 9025dc7f…: store: not found`.
+- *Compiles and vets:* yes. `OR true` rather than deleting the predicate, because dropping it unbinds `$1` and pgx answers a protocol error, which is void.
+
+**M6 — `VectorRan` hard-wired to `true`.**
+- *Why the code exists:* it selects the arms *and* decides whether the floor applies. In lexical mode there is no cosine similarity, so a floor over `ts_rank_cd` would be a category error that typechecks.
+- *Fixture that separates mutant from original:* the lexical-mode runs. Every hybrid and vector case passes under the mutant, since `VectorRan` is already true there.
+- *Observed:* killed twice. `lexical over the AST corpus: want refused no_spans, got {…Refused:false…Answer:[1] big.go:3-42…}`, and `lexical mode: 4/10 ranked by the lexical arm, 10 by the vector one` plus `lexical mode reported a top score of 0.64549720287323`.
+- *Compiles and vets:* yes.
+
+**M7 — eviction leaves no tombstone (`… FROM gone WHERE false`).**
+- *Why the code exists:* spec §10 wants `410` for a repository that was here, and the cascade leaves nothing else to tell it from one that never was.
+- *Fixture that separates mutant from original:* a repository indexed and then evicted, driven on all four repo-keyed routes. An unknown id is `404` under both.
+- *Must fail:* `TestAnEvictedRepoAnswersGoneOnEveryReadRoute`
+- *Observed:* killed on all four routes — `an evicted repository answered 404, which forgets it was ever here`, and `want 410 after eviction, got 404: {"error":"no such repository"}`.
+- *Compiles and vets:* yes, and the `DELETE` still runs: a data-modifying CTE executes whether or not the outer query reads its rows, so this is a lost tombstone rather than a skipped eviction.
+
+**M8 — a rejected question counted as an answer error.**
+- *Why the code exists:* a request that never reached the answerer is not one of spec §10's three outcomes, and filing a caller's malformed question as an error inflates exactly the rate §10 wants readable.
+- *Fixture that separates mutant from original:* the `{"q":"   "}` case with the *whole set* of counter series read before and after. An assertion naming one series cannot see a mutant that moves a different one.
+- *Must fail:* `TestARefusalAnErrorAndAValidationFailureAreThreeOutcomesLive`
+- *Observed:* killed — `a validation failure moved map[codetrail_answer_total{outcome="error"}:1]; it must move no outcome counter at all`.
+- *Compiles and vets:* yes.
+
+- [x] **Step 6: Commit**
 
 ```bash
 git commit -m "feat(gateway): P3 end to end, and a README that does not claim a calibrated floor
@@ -1985,25 +2053,27 @@ is spec:316's experiment."
 ```
 
 **Definition of Done**
-- The whole path runs on a live database on the fake embedder in CI.
-- A citation returned by the API was checked byte-for-byte against `git show`, and the permalink was opened.
-- The README's floor and staleness claims are true, and a skim of either cannot produce "the floor is calibrated".
-- The `doc.go` asymmetry is pinned by a test and named in the README as a retrieval limitation.
+- [x] The whole path runs on a live database on the fake embedder in CI — six new live tests over a fixture corpus indexed through `chunk`, `embed.FromEnv` and `store`, with the CI step's comment saying what a green build proves and what it cannot.
+- [x] A citation returned by the API was checked byte-for-byte against `git show`, and the permalink was opened. `sampler.go:18-23` of `rs/zerolog` at `dfd11cca`, digest `a7a70e1e…`, hashed from the answer's own rendered text and from `git show … | sed … | head -c -1`; the permalink lands on L18–L23.
+- [x] The README's floor and staleness claims are true, and a skim of either cannot produce "the floor is calibrated" — "ships uncalibrated" and "measured in P6" are in the same paragraph, and the phase table's P3 row says the value is P6's.
+- [x] The `doc.go` asymmetry is pinned by a test and named in the README as a retrieval limitation — with the plan's prediction of a refusal corrected: under `hybrid` it answers from other files instead, and only `lexical` refuses.
 
 ---
 
 ## Definition of done for P3
 
-- [ ] Hybrid retrieval: pgvector cosine filtered by repo, fused by reciprocal rank with a lexical arm over symbol names and identifiers, switchable and measurable per arm.
-- [ ] Citations carry `(repo, commit, path, startLine, endLine, digest)`, render an immutable permalink for each supported forge and none for a forge whose format is unknown, and state exactly what is known about staleness and what is not.
-- [ ] An extractive answer assembles ranked spans with citation markers, never truncating a span under its own digest, with no model call and no API key.
-- [ ] A refusal happens when nothing is retrieved, when the top score falls under the floor, and when the top score is not a number — and it is a `200` with a reason.
-- [ ] Refusal and error are distinct in the metrics, asserted in both directions on both counters.
-- [ ] The floor is a knob, ships at `-1`, is labelled uncalibrated in the payload, the gauges, the boot log and the README, and P6 is named as where the number comes from.
-- [ ] The top-score histogram exists and its `Help` string says it is an instrument, not a calibration.
-- [ ] An evicted repo answers `410`; an unknown one `404`; job history is bounded by a stated age window that never deletes a running job.
-- [ ] A completed job names the repository it produced.
-- [ ] Every mutation is recorded with its observed output, and every survivor is recorded as a survivor with what it revealed.
+- [x] Hybrid retrieval: pgvector cosine filtered by repo, fused by reciprocal rank with a lexical arm over symbol names and identifiers, switchable and measurable per arm. Live: `TestEveryRetrievalModeRetrievesFromALiveCorpus` drives all three modes over one corpus and asserts which arm ranked what.
+- [x] Citations carry `(repo, commit, path, startLine, endLine, digest)`, render an immutable permalink for each supported forge and none for a forge whose format is unknown, and state exactly what is known about staleness and what is not.
+- [x] An extractive answer assembles ranked spans with citation markers, never truncating a span under its own digest, and needs no API key. **The "no model call" half of this line was false and is corrected here as it was in the README**: the *assembly* makes no model call, and the query is embedded on every search and every ask. What is true is no API key, no vendor cost, and offline.
+- [x] A refusal happens when nothing is retrieved, when the top score falls under the floor, and when the top score is not a number — and it is a `200` with a reason.
+- [x] Refusal and error are distinct in the metrics, asserted in both directions on both counters — hermetically in Task 7 and, on a live database with a real `ErrModelMismatch`, in Task 8, both as the whole set of series that moved.
+- [x] The floor is a knob, ships at `-1`, is labelled uncalibrated in the payload, the gauges, the boot log and the README, and P6 is named as where the number comes from. All four verified live: the running gateway serves `codetrail_score_floor -1` and `codetrail_score_floor_calibrated 0`.
+- [x] The top-score histogram exists and its `Help` string says it is an instrument, not a calibration.
+- [x] An evicted repo answers `410`; an unknown one `404`; job history is bounded by a stated age window that never deletes a running job (`status IN ('done','failed')` is the safety property, not a filter).
+- [x] A completed job names the repository it produced — verified live: `{"id":"0a7fca4c…","status":"done","repo_id":"bee14320c329c3c67b2786f124cbd74b"}`.
+- [x] Every mutation is recorded with its observed output, and every survivor is recorded as a survivor with what it revealed. **99 mutations across eight tasks, no void kills standing, and no survivor of the shipped configuration.** M1 here is the one mutant that survives under a *named environment* rather than under the code, and that survival is the finding that changed the CI step.
+
+**One residual risk this phase closes with, recorded rather than fixed.** Four knobs are read through `config.GetInt`, which answers its default for anything it cannot parse: `RETRIEVAL_RRF_K=abc`, `RETRIEVAL_CANDIDATES=oops`, `ANSWER_MAX_SPANS=five` and `ANSWER_MAX_CHARS=lots` each boot silently on the shipped value. Measured by running the binary with each: the first three logged `rrf_k=60 candidates=40` and `answer_max_spans=5` and started, while `ANSWER_SCORE_FLOOR=abc` and `RETRIEVAL_MODE=nope` refused. Their *ranges* are all validated — a negative `k`, a zero depth, a zero budget and a floor outside `[-1,1]` are each a refusal naming the setting — so "validated at boot" is true of the values and not of the parse. The floor is hand-parsed for exactly this reason, and the same hardening is owed to the other four and to P1's integer caps; it is written in the README rather than rounded up, because "all knobs validated at boot" is the sentence P2's review already found false once.
 
 **Not in P3, deliberately:** no symbol graph and no `definition_of`/`callers_of` (P4) — the spec lists them as tools for the LLM loop, which is P7. No LLM answering: the response already names `answered_by` so the field exists before there is anything to downgrade from. No console (P5). No eval harness, golden set or calibration (P6) — P3's contribution to it is the instrument and the switchable arms. No incremental re-index (P7). No rate limit on submission, which is the control the job-retention window explicitly does not replace. No `/metrics` on the indexer, so its eviction and job-outcome counters have nowhere to live yet.
 
@@ -2057,6 +2127,7 @@ Nothing here is blocking. Each is something the spec does not settle, with the t
 15. **The lexical arm's ranking function makes repetition outrank coverage, and `simple` has no stopword list.** Both are consequences of Task 3's shipped choices, both were found by measurement, and neither is a defect to fix now.
     Under `ts_rank_cd` a span mentioning one query term six times outranks a span mentioning each of two terms once (2.4 against 0.8); under `ts_rank` the order reverses (0.1813 against 0.2432). Cover density does not enter into it — it never runs under `OR`, which is the only shape this arm builds — so the choice between the functions is a choice between *frequency* and *distinct-term coverage*, made without a corpus to measure against. Separately, the `simple` configuration drops nothing, so "where is X defined" ORs in `where`, `is` and `defined`, and every span containing the word "defined" is a candidate. The two compound: a span that says "where" six times is a hit.
     *Recommendation:* leave both as they ship, and keep them visible rather than papering over them. Task 3's test is named `TestRepetitionOutranksCoverageUnderTheShippedRankingFunction` precisely so the consequence is in the test list and not only in a comment, and M6 records that the function is pinned but not justified. **This is a P6 question** — spec:316 makes the whole arm's value an experiment, and both a ranking-function sweep and a code-appropriate stopword list are things to decide with a golden set in front of you. Adding either now would be a guess wearing a measurement's clothes, which is the same mistake the `-1` floor exists to avoid.
+    **Confirmed on a real corpus in Task 8, and now in the README.** Both numbers re-measured against the pinned pg17 (`ts_rank_cd` 2.4 against 0.8; `ts_rank` 0.18133 against 0.24317), and the consequence is visible in the shipped product rather than only in a fixture: asking `rs/zerolog` "how does the sampler decide to drop an event" in `hybrid` returns `event_test.go` at ranks 4 and 5, because `event` is a live term and the test file repeats it. That is reported as one of two result sets, never as evidence that either mode is better.
 
 16. **Nothing in the lexical suite detects a missing `ORDER BY` on the ranking pair, and the obvious fix does not work.** Task 3's M9 dropped the arm's `ORDER BY` and survived `TestRepetitionOutranksCoverageUnderTheShippedRankingFunction` twice: once because the two spans had been inserted in the order the test expects them back, and again after that was corrected, because with no `ORDER BY` the pair comes back `[x_repeat, y_cover]` **whichever order it was inserted in**. An unordered result is not an insertion-ordered result, and "Fixtures" rule 2 — build the fixture so the answer disagrees with insertion order — is therefore necessary but not sufficient; Task 2's M5 found the same thing from the other side, where the rows came back in *path* order.
     *Recommendation:* nothing to change now. M9 is killed by `TestSymbolOutweighsBody`, so the arm's ordering is pinned; what is recorded here is that the fixture rule the plan leaned on does not do the work it was assumed to do. A phase that writes a new retrieval fixture should assert the disagreement it depends on rather than construct it, as Task 2's ranking test now does.
