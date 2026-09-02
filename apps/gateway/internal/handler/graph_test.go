@@ -577,7 +577,10 @@ func TestDepthOutsideOneToFiveIsFourHundredNamingTheRule(t *testing.T) {
 	for _, raw := range []string{"40", "0", "-1", "6", "five"} {
 		rec := getPath(e, "/api/repos/repo-1/symbols/"+symStoreGet+"/callers?depth="+raw)
 		if rec.Code != http.StatusBadRequest {
-			t.Errorf("depth=%s answered %d: %s", raw, rec.Code, rec.Body)
+			// The depth it served, not the whole body: a clamp answers 200 and
+			// the number it clamped to is the fact that names the mutant.
+			t.Errorf("depth=%s answered %d with depth %v, want 400",
+				raw, rec.Code, body(t, rec)["depth"])
 			continue
 		}
 		out := body(t, rec)
