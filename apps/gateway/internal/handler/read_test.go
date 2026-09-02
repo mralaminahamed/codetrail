@@ -99,6 +99,10 @@ type fakeStore struct {
 	embedderErr error
 
 	touched []string
+	// The limit the last listing asked for. Recorded because the default is a
+	// number nothing else can see: the fake would answer its one row whatever
+	// it was handed.
+	listLimit int
 
 	vector, lexical []models.Cite
 	model           string
@@ -123,7 +127,8 @@ func newStore() *fakeStore {
 // A failing read returns the zero value with its error, as the real store does:
 // a handler that swallows one then serves that zero value, which is the shape
 // of the mistake worth catching.
-func (f *fakeStore) ListRepos(context.Context, int) ([]store.RepoRow, error) {
+func (f *fakeStore) ListRepos(_ context.Context, limit int) ([]store.RepoRow, error) {
+	f.listLimit = limit
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
@@ -717,7 +722,7 @@ func TestAnEmptyOrTokenlessQuestionIsFourHundredNamingTheRule(t *testing.T) {
 		{"empty", ""},
 		{"whitespace", "   \t\n "},
 		{"punctuation only", "???"},
-		{"too long", strings.Repeat("a", maxQuestionLen+1)},
+		{"1001 characters", strings.Repeat("a", 1001)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			st := newStore()
@@ -1202,4 +1207,156 @@ func movedSince(t *testing.T, before map[string]float64) map[string]float64 {
 		}
 	}
 	return moved
+}
+
+// Each reason says what it means in words (spec §10 forbids a generic
+// refusal), and the strings are pinned whole. Only the below_floor one was ever
+// read back: the other two could be emptied, swapped or reduced to "refused"
+// and every assertion in this file still passed.
+func TestEveryRefusalReasonCarriesItsOwnDetail(t *testing.T) {
+	for _, tc := range []struct {
+		reason rag.Reason
+		res    rag.Result
+		floor  rag.Floor
+		want   string
+	}{
+		{rag.ReasonNoSpans,
+			rag.Result{Mode: rag.ModeHybrid, TopScore: math.NaN(), VectorRan: true},
+			rag.DefaultFloor(),
+			"Nothing in this repository's index matched the question."},
+		{rag.ReasonBelowFloor, result(rag.ModeHybrid, 0.2, true), rag.Floor{Value: 0.5},
+			"The best match scored under the configured floor of 0.5. " +
+				"That floor is not calibrated; its value is measured in P6."},
+		{rag.ReasonUnscored, result(rag.ModeHybrid, math.NaN(), true), rag.DefaultFloor(),
+			"The best match has no usable similarity score, so there is nothing to judge it by."},
+	} {
+		t.Run(string(tc.reason), func(t *testing.T) {
+			h := hermeticHandler(newStore(), &fakeRetriever{res: tc.res})
+			h.Floor = tc.floor
+			rec := do(mount(h), http.MethodPost, "/api/repos/repo-1/ask", `{"q":"sampler"}`)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body)
+			}
+			out := body(t, rec)
+			if out["reason"] != string(tc.reason) {
+				t.Fatalf("reason %v, want %q", out["reason"], tc.reason)
+			}
+			if out["detail"] != tc.want {
+				t.Errorf("detail %q, want %q", out["detail"], tc.want)
+			}
+		})
+	}
+	// And the three are different sentences: one string reused for all of them
+	// would satisfy "has a detail" everywhere and tell a caller nothing.
+	seen := map[string]rag.Reason{}
+	for _, r := range []rag.Reason{rag.ReasonNoSpans, rag.ReasonBelowFloor, rag.ReasonUnscored} {
+		d := detail(r, rag.DefaultFloor())
+		if d == "" {
+			t.Errorf("%s has no detail", r)
+		}
+		if other, ok := seen[d]; ok {
+			t.Errorf("%s and %s share a detail: %q", r, other, d)
+		}
+		seen[d] = r
+	}
+}
+
+// What a caller who names no limit gets. Each of these is a number nothing read
+// back: the retriever and the store were handed whatever the handler chose and
+// answered the same fixture regardless, so every default here was free to move.
+func TestTheReadPathDefaultsAndTheirCeilingReachTheStore(t *testing.T) {
+	st, rt := newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)}
+	h := hermeticHandler(st, rt)
+	// Not the shipped budget: a value no constant in this package shares, so
+	// "ask defaults to the answer budget" cannot be satisfied by a literal or
+	// by defaultSearchLimit.
+	h.Budget = rag.Budget{MaxSpans: 7, MaxChars: 4000}
+	e := mount(h)
+
+	do(e, http.MethodGet, "/api/repos", "")
+	if st.listLimit != 20 {
+		t.Errorf("a listing with no ?limit asked for %d repos, want 20", st.listLimit)
+	}
+	do(e, http.MethodPost, "/api/repos/repo-1/search", `{"q":"sampler"}`)
+	do(e, http.MethodPost, "/api/repos/repo-1/ask", `{"q":"sampler"}`)
+	if len(rt.calls) != 2 {
+		t.Fatalf("want a retrieval per route, got %v", rt.calls)
+	}
+	if rt.calls[0].limit != 10 {
+		t.Errorf("a search with no limit retrieved %d, want 10", rt.calls[0].limit)
+	}
+	// An ask retrieves exactly what an answer can hold, so a caller who says
+	// nothing never pays for spans the budget would drop.
+	if rt.calls[1].limit != h.Budget.MaxSpans {
+		t.Errorf("an ask with no limit retrieved %d, want the budget's %d",
+			rt.calls[1].limit, h.Budget.MaxSpans)
+	}
+
+	// The ceiling from the accepted side. 51 is a 400 elsewhere in this file;
+	// without this, maxReadLimit could be any number below 51.
+	do(e, http.MethodGet, "/api/repos?limit=50", "")
+	if st.listLimit != 50 {
+		t.Errorf("?limit=50 asked for %d repos, want 50", st.listLimit)
+	}
+	do(e, http.MethodPost, "/api/repos/repo-1/search", `{"q":"sampler","limit":50}`)
+	if got := rt.calls[len(rt.calls)-1].limit; got != 50 {
+		t.Errorf("a search for 50 retrieved %d", got)
+	}
+}
+
+// The bound on a question, from both sides and in literals. Derived from the
+// constant, "one over the limit" is one over whatever the limit became: the
+// fixture moved with maxQuestionLen instead of pinning it.
+func TestAQuestionAtTheLengthLimitIsAcceptedAndOneOverIsNot(t *testing.T) {
+	st, rt := newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)}
+	e := mount(hermeticHandler(st, rt))
+	for _, route := range []string{"search", "ask"} {
+		path := "/api/repos/repo-1/" + route
+		if rec := do(e, http.MethodPost, path, `{"q":"`+strings.Repeat("a", 1000)+`"}`); rec.Code != http.StatusOK {
+			t.Errorf("%s: a 1,000-character question was refused: %d %s", route, rec.Code, rec.Body)
+		}
+		rec := do(e, http.MethodPost, path, `{"q":"`+strings.Repeat("a", 1001)+`"}`)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: a 1,001-character question was accepted: %d", route, rec.Code)
+			continue
+		}
+		// The message names the bound, so a caller can act on it rather than
+		// bisecting their own question.
+		if d, _ := body(t, rec)["error"].(string); !strings.Contains(d, "1000") {
+			t.Errorf("%s: the refusal does not name the limit: %q", route, d)
+		}
+	}
+}
+
+// Symbol is on both response views and was read by neither, so it could be
+// dropped from both: a caller looking for a function by name would get the path
+// and the lines and nothing that says what it is called.
+func TestBothResponseViewsCarryTheSymbol(t *testing.T) {
+	st, rt := newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)}
+	e := mount(hermeticHandler(st, rt))
+
+	span, _ := body(t, do(e, http.MethodGet, "/api/repos/repo-1/spans/span-c", ""))["span"].(map[string]any)
+	if span["symbol"] != "Sample" {
+		t.Errorf("the span view's symbol is %v, want %q", span["symbol"], "Sample")
+	}
+
+	hits, _ := body(t, do(e, http.MethodPost, "/api/repos/repo-1/search", `{"q":"sampler"}`))["hits"].([]any)
+	// The fixture's third span has none: an empty symbol is a real value — a
+	// markdown heading has no declaration — and the key has to be there anyway,
+	// or a client cannot tell "no symbol" from "field gone".
+	want := []string{"Sample", "Logger", ""}
+	if len(hits) != len(want) {
+		t.Fatalf("want %d hits, got %d", len(want), len(hits))
+	}
+	for i, h := range hits {
+		hit, _ := h.(map[string]any)
+		sym, ok := hit["symbol"]
+		if !ok {
+			t.Errorf("hit %d carries no symbol key: %v", i, hit)
+			continue
+		}
+		if sym != want[i] {
+			t.Errorf("hit %d symbol %v, want %q", i, sym, want[i])
+		}
+	}
 }
