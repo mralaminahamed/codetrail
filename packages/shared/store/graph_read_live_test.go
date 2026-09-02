@@ -22,7 +22,7 @@ import (
 //	                target ─▶ target    a direct self-call
 //	         d ─▶ e ─▶ d, e ─▶ target   a two-node cycle reaching target
 //	Store.Get and Cache.Get             two definitions sharing a last segment
-//	f ─▶ "Get", f ─▶ "target"           syntactic edges, null target
+//	f ─▶ "Get" twice, f ─▶ "target"     syntactic edges, null target
 //	g ─▶ Store.Get, h ─▶ Cache.Get      resolved edges naming Get
 //
 // outer exists because the diamond puts main at depth 2 by the short route, so
@@ -113,7 +113,10 @@ func seedReadGraph(t *testing.T) graphFixture {
 		call("e", "z.go", 12, "d", id("d")),
 		call("e", "z.go", 13, "target", id("target")),
 		call("g", "store.go", 8, "Get", id("Store.Get")),
+		// Two call sites in one function are two approximate rows, which is
+		// what puts the call site in that query's ORDER BY.
 		call("f", "cache.go", 8, "Get", ""),
+		call("f", "cache.go", 10, "Get", ""),
 		call("h", "cache.go", 12, "Get", id("Cache.Get")),
 		call("f", "cache.go", 9, "target", ""),
 	}
@@ -435,13 +438,19 @@ func TestApproximateCallersAreNameMatchedAndSeparateLive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 {
-		t.Fatalf("approximate callers of Get: %d rows %v, want 1 (f)", len(got), approxNames(got))
+	// Two rows, because f calls something named Get twice: the set is call
+	// sites, not callers, and the order between two sites in one function is
+	// the query's to decide rather than the planner's.
+	var sites []string
+	for _, a := range got {
+		if a.ToName != "Get" {
+			t.Errorf("%s is in the answer for Get with to_name %q", a.Symbol.Name, a.ToName)
+		}
+		sites = append(sites, fmt.Sprintf("%s@%s:%d", a.Symbol.Name, a.CallPath, a.CallLine))
 	}
-	a := got[0]
-	if a.Symbol.Name != "f" || a.ToName != "Get" || a.CallPath != "cache.go" || a.CallLine != 8 {
-		t.Errorf("approximate caller %s calls %q at %s:%d, want f calls \"Get\" at cache.go:8",
-			a.Symbol.Name, a.ToName, a.CallPath, a.CallLine)
+	want := []string{"f@cache.go:8", "f@cache.go:10"}
+	if !slices.Equal(sites, want) {
+		t.Errorf("approximate callers of Get: %v, want %v", sites, want)
 	}
 
 	// Separate, not merged: f is in neither precise answer, and the precise
@@ -483,7 +492,7 @@ func TestApproximateCallersExcludeResolvedEdgesLive(t *testing.T) {
 		t.Fatal(err)
 	}
 	// g calls Store.Get and h calls Cache.Get, both resolved, both naming Get.
-	if want := []string{"f"}; !slices.Equal(approxNames(got), want) {
+	if want := []string{"f", "f"}; !slices.Equal(approxNames(got), want) {
 		t.Errorf("approximate callers of Get: %v, want %v (g and h resolve)", approxNames(got), want)
 	}
 }
@@ -581,7 +590,7 @@ func TestRepoStatsSplitsEdgesByProvenanceLive(t *testing.T) {
 	}
 	want := Stats{
 		Files: 4, Spans: 0, FilesWithSpans: 0,
-		Symbols: 13, Edges: 14, EdgesResolved: 12, EdgesSyntactic: 2,
+		Symbols: 13, Edges: 15, EdgesResolved: 12, EdgesSyntactic: 3,
 	}
 	if got != want {
 		t.Errorf("repo A stats %+v, want %+v", got, want)
