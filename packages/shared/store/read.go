@@ -18,12 +18,17 @@ type RepoRow struct {
 	LastUsedAt time.Time
 }
 
-// ListRepos is the corpus, most recently used first — the same order Evict
+// ListRepos is the corpus, most recently used first — on the same column Evict
 // reads, so the listing's tail is what eviction takes next.
 //
-// The id tiebreak is not decoration: PutRepo stamps last_queried_at from now()
-// once per transaction, so a batch of repos indexed inside one clock tick ties,
-// and two listings of an unchanged corpus would otherwise differ.
+// The same column, not the same ORDER BY: the id tiebreak is this query's own
+// and Evict has none. PutRepo stamps last_queried_at from now() once per
+// transaction, so a batch of repos indexed inside one clock tick ties, and two
+// listings of an unchanged corpus would otherwise differ. Eviction needs no
+// such tiebreak — a tie spanning the keep boundary means two equally stale
+// repositories and either may go — so the listing's tail names what goes next
+// as a set, and which of two tied rows leads it is not a promise about which
+// one eviction takes.
 func (s *Store) ListRepos(ctx context.Context, limit int) ([]RepoRow, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, remote, ref, commit_sha, size_bytes, indexed_at, last_queried_at
