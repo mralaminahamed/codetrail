@@ -43,9 +43,12 @@ jobs:
       # against a schema Postgres would reject.
       #
       # Spec §9 requires the harness to run with no model. EMBED_PROVIDER is
-      # written out rather than left to a default: every live suite defaults to
-      # the fake itself and refuses any other provider, so this is the intent
-      # made visible in the log next to the run it describes.
+      # written out rather than left to a default, and it changes nothing about
+      # the run: the two live suites that build an embedder — apps/indexer/cmd
+      # and apps/gateway/internal/handler — default to the fake themselves and
+      # refuse any other provider, and the store and jobs suites never construct
+      # one at all. It is here as the intent, visible in the log next to the run
+      # it describes.
       #
       # What a green run here proves as of P3: the whole read path — both
       # retrieval arms, fusion, the floor, an extractive answer and its
