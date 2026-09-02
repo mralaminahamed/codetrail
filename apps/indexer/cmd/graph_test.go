@@ -532,8 +532,11 @@ func TestADeclarationWithNoSpanStillGetsASymbolWithANullLink(t *testing.T) {
 	for _, s := range rec.syms {
 		links[s.Name] = s.SpanID
 	}
-	if links["F"] != "" {
-		t.Errorf("F links to a span (%s); with the doc comment stripped its first line is in none", links["F"])
+	for _, name := range []string{"F", "G"} {
+		if links[name] != "" {
+			t.Errorf("%s links to span %s; with the doc comment stripped its first line is inside no span, and the nearest one below it belongs to another declaration",
+				name, links[name])
+		}
 	}
 	// And the undocumented declaration in the same file still links, so the
 	// null above is a property of the range and not of the whole job.
