@@ -1614,9 +1614,15 @@ label for whether a hit was correct."
 ### Task 7: The read endpoints — search, span, repo, ask, refusal
 
 **Files:**
-- Create: `apps/gateway/internal/handler/read.go`, `packages/shared/rag/answer.go`
-- Modify: `apps/gateway/internal/handler/handler.go` (Mount), `apps/gateway/cmd/main.go` (wire the reader)
-- Test: `apps/gateway/internal/handler/read_test.go`, `packages/shared/rag/answer_test.go`
+
+- Create: `apps/gateway/internal/handler/read.go`, `packages/shared/rag/answer.go`, **`packages/shared/store/read.go`**
+- Modify: `apps/gateway/internal/handler/handler.go` (Mount, and `jobView`), `apps/gateway/cmd/main.go` (wire the reader), `apps/gateway/cmd/store.go`, `packages/shared/rag/cite.go` (`NewStaleness`), `packages/shared/store/evict.go` + `repos.go` (the two comments this task makes false)
+- Test: `apps/gateway/internal/handler/read_test.go`, `packages/shared/rag/answer_test.go`, **`packages/shared/store/read_live_test.go`**
+
+**Corrected against what the routes need.** The file list above originally held four files and no store change, and the five routes cannot be served from the store as Tasks 1–6 left it: there is no listing, no per-repo counts and no way to read one span. Three queries were added — `ListRepos`, `RepoStats`, `GetSpan` — with live tests, because a hermetic handler test above untested SQL proves the handler, not the query. Two more corrections in the same direction:
+
+- **`jobs.repo_id` never reached the API.** Task 5 added the column for the submit-then-poll flow and Open question 13 calls that flow covered; no task wired it to a response, and `jobView` is a whitelist, so `GET /api/jobs/:id` withheld it. Every read endpoint here is keyed on a repo id and `hash(key, commit)` is computable only by the indexer, so without this the corpus listing was a caller's only route to one. Added as `repo_id,omitempty` — empty until the job is done — and the P1 disclosure test still passes, because a pending job has none.
+- **`rag.NewStaleness`.** The repo view claims staleness with no span to cite, and `staleness` was unexported. Exported as a wrapper rather than duplicated, so the repo view and a citation cannot word the same evidence differently.
 
 **Routes:**
 
@@ -1639,7 +1645,7 @@ label for whether a hit was correct."
 - **The response always names what answered it** — `"answered_by": "extractive"` — even though there is only one answerer until P7. §8 calls a silent downgrade the failure that costs a week; the field has to exist *before* there is something to downgrade from, or the console and every client will be written without it.
 - **`top_score` is a `*float64`.** `json.Marshal` fails outright on `NaN` — the response would be a `500` with an empty body — and a lexical-only or empty result has no score. `null` is the honest encoding.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `answer_test.go`, hermetic:
 
@@ -1647,9 +1653,14 @@ label for whether a hit was correct."
 // Over budget, whole spans are dropped. Truncating one would put a digest on
 // text that is not the text the digest was taken of.
 func TestAssembleDropsWholeSpansAndNeverTruncatesOne(t *testing.T) {
-	// Fixture: three spans of 4,000 characters each with a budget of 9,000.
+	// Fixture: three spans with a budget of 9,000.
 	// A budget larger than the corpus cannot detect a truncating assembler,
 	// and equal-length spans cannot detect a wrong drop order.
+	//
+	// Corrected: the prescription (three spans of 4,000 characters *each*)
+	// contradicted its own second sentence. The shipped fixture is 4,000 /
+	// 3,500 / 3,000, and the assertions name which spans survived rather
+	// than how many, which is what a wrong drop order actually changes.
 }
 func TestAssembleNumbersCitationsInRankOrder(t *testing.T)
 func TestAssembleReportsWhatItDropped(t *testing.T)
@@ -1683,12 +1694,12 @@ func TestANaNTopScoreSerialisesAsNull(t *testing.T)
 
 `TestARetrievalErrorIsFiveHundredAndIsNotCountedAsARefusal` and its mirror are the two that carry spec §10. Both read the Prometheus counters before and after and assert the *delta on both counters*, not just the one they expect to move — a test that only checks its own counter passes under a mutant that increments both.
 
-- [ ] **Step 2: Implement**
+- [x] **Step 2: Implement**
 
 Sketch of the ask handler's shape:
 
 ```go
-out, err := h.Rag.Search(ctx, repoID, req.Q, h.AnswerSpans)
+out, err := h.Rag.Search(ctx, repoID, q, limit)   // limit defaults to h.Budget.MaxSpans
 if err != nil {
 	metrics.CountAnswer("error")
 	return h.fail(c, err, "ask")
@@ -1702,65 +1713,144 @@ if outcome == rag.OutcomeRefused {
 metrics.CountAnswer("answered")
 ```
 
-- [ ] **Step 3: Commit, then prove the tests discriminate**
+- [x] **Step 3: Commit, then prove the tests discriminate**
+
+**Shipped shapes.** `GET /api/repos` → `{repos:[{id,remote,ref,commit,indexed_at,last_used_at}],count}`. `GET /api/repos/:repo` → `{id,remote,ref,commit,indexed_at,files,spans,files_with_spans,staleness}`. `GET /api/repos/:repo/spans/:span` → `{span:{id,path,kind,symbol,start_line,end_line,text},citation}` — `file_id` and `repo_id` are join keys and stay off the wire, as `jobView` does it. `POST …/search` → `{repo_id,mode,top_score,count,hits:[{span_id,path,kind,symbol,start_line,end_line,text,score,vector_score,vector_rank,lexical_rank,citation}]}`. `POST …/ask` → `{repo_id,refused:false,answered_by,answer,citations,dropped,mode,top_score,floor:{value,calibrated,applicable}}` or `{repo_id,refused:true,reason,detail,mode,top_score,floor}`.
+
+Three decisions the plan did not make, made here and recorded rather than discovered:
+
+- **`search` carries no `floor`.** The floor is the answer's decision; reporting one on a route that never applied it implies a filter that did not run. M13 pins it.
+- **`hits[].vector_score` is `null` when `vector_rank` is 0.** `Fused.VectorScore` is the zero value for a span the vector arm never returned, and 0 is a real cosine similarity — an orthogonal span. M15 pins it.
+- **The top-ranked span is kept whole however long it is**, so a budget smaller than the first span still answers. The no-truncation rule outranks the budget, because the alternative is an empty answer beside a non-zero hit count. `TestASpanLargerThanTheWholeBudgetIsStillCitedWhole` pins it.
+
+**Eighteen mutations, eighteen kills, no survivors.** M1–M10 are the plan's; M11–M18 were added where the shipped code made a claim the plan's ten did not reach.
 
 **M1 — a refusal answered as `422` (or `404`).**
 - *Why the code exists:* an HTTP error code puts a refusal in every error-rate panel, which is §10's failure with a different spelling.
-- *Fixture that separates mutant from original:* the below-floor retriever. The no-hits one works too; keep both, since they take different branches.
+- *Fixture that separates mutant from original:* the below-floor retriever. The no-hits one works too; both are kept, since they take different branches.
 - *Must fail:* `TestAskRefusesUnderTheFloorWithTwoHundredAndAReason`
-- *Expected (verify and correct):* `want 200 with refused=true, got 422`
+- *Observed:* killed, both branches. `read_test.go:425: want 200 with refused=true, got 422: {"repo_id":"repo-1","refused":true,"reason":"below_floor",…}` and `read_test.go:452: want 200, got 422: {…"reason":"no_spans"…}`. Predicted output was correct.
+- *Compiles and vets:* yes; a different constant of the same type.
 
 **M2 — `metrics.CountAnswer("error")` in the refusal branch.**
 - *Why the code exists:* spec §10, the sentence this whole phase is built around.
-- *Fixture that separates mutant from original:* the counter delta assertion on **both** counters. A test asserting only that the refusal counter moved passes under this mutant, because the mutant still counts the refusal reason.
+- *Fixture that separates mutant from original:* the counter delta assertion on **both** counters. A test asserting only that the refusal counter moved passes here, because the mutant still counts the refusal reason.
 - *Must fail:* `TestARefusalIsNotCountedAsAnError`
-- *Expected (verify and correct):* `answer_total{outcome="error"} moved by 1 on a refusal`
+- *Observed:* killed. `counters moved map[codetrail_answer_total{outcome="error"}:1 codetrail_refusal_total{reason="below_floor"}:1], want map[codetrail_answer_total{outcome="refused"}:1 codetrail_refusal_total{reason="below_floor"}:1]`. The message is the evidence for the fixture claim: the refusal counter *did* move under the mutant. Predicted as `answer_total{outcome="error"} moved by 1 on a refusal` — right in substance; the assertion compares the whole set of series that moved, so a mutant incrementing both is also a failure.
+- *Compiles and vets:* yes; a different string literal to the same call.
 
 **M3 — `metrics.CountAnswer("refused")` in the error branch.**
 - *Why the code exists:* the same sentence, read the other way.
 - *Fixture that separates mutant from original:* the erroring fake retriever.
 - *Must fail:* `TestARetrievalErrorIsFiveHundredAndIsNotCountedAsARefusal`
+- *Observed:* killed. `counters moved map[codetrail_answer_total{outcome="refused"}:1], want map[codetrail_answer_total{outcome="error"}:1]`.
+- *Compiles and vets:* yes.
 
 **M4 — the assembler truncates the last span to fit the budget.**
 - *Why the code exists:* a digest over text that was then cut is a citation that lies.
-- *Fixture that separates mutant from original:* three 4,000-character spans against a 9,000-character budget, so the third span *must* be dealt with. A budget bigger than the corpus never reaches the branch. The assertion is `strings.Contains(answer, span.Text)` for every cited span — under the mutant the truncated span's full text is absent while its citation is present.
+- *Fixture that separates mutant from original:* three spans of 4,000 / 3,500 / 3,000 characters against a 9,000-character budget, so the third *must* be dealt with. A budget bigger than the corpus never reaches the branch.
 - *Must fail:* `TestAssembleDropsWholeSpansAndNeverTruncatesOne`
-- *Expected (verify and correct):* `citation 3 names a digest whose text is not in the answer`
+- *Observed:* killed twice over, and the second run is the one that matters. As shipped the test dies first on the count — `kept 3 citations and dropped 0, want 2 and 1: 9000 characters` — which would leave the no-truncation claim itself unproven. Re-run with the count assertion deliberately weakened, the content assertions fire on their own: `citation 3 names digest eb8b4d8da039, whose text is not in the answer` and `the dropped span's text is in the answer`. That is the plan's predicted message, and it is now known to be load-bearing rather than shadowed by the count.
+- *Compiles and vets:* yes; a slice expression in place of a `break`.
 
 **M5 — `TouchRepo` removed from the read path.**
 - *Why the code exists:* it is the LRU clock; without a reader winding it, "least recently *queried*" means "least recently indexed" and a popular repository is evicted while it is being used.
 - *Fixture that separates mutant from original:* a fake store recording touches. Nothing about the response changes, so no assertion on the body can see it.
 - *Must fail:* `TestASuccessfulReadWindsTheLRUClock`
-- *Expected (verify and correct):* `TouchRepo was not called`
+- *Observed:* killed on all four repo routes plus the refusal. `read_test.go:665: /api/repos/repo-1: TouchRepo was not called (touched [])`, and three more, and `a refusal did not wind the clock: touched []`. Predicted as `TouchRepo was not called` — correct.
+- *Compiles and vets:* yes; `if err := error(nil); err != nil` keeps both parameters used.
 
 **M6 — a `TouchRepo` failure returned to the caller.**
 - *Why the code exists:* the touch is a hint for a future eviction, not part of the answer; failing a correct answer on it trades a good response for a bookkeeping error.
-- *Fixture that separates mutant from original:* a fake store whose `TouchRepo` errors while everything else succeeds.
-- *Must fail:* `TestASuccessfulReadWindsTheLRUClock` (extend it with the erroring case) — **verify this predicts a kill**; if the test only asserts the call happened, the mutation survives and the test needs the second case.
+- *Fixture that separates mutant from original:* a fake store whose `TouchRepo` errors while everything else succeeds. The plan asked to **verify this predicts a kill** rather than assuming it: it does, but only because the test was written with the second case. An assertion that the call happened survives this mutation untouched.
+- *Must fail:* `TestASuccessfulReadWindsTheLRUClock`
+- *Observed:* killed — `a failed touch cost the caller the answer: 500 {"error":"internal error","request_id":"dJSTxJWHhIpSHZZTfDsMdxNSdlxcDFki"}`.
+- *Void form, recorded:* the first mutant spelled "returned to the caller" as a `panic`, and the panic escaped into the test binary instead of becoming an assertion failure — an incident, not a kill (rule 7). Two things were wrong and both were fixed: the harness mounted no `middleware.Recover()`, which production's `server.New` does, and the mutation was not the behaviour the comment claims. The recorded kill is the non-panicking form.
 
 **M7 — the evicted branch answers `404`.**
 - *Why the code exists:* spec §10 — it existed, and that is a different fact.
 - *Fixture that separates mutant from original:* the tombstoned id. An unknown id is `404` under both.
 - *Must fail:* `TestAnEvictedRepoIsFourTenNotFourOhFour`
+- *Observed:* killed on all four routes. `GET /api/repos/evicted-1: want 410, got 404: {"error":"this repository was indexed and has since been evicted"}`. `TestAnUnknownRepoIsFourOhFour` passes under the mutant, which is the point of keeping both.
+- *Compiles and vets:* yes.
 
 **M8 — query validation removed.**
 - *Why the code exists:* `"???"` otherwise reaches the embedder, which refuses a text with no tokens, and the user sees a `500`.
-- *Fixture that separates mutant from original:* the `"???"` case with a **real `embed.Fake`** behind the retriever, not a stub that returns hits regardless. A stubbed retriever swallows the mutation and the test passes.
+- *Fixture that separates mutant from original:* the `"???"` case with a **real `embed.Fake`** behind a real `rag.Retriever`, not a stub that returns hits regardless. A stubbed retriever swallows the mutation.
 - *Must fail:* `TestAnEmptyOrTokenlessQuestionIsFourHundredNamingTheRule`
-- *Expected (verify and correct):* `want 400 with a rule, got 500`
+- *Observed:* killed on all four cases, on both routes. Empty, whitespace and punctuation-only give `search: want 400 with a rule, got 500: {"error":"internal error","request_id":…}` — the plan's predicted `want 400 with a rule, got 500`, exactly. The over-length case gives `got 200`, because that rule is a bound rather than a crash-preventer, and the body it served is a full ranked result for a 1,001-character question.
+- *Compiles and vets:* yes; deleting the `switch` leaves `q` used by the return.
 
 **M9 — `top_score` marshalled as a plain `float64`.**
-- *Why the code exists:* `json.Marshal` errors on `NaN`, and echo turns that into an empty `500`.
-- *Fixture that separates mutant from original:* the lexical-only or empty-result case, whose top score is `NaN`. Every scored fixture passes.
+- *Why the code exists:* `json.Marshal` errors on `NaN`, and echo turns that into a `500`.
+- *Fixture that separates mutant from original:* the lexical-only and the empty-result cases, whose top score is `NaN`. Every scored fixture passes.
 - *Must fail:* `TestANaNTopScoreSerialisesAsNull`
-- *Expected (verify and correct):* `json: unsupported value: NaN`
+- *Observed:* killed, and with it `TestAskRefusesWhenNothingWasRetrieved`. `search: want 200, got 500: {"message":"Internal Server Error"}`. **The prediction was wrong in a way worth recording:** `json: unsupported value: NaN` is the underlying error and never reaches the caller — echo's default error handler answers its own body, so the response carries neither the handler's `{"error":"internal error"}` nor a request id. A `NaN` would therefore produce the one 500 in this service that a caller cannot quote back.
+- *Compiles and vets:* yes, once all three response structs change together — the first attempt changed two and broke the build, which is the compiler test rule 2 forbids counting.
 
 **M10 — the question logged at info level.**
 - *Why the code exists:* a public endpoint's user input must not reach an operator's log aggregator.
-- *Fixture that separates mutant from original:* a distinctive question string and a captured zerolog writer. A test that checks the response body cannot see a log line.
+- *Fixture that separates mutant from original:* a distinctive question string and a captured zerolog writer at production's `InfoLevel`. A test that checks the response body cannot see a log line.
 - *Must fail:* `TestTheQuestionIsNeverLogged`
+- *Observed:* killed on three of the six sub-cases. `the question reached the log: {"level":"info","request_id":"afDfbdbIlPgpWJQKWgEpjvDzMaRaMetg","q":"zqxjkv-sampler-question","message":"ask"}`. The test also asserts that something *was* logged for a 500, or every sub-case would pass on a dead writer.
+- *Compiles and vets:* yes.
 
-- [ ] **Step 4: Commit**
+**M11 — `RepoGone` asked before `repos` is read.**
+- *Why the code exists:* a repo id is `hash(key, commit)`, so a repository re-indexed at the same commit re-uses the id its tombstone was written under. Reading `repos` first is what stops a live corpus answering `410`.
+- *Fixture that separates mutant from original:* a live repo **and** a tombstone under the same id, against a fake `RepoGone` that answers the tombstone table alone. The real `RepoGone` carries a `NOT EXISTS` guard; a fake that copied it would cover for the handler and the order would be untested.
+- *Must fail:* `TestALiveRepoIsNeverGoneEvenWithATombstone`
+- *Observed:* killed on all four routes. `GET /api/repos/repo-1: want 200 for a live repo with a stale tombstone, got 410`. `TestAnEvictedRepoIsFourTenNotFourOhFour` and `TestAnUnknownRepoIsFourOhFour` both pass under the mutant, which is why neither can stand in for this fixture.
+- *Compiles and vets:* yes; the two reads swap places.
+
+**M12 — citation markers numbered from the hit index rather than from what was kept.**
+- *Why the code exists:* the marker in the text is what a reader follows; a number that counts skipped hits points at nothing.
+- *Fixture that separates mutant from original:* a hit whose span did not travel with it. With every span present the two numberings agree.
+- *Must fail:* `TestAHitWithNoSpanIsDroppedRatherThanCited`
+- *Observed:* killed. `marker 2 after a skipped hit, want 1: the numbering must follow what is shown`.
+- *Compiles and vets:* yes.
+
+**M13 — `search` applies the floor and refuses.**
+- *Why the code exists:* search ranks, ask answers. A floor on a ranking is a filter nobody asked for, and a `floor` field on a route that never applied one implies a filter that did not run.
+- *Fixture that separates mutant from original:* a top score of 0.2 against a floor of 0.9 — the same numbers the ask refusal uses, driven at the other route.
+- *Must fail:* `TestSearchDoesNotRefuse`
+- *Observed:* killed three ways. `search answered a refusal: {…"reason":"below_floor"…}`, `search reports a floor it never applied`, and `hits <nil>`.
+- *Compiles and vets:* yes.
+
+**M14 — `floor.calibrated` hard-wired to `true` and `applicable` to `true`.**
+- *Why the code exists:* spec:315 puts the number in P6, and `calibrated` is the field that stops a `-1` floor reading as a tuned threshold. `applicable` is false in lexical-only mode, where there is no cosine similarity to compare against.
+- *Fixture that separates mutant from original:* the answered case for `calibrated`, and the lexical-only case for `applicable`. Neither sees the other's half.
+- *Must fail:* `TestAskAnswersWithCitationsAndAPermalink`
+- *Observed:* killed three times. `floor {Value:-1 Calibrated:true Applicable:true}, want {-1 false true}`, `floor map[applicable:true calibrated:true value:0.5]` on the refusal, and `the floor claims to apply in lexical mode: map[applicable:true calibrated:true value:-1]`.
+- *Compiles and vets:* yes.
+
+**M15 — `vector_score` served for a span the vector arm never returned.**
+- *Why the code exists:* `Fused.VectorScore` is the zero value at `VectorRank` 0, and 0 is a real cosine similarity — an orthogonal span. Serving it turns "this arm did not have it" into "this arm scored it at zero".
+- *Fixture that separates mutant from original:* the lexical-only hit, `span-b`. Every hit both arms returned passes.
+- *Must fail:* `TestSearchReturnsPerArmRanksSoFusionCanBeMeasured`
+- *Observed:* killed — `span-b: vector_score 0 with vector_rank 0`. The message first printed the pointer address, which named the defect without naming the value; the assertion now formats the number, and the kill was re-run against it.
+- *Compiles and vets:* yes.
+
+**M16 — `ListRepos` orders `last_queried_at ASC`.**
+- *Why the code exists:* the listing is the corpus in the order eviction reads it, so its tail is what goes next.
+- *Fixture that separates mutant from original:* three repos whose `last_queried_at` is wound backwards, so the expected order disagrees with insertion order; the test also asserts that it disagrees with id order, since an unordered result is not an insertion-ordered one (Open question 16).
+- *Must fail:* `TestListReposIsMostRecentlyUsedFirstLive`
+- *Observed:* killed. `position 0 is 5af9f240076271432b6c90f6a215ceb4, want de516f866b6ea1543285b719c5c1dc62 (order [5af9f240… 05229dea… de516f86…])`.
+- *Compiles and vets:* yes; the statement stays valid SQL and returns the same rows in a different order, which rule 2 requires of a SQL mutation.
+
+**M17 — `RepoStats` counts spans across the whole table.**
+- *Why the code exists:* three numbers about *this* repository; a missing filter reads as a bigger corpus rather than as an error.
+- *Fixture that separates mutant from original:* a second repository holding strictly more spans than the target. A single-repository fixture cannot see it.
+- *Must fail:* `TestRepoStatsCountsThisRepositoryOnlyLive`
+- *Observed:* killed. `stats {Files:3 Spans:13 FilesWithSpans:2}, want {Files:3 Spans:4 FilesWithSpans:2}`.
+- *Compiles and vets:* yes; `count(*) FROM spans` is valid SQL with `$1` still bound by the other two subqueries.
+
+**M18 — `GetSpan`'s repo scope defeated (`repo_id = $1 OR true`).**
+- *Why the code exists:* a span id is a primary key, so an unscoped read serves another repository's code to a caller who named this one.
+- *Fixture that separates mutant from original:* two repositories, and the same span id read under the other one.
+- *Must fail:* `TestGetSpanIsScopedToItsRepositoryLive`
+- *Observed:* killed. `a span of 450ef7df52ceb623922dc23882f4a749 was served under e8db6409713bfa871d12bb3e49cac7da: <nil>`.
+- *Compiles and vets:* yes. `OR true` rather than deleting the predicate, because dropping it unbinds `$1` and pgx answers a protocol error — a void mutation, not a behaviour change (rule 2).
+- [x] **Step 4: Commit**
 
 ```bash
 git commit -m "feat(gateway): search, read, and an extractive answer that can be refused
@@ -1784,11 +1874,13 @@ accident."
 ```
 
 **Definition of Done**
-- Five routes, with `400` naming a rule, `404` for unknown, `410` for evicted, `500` withholding internals.
-- A refusal is a `200` with a reason and is never counted as an error; an error is never counted as a refusal; both directions asserted on both counters.
-- No question in any log line.
-- No citation whose digest does not match the text shown.
-- M1–M10 recorded.
+- [x] Five routes, with `400` naming a rule, `404` for unknown, `410` for evicted, `500` withholding internals.
+- [x] A refusal is a `200` with a reason and is never counted as an error; an error is never counted as a refusal; both directions asserted on both counters — as the whole set of series that moved, so a mutant incrementing both fails too.
+- [x] No question in any log line, on any of the six paths a question can take, with the log writer proved live.
+- [x] No citation whose digest does not match the text shown.
+- [x] M1–M10 recorded, plus M11–M18 for the claims the shipped code makes and the plan's ten did not reach. Eighteen kills, no survivors, one void form corrected before it was counted (M6).
+
+**One residual risk, recorded rather than fixed.** "No question in a log line" holds for every line this handler writes, and the 500 path logs the underlying error, which nothing in this phase builds from the question: `embed.Fake` names an index, `ErrModelMismatch` names models. The one path that could carry question-derived text is a pgx error naming a `tsquery` — `rag.Terms` restricts terms to letters and digits precisely so `to_tsquery` cannot fail on them, so it is unreachable through this code, and it is the thing to check first if a lower layer ever starts interpolating.
 
 ---
 

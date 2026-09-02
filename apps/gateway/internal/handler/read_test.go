@@ -294,7 +294,11 @@ func TestSearchReturnsPerArmRanksSoFusionCanBeMeasured(t *testing.T) {
 		// A span the vector arm never returned has no cosine similarity, and 0
 		// there is a real one — an orthogonal span.
 		if (got.VectorScore == nil) != want.vectorScoreIsNull {
-			t.Errorf("%s: vector_score %v with vector_rank %d", got.SpanID, got.VectorScore, got.VectorRank)
+			shown := "null"
+			if got.VectorScore != nil {
+				shown = strconv.FormatFloat(*got.VectorScore, 'g', -1, 64)
+			}
+			t.Errorf("%s: vector_score %s with vector_rank %d", got.SpanID, shown, got.VectorRank)
 		}
 		s := spanByID(want.id)
 		if got.Text != s.Text || got.StartLine != s.StartLine || got.EndLine != s.EndLine {
