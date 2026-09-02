@@ -5,15 +5,18 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/mralaminahamed/codetrail/packages/shared/rag"
 	"github.com/mralaminahamed/codetrail/packages/shared/store"
 )
 
-// storeHandle is the store surface main needs: a ping for readiness, and the
-// pool the job queue is built from. A test stands in for it without a database:
-// pgxpool.New does not dial, so a fake hands back a real pool aimed at an
-// address nothing answers on and the queue errors rather than panicking. That
-// Pool returns a concrete *pgxpool.Pool does not stop this — see deadStore.
+// storeHandle is the store surface main needs: a ping for readiness, the pool
+// the job queue is built from, and the two retrieval arms. A test stands in for
+// it without a database: pgxpool.New does not dial, so a fake hands back a real
+// pool aimed at an address nothing answers on and the queue errors rather than
+// panicking. That Pool returns a concrete *pgxpool.Pool does not stop this —
+// see deadStore.
 type storeHandle interface {
+	rag.Searcher
 	Ping(context.Context) error
 	Pool() *pgxpool.Pool
 	Close()

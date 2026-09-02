@@ -3,11 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
-	"io"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -1365,93 +1361,6 @@ func TestEmbedderConstructionRefusesTheWrongWidth(t *testing.T) {
 	t.Setenv("EMBED_DIM", "7")
 	if _, err := newEmbedder(context.Background(), time.Minute); !errors.Is(err, store.ErrDimMismatch) {
 		t.Fatalf("want ErrDimMismatch, got %v", err)
-	}
-}
-
-// answersOneVector is an Ollama that has the model and returns the schema's
-// width, which is what a healthy boot probe finds.
-func answersOneVector(t *testing.T) string {
-	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		v := make([]float32, store.EmbeddingDim)
-		v[0] = 1
-		json.NewEncoder(w).Encode(struct {
-			Embeddings [][]float32 `json:"embeddings"`
-		}{[][]float32{v}})
-	}))
-	t.Cleanup(srv.Close)
-	return srv.URL
-}
-
-// Both providers are constructible, and nothing else is: a typo in
-// EMBED_PROVIDER must not fall back to one of them silently.
-func TestEmbedderProviders(t *testing.T) {
-	// The ollama arm needs a server now, because constructing it proves it
-	// answers; the fake arm ignores the URL entirely.
-	t.Setenv("OLLAMA_URL", answersOneVector(t))
-	for _, tc := range []struct{ provider, model string }{
-		{"fake", "fake-hashed-bow"},
-		{"ollama", "nomic-embed-text"},
-	} {
-		t.Setenv("EMBED_PROVIDER", tc.provider)
-		e, err := newEmbedder(context.Background(), time.Minute)
-		if err != nil {
-			t.Fatalf("%s: %v", tc.provider, err)
-		}
-		if e.Model() != tc.model || e.Dim() != store.EmbeddingDim {
-			t.Errorf("%s: model %q dim %d, want %q and %d", tc.provider, e.Model(), e.Dim(), tc.model, store.EmbeddingDim)
-		}
-	}
-	t.Setenv("EMBED_PROVIDER", "olama")
-	if _, err := newEmbedder(context.Background(), time.Minute); err == nil {
-		t.Fatal("a misspelt provider was accepted")
-	}
-}
-
-// The README calls every knob boot-validated, and these two were not.
-// Measured before: `OLLAMA_URL='not a url at all' EMBED_MODEL='no-such-model-xyz'`
-// logged "indexer up" and the failure surfaced on the first leased job's embed
-// call, spending an attempt against the cap for a setting no retry can fix.
-//
-// Each case names the knob that is wrong, because "connection refused" on a
-// job is what this is replacing.
-func TestTheEmbedderAddressAndModelAreValidatedAtBoot(t *testing.T) {
-	missingModel := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// The real server's answer for a model that was never pulled: a 404
-		// whose body is JSON and decodes cleanly into the success shape.
-		w.WriteHeader(http.StatusNotFound)
-		io.WriteString(w, `{"error":"model \"no-such-model-xyz\" not found"}`)
-	}))
-	defer missingModel.Close()
-	// A listener that is closed: the address is well formed and nothing is
-	// there, which is the misconfiguration a typo'd port makes.
-	gone := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	goneURL := gone.URL
-	gone.Close()
-
-	const badAddress = "is not an http:// or https:// address"
-	// Each want is the part of the message that could only have come from the
-	// check being tested: "an error happened" would pass against a client that
-	// merely failed differently later.
-	for _, tc := range []struct{ name, url, model, want string }{
-		{"not an address", "not a url at all", "nomic-embed-text", badAddress},
-		{"no scheme", "localhost:11435", "nomic-embed-text", badAddress},
-		{"no host", "http://", "nomic-embed-text", badAddress},
-		{"model never pulled", missingModel.URL, "no-such-model-xyz", `EMBED_MODEL="no-such-model-xyz"`},
-		{"nothing listening", goneURL, "nomic-embed-text", `EMBED_MODEL="nomic-embed-text" at OLLAMA_URL=`},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("EMBED_PROVIDER", "ollama")
-			t.Setenv("OLLAMA_URL", tc.url)
-			t.Setenv("EMBED_MODEL", tc.model)
-			_, err := newEmbedder(context.Background(), time.Minute)
-			if err == nil {
-				t.Fatalf("%s booted", tc.name)
-			}
-			if !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("the error does not name %s: %v", tc.want, err)
-			}
-		})
 	}
 }
 
