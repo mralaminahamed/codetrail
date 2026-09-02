@@ -296,7 +296,7 @@ func TestAResolverFailureLeavesEveryEdgeSyntacticAndTheJobIntact(t *testing.T) {
 		// The knob, proven by a resolver that panics if it is called at all:
 		// asserting that the edges are syntactic also passes when the
 		// resolver ran and failed.
-		{name: "typechecking is off", opts: []fixtureOpt{typechecking(false), withPanickingResolver()},
+		{name: "typechecking is off", opts: []fixtureOpt{typechecking(false), withForbiddenResolver()},
 			want: symbols.ReasonDisabled},
 		// The real loader with no go binary. Nothing is forked: Validate
 		// refuses a GoBin the parent's PATH does not resolve to.
