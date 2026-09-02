@@ -1043,7 +1043,7 @@ type fixture struct {
 	resolved    map[symbols.Key]symbols.Target
 	stats       symbols.Stats
 	graphErr    error
-	graphPanics bool
+	forbidGraph bool
 }
 
 type fixtureOpt func(t *testing.T, f *fixture)
@@ -1074,11 +1074,12 @@ func withGraphWriteError(err error) fixtureOpt {
 	return func(_ *testing.T, f *fixture) { f.graphErr = err }
 }
 
-// withPanickingResolver is the strong form of "the stage did not run":
+// withForbiddenResolver is the strong form of "the stage did not run":
 // asserting that every edge is syntactic also passes when the resolver ran and
-// failed.
-func withPanickingResolver() fixtureOpt {
-	return func(_ *testing.T, f *fixture) { f.graphPanics = true }
+// failed. It fails the test where it is called rather than panicking, so the
+// kill is an assertion and not an incident.
+func withForbiddenResolver() fixtureOpt {
+	return func(_ *testing.T, f *fixture) { f.forbidGraph = true }
 }
 
 func typechecking(on bool) fixtureOpt {
@@ -1153,8 +1154,9 @@ func fakeIndexer(t *testing.T, opts ...fixtureOpt) (*indexer, *recorder) {
 		return nil
 	}
 	ix.graph = func(ctx context.Context, p symbols.Policy) (map[symbols.Key]symbols.Target, symbols.Stats) {
-		if f.graphPanics {
-			panic("the type-checker ran with TYPECHECK off")
+		if f.forbidGraph {
+			t.Error("the type-checker ran with TYPECHECK=false")
+			return nil, symbols.Stats{Reason: symbols.ReasonLoadError}
 		}
 		if dl, ok := ctx.Deadline(); ok {
 			rec.deadlines["graph"] = dl
