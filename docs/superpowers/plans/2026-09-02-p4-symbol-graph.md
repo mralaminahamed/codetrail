@@ -144,7 +144,7 @@ Each of these is a constraint on the design, not context.
   - Task 2 creates the migration, the models and `store.PutGraph`.
   - Task 5 creates `packages/shared/store/graph_read.go` — the reads. (Task 5's own file list says `graph_read.go` and this line said `graph.go`, which is Task 2's writer; corrected once Task 2 landed and took that name.) It depends on Task 2's *schema* but not on its writer; work it against the migration once Task 2's migration file lands, or write the migration in whichever task lands first and rebase the other onto it.
 - **Task 3** (the sandboxed type-check) depends on Task 1 for the call-site keys.
-- **Task 4** (indexer wiring) depends on 1, 2 and 3.
+- **Task 4** (indexer wiring) depends on 1, 2 and 3. *(Landed.)*
 - **Task 6** (gateway endpoints) depends on 5.
 - **Task 7** (end to end, the sweep, the README) depends on everything.
 
@@ -738,9 +738,10 @@ Twenty mutations. **Eighteen killed, two recorded as survivors**, each with the 
 ### Task 4: The indexer stage — per-edge labelling, one deadline, and a failure that is not a failure
 
 **Files:**
-- Modify: `apps/indexer/cmd/main.go` (the `indexer` struct, `runJob`, `limitsFrom`), `packages/shared/metrics/metrics.go`
+- Modify: `apps/indexer/cmd/main.go` (the `indexer` struct, `runJob`, `limitsFrom`, `index`), `packages/shared/metrics/metrics.go`
 - Create: `apps/indexer/cmd/graph.go`
 - Test: `apps/indexer/cmd/graph_test.go`, additions to `apps/indexer/cmd/index_live_test.go`
+- Also modified, and none of the three was on the plan's list: `packages/shared/symbols/load.go` gains `Reasons`, the exported closed set the counter's label vocabulary is pinned against; `packages/shared/symbols/policy.go` gains `ValidateProxy`, so `TYPECHECK_GOPROXY` is refused at boot rather than once per job; and the live fixture repository gains `use.go` and `calc/use.go`, without which it holds no in-repo call at all. The gateway's live suite reads the same fixture tree, so its `astPaths`/`windowPaths` follow.
 
 **Interfaces:**
 - Consumes: `symbols.Parse`, `symbols.Resolve`, `store.PutGraph`, `store.SymbolID`, `store.EdgeID`.
@@ -757,141 +758,186 @@ Twenty mutations. **Eighteen killed, two recorded as survivors**, each with the 
 - **The `go` binary is resolved once at boot with `exec.LookPath`, and its absence is a `warn` line at boot plus `reason=no_toolchain` on every job — not a boot failure.** P3's review round made two unvalidated knobs fail at boot, and the instinct here is the same; it is wrong here for a specific reason. Every other boot check guards something without which the indexer cannot do its job. This one guards a stage whose absence downgrades a label. Refusing to boot would mean an operator with no toolchain cannot index at all, which is a worse product than one that indexes with syntactic edges and says so. **The visible failure mode is the one §8 calls the failure that costs a week — a silent downgrade — so it is not silent: a boot line, a counter, and a `provenance` column a caller can read.**
 - **`span_id` links to the containing span, most specific first.** Under `CHUNK_STRATEGY=window` the windows overlap by `WindowOverlap` lines, so a definition's first line can be inside two spans; the rule is the containing span with the **greatest `start_line`, then the smallest `end_line`, then the smallest id**, which is deterministic and picks the window that starts closest to the definition. Under the AST strategy the declaration's own span is the only container and the rule is a no-op — which is exactly why a window-strategy fixture is needed to test it at all.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
-Hermetic, in `graph_test.go`, against a substituted resolver — the seam exists so that the labelling logic is testable without running the go command twice per assertion:
+Hermetic, in `graph_test.go`, against a substituted resolver — the seam exists so that the labelling logic is testable without running the go command twice per assertion. The eight the plan listed, plus six the debts and the mutation round earned:
 
 ```go
 func TestEveryCallIsAnEdgeBeforeAnythingIsResolved(t *testing.T)
-func TestOnlyTheCallSitesTheResolverNamedAreResolved(t *testing.T)   // the per-edge claim
-func TestAResolverFailureLeavesEveryEdgeSyntacticAndTheJobIntact(t *testing.T)
+func TestOnlyTheCallSitesTheResolverNamedAreResolved(t *testing.T)   // the per-edge claim, both directions
+func TestAResolverFailureLeavesEveryEdgeSyntacticAndTheJobIntact(t *testing.T)  // five reasons
 func TestASymbolLinksToTheSpanThatContainsIt(t *testing.T)
 func TestASymbolLinksToTheMostSpecificOfTwoOverlappingWindows(t *testing.T)
 func TestADeclarationWithNoSpanStillGetsASymbolWithANullLink(t *testing.T)
 func TestTheJobLogNamesWhatTheGraphStageProducedAndWhyItStopped(t *testing.T)
-func TestTheGraphCountersMoveExactlyOnce(t *testing.T)               // whole set of series
+func TestTheGraphCountersMoveExactlyOnce(t *testing.T)
+func TestATargetIsMatchedToTheDefinitionThatContainsIt(t *testing.T)          // new: Task 3's debt 2
+func TestTheEdgeTailIsTheDeclarationTheCallIsIn(t *testing.T)                 // new
+func TestTheGraphPassParsesTheRawBodyAndNotTheStrippedSource(t *testing.T)    // new: Task 3's debt 1
+func TestAScratchTreeTheGoCommandLeftReadOnlyIsStillRemoved(t *testing.T)     // new: Task 3's debt 5
+func TestTheGraphCounterVocabulariesAreTheClosedSetsTheyName(t *testing.T)    // new: Task 3's debt 4
+func TestTheBootLineSaysWhetherThisWorkerCanTypeCheck(t *testing.T)           // new: open question 9
+func TestTheGraphKnobsAreRefusedAtBoot(t *testing.T)                          // new
+func TestAGraphWriteThatFailsFailsTheJob(t *testing.T)                        // new: the fake's error path
+func TestAFileThatDoesNotParseIsCountedRatherThanLosingTheGraph(t *testing.T) // new
+func TestTheTypeCheckerIsGivenTheCheckoutAndTheJobsOwnCaches(t *testing.T)    // new
 ```
 
-Live, appended to `index_live_test.go` (same `TestMain`, same `codetrail_indexer` prefix):
+Plus two existing tests that grew rather than being duplicated: `TestEveryStageSharesTheOneJobDeadline` gains `graph` to its stage list **and** the assertion that `putGraph` is *not* on that deadline, and `TestFilesAreWrittenBeforeSpans` becomes `…AndBothBeforeTheGraph`.
 
-```go
-func TestIndexingWritesAGraphForTheFixtureRepoLive(t *testing.T)
-func TestATypecheckFailureStillCompletesTheJobLive(t *testing.T)     // GOPROXY unreachable-by-policy fixture
-func TestTheGraphStageSharesTheJobDeadlineLive(t *testing.T)
-```
+Live, appended to `index_live_test.go`: `TestIndexingWritesAGraphForTheFixtureRepoLive`, `TestATypecheckFailureStillCompletesTheJobLive`, `TestTheGraphStageSharesTheJobDeadlineLive`, and `TestEvictionRemovesSpansEndToEndLive` extended to the graph.
 
-`TestTheGraphCountersMoveExactlyOnce` reads **every** series in `codetrail_graph_edges_total` and `codetrail_typecheck_total` before and after, and asserts the whole delta vector. P3 learned this twice: a test that checks only the counter it expects to move passes under a mutant that increments both.
+> **The live fixture repository gained two files, and they are what make it a graph fixture.** `use.go` in the root package and `calc/use.go` in `calc/`. Measured: `packages.Load` reports **2 packages, 1 loaded, 1 failed** — `calc/` does not type-check because `calc/broken.go` is not parseable Go — and **three of the six edges still resolve, two of them inside the failing package**. So the repository's reason is `load_error` while half its edges are `resolved`, which is the shape no single-package fixture can have. The unresolvable half is real too: `fmt.Sprintf` twice (external) and `len` (a builtin, so `Uses` has no `*types.Func`).
+>
+> Also measured, and it is where the containment rule earns its place: `calc/use.go@153 → calc/calc.go:20` while `Machine.Push`'s definition is **19..23**, and `use.go@243 → use.go:6` while `Count` is **5..8**. Every resolved target in the fixture lands on a line that is *not* its definition's first line.
 
-- [ ] **Step 2: Implement**
+- [x] **Step 2: Implement**
 
-Sketch of the stage, showing only the shape the mutations attack:
+`apps/indexer/cmd/graph.go`, with the labelling loop as sketched. Four shapes are worth stating because they are what the mutations attack, and three of them are deviations from the plan as written:
 
-```go
-// Spec §6: the edge set is the AST's; type information only upgrades rows.
-// There is deliberately no branch here on whether a package loaded — the label
-// is a property of a call site, and a per-package branch is how it stops being
-// one.
-for _, c := range calls {
-	e := models.Edge{ /* … */ ToName: c.Name, Kind: models.EdgeCalls,
-		Provenance: models.ProvenanceSyntactic}
-	if t, ok := resolved[symbols.Key{Path: c.Path, Offset: c.Offset}]; ok {
-		if id, ok := defIndex.at(t); ok {
-			e.ToSymbolID, e.Provenance = &id, models.ProvenanceResolved
-		}
-	}
-	edges = append(edges, e)
-}
-```
+- **The stage takes two contexts.** `runGraph(jobCtx, writeCtx, …)`. The type-check runs on `jobCtx` — spec:194's one budget, shared with the clone and the chunker. The *write* runs on the same process-derived budget as `Complete`. **This is a deviation and the plan implied the opposite.** Measured: with the write on `jobCtx`, `TestTheGraphStageSharesTheJobDeadlineLive` fails the job with `context deadline exceeded` — the type-check spends the job's remaining time by design, so writing its result on that context is the type-check's slowness failing the job, which spec:196 forbids. M18 is the mutation and the live test is its kill.
+- **The go command's caches live *beside* the checkout, at `<jobdir>.gohome`.** Task 3 says "under the job's scratch directory"; the job's scratch directory **is** the checkout (`clone.Run` clones into `dir` itself), so caches under it are directories `go list ./...` walks — and in proxy mode a fetched module brings a `go.mod` of its own into the tree being type-checked. Both trees are removed on every path.
+- **`index` returns a fourth value, `[]symbols.File`, and counts `unparsed`.** The parse happens in `index`, where the raw `body` is in hand and *before* `src := body` is stripped — the debt is honoured structurally rather than by a comment. `unparsed` joins `vanished`/`unstrippable`/`tokenless` on the existing per-job line, because it is the same kind of soft loss.
+- **`mostSpecific` is one function with two callers**, spans and definitions, for the reason `chunk.Decl` is one function with two callers: the rule is "the container holding this line, greatest start, then smallest end, then smallest id", and stating it twice is how the two drift.
 
-- [ ] **Step 3: Commit, then prove the tests discriminate**
+- [x] **Step 3: Commit, then prove the tests discriminate**
 
-**M1 — the label is taken from the package's load status rather than from the call site** (`if stats.Reason == "ok" { e.Provenance = resolved }`).
+**Twenty-four mutations. Twenty-three killed, one recorded as a survivor**, each with the observed message rather than the prediction. Two of them killed nothing until the fixture was fixed, and both fixes are recorded below as findings rather than as edits.
+
+**M1 — the label is taken from the package's load status rather than from the call site** (`if g.stats.Reason == symbols.ReasonOK { e.Provenance = resolved }`).
 - *Why the code exists:* spec:190. This is the mutation this whole phase is written against.
-- *Fixture that separates mutant from original:* a repository where the resolver names **some** call sites and not others — i.e. any fixture containing a standard-library call beside an in-repo one. **A fixture in which every call resolves cannot see it**, and neither can one in which none do.
-- *Must fail:* `TestOnlyTheCallSitesTheResolverNamedAreResolved`
-- *Expected (verify and correct):* `edge to Println is resolved with a null target, want syntactic` — verify whether the mutant fails at the assertion or earlier, in `PutGraph`'s pair check; if it is the latter in the live test, the hermetic test is the one that carries the kill.
-- *Compiles and vets:* yes.
+- *Fixture that separates mutant from original:* `TestOnlyTheCallSitesTheResolverNamedAreResolved`, **and it needs both of its subtests**. With `reason=ok` the mutant labels everything resolved; with `reason=load_error` it labels everything syntactic. Either half alone passes one of the two.
+- *Observed — killed, hermetic and live:* `got F calls Println-> at a.go:7 (resolved) … want (syntactic)` in the first subtest and `F calls G-> at a.go:7 (syntactic) … want F calls G->G at a.go:7 (resolved)` in the second. Live: `Total calls Push-> at calc/use.go:7 (syntactic), want Total calls Push->Machine.Push … (resolved)` — the two edges inside the package that failed to load are exactly the ones the mutant loses.
+- *Compiles and vets:* yes, with `_ = resolved`.
 
 **M2 — a resolver failure is returned and fails the job.**
 - *Why the code exists:* spec:196.
-- *Fixture that separates mutant from original:* the substituted resolver returning `Reason: "load_error"` and an empty map. **This is a fake, and M2 is the mutation that proves the fake's error path is wired** — the second of the two survivor shapes P3's sweep found.
-- *Must fail:* `TestAResolverFailureLeavesEveryEdgeSyntacticAndTheJobIntact`
-- *Expected (verify and correct):* `runJob returned "graph: load_error", want nil and 4 syntactic edges`
+- *Fixture that separates mutant from original:* the substituted resolver's error path — **the fake whose failure mode a test has to set**, the second of P3's two survivor shapes.
+- *Observed — killed, five subtests:* `the job failed: graph: load_error`, and the same for `deadline`, `no_module`, `disabled` and `no_toolchain`.
 - *Compiles and vets:* yes.
 
-**M3 — the stage gets its own deadline (`context.WithTimeout(ctx, 2*time.Minute)`).**
-- *Why the code exists:* spec:194, and the sentence names the exact failure: a slow clone buying extra time by failing into the next stage.
-- *Fixture that separates mutant from original:* `TestTheGraphStageSharesTheJobDeadlineLive`, which sets `JOB_DEADLINE_SECONDS` low enough that the budget is spent by the time the stage starts, and asserts every edge is syntactic with `reason=deadline`. **A generous deadline cannot see this at all.** Verify the timing is not flaky; if it is, assert on the deadline the stage observed (record it in the log line) rather than on the elapsed time.
-- *Must fail:* `TestTheGraphStageSharesTheJobDeadlineLive`
-- *Expected (verify and correct):* `12 of 12 edges resolved with reason "ok", want 0 and "deadline"`
+**M3 — the stage gets its own deadline (`context.WithTimeout(jobCtx, 2*time.Minute)`).**
+- **PLAN DEFECT — the mutation as the plan spells it is void.** `WithTimeout` takes the *earlier* of the parent's deadline and its own, so a two-minute child of a thirty-second parent has the parent's deadline exactly. Whole suite `ok`. It is not a survivor, it is a no-op: there is no behaviour to detect.
+- **M3a — `context.WithTimeout(context.Background(), 2*time.Minute)`**, the failure spec:194's sentence was written against. *Observed — killed:* `graph was given 2m0.000496483s, more than the job's 30s` and `graph got deadline …m=+120.0024, the clone got …m=+30.0019: that is a fresh budget per stage`. Live: `the job log says reason load_error, want "deadline"` — the mutant type-checks happily on a job whose budget is gone.
+- **M3b — `context.WithTimeout(jobCtx, 2*time.Second)`**, the smaller second budget the plan calls "defensible and still wrong". *Observed — killed:* `graph got deadline …m=+2.0022, the clone got …m=+30.0017: that is a fresh budget per stage`.
+- *Fixture that separates mutant from original:* the hermetic stage-deadline recorder, and the live test whose budget is spent in `putSpans` before the stage starts. **The live one is deterministic rather than timed:** the wrapped `putSpans` writes and then waits for `ctx.Done()`, so the stage starts on an expired context at whatever speed the machine runs.
 - *Compiles and vets:* yes.
 
 **M4 — the stage runs before `putSpans`.**
-- *Why the code exists:* `symbols.span_id` references a row that must exist, and the containment link is computed against ranges that are only known once the chunker has run.
-- *Fixture that separates mutant from original:* the live fixture repo, asserting a **non-null** `span_id` for a named symbol. A test that only counts symbols passes.
-- *Must fail:* `TestIndexingWritesAGraphForTheFixtureRepoLive`
-- *Expected (verify and correct):* a foreign-key violation from `PutGraph`, or every `span_id` null — verify which, since the ordering decides it. If it is the FK error, note that the mutant fails the *job*, so the assertion that carries the kill is the job's status, not the row count.
+- *Why the code exists:* `symbols.span_id` references a row that must exist, and the containment link is computed against ranges only the chunker knows.
+- *Observed — killed, and the plan's "verify which" is answered:* it is the **foreign key**, and it fails the *job* — `the job failed instead of indexing: symbols 0-8: ERROR: insert or update on table "symbols" violates foreign key constraint "symbols_span_id_fkey" (SQLSTATE 23503)` — plus the hermetic `call order [put putGraph putSpans], want [put putSpans putGraph]`. So the assertion carrying the live kill is the job's status, as the plan suspected.
 - *Compiles and vets:* yes.
 
 **M5 — the span link is by exact range instead of containment.**
-- *Why the code exists:* a declaration longer than `MaxDeclLines` has no span with its range, and those are the declarations most worth asking about.
-- *Fixture that separates mutant from original:* a fixture file with a declaration longer than `CHUNK_MAX_DECL_LINES` — the live fixture repo needs one added. Every short declaration matches exactly and passes under the mutant.
-- *Must fail:* `TestASymbolLinksToTheSpanThatContainsIt`
-- *Expected (verify and correct):* `symbol Big has a null span_id, want the span 3..42`
+- *Fixture that separates mutant from original:* a declaration longer than `CHUNK_MAX_DECL_LINES` — generated in the hermetic test, and `big.go`'s `Table` (3..208) live. Every short declaration matches exactly and passes.
+- *Observed — killed:* `Table links to "", want the span 3..42 (3e7d6f68…)` and live `big.go|var|Table|3|208 links to span "", want big.go|file||3|42 (090b8aaf…)`.
 - *Compiles and vets:* yes.
 
 **M6 — the containing span is chosen by smallest `start_line` instead of greatest.**
-- *Why the code exists:* window strategy produces overlapping spans and the link must be deterministic and specific.
-- *Fixture that separates mutant from original:* `TestASymbolLinksToTheMostSpecificOfTwoOverlappingWindows`, whose spans overlap by design. **The AST-strategy fixture cannot** — its spans do not overlap, and this is the one rule that is invisible in production configuration.
-- *Must fail:* `TestASymbolLinksToTheMostSpecificOfTwoOverlappingWindows`
-- *Expected (verify and correct):* `symbol Parse linked to span 1..40, want 31..70`
+- *Fixture that separates mutant from original:* `TestASymbolLinksToTheMostSpecificOfTwoOverlappingWindows`, a window-strategy file whose declaration begins at line 34, inside both 1..40 and 31..70. **The AST fixture cannot see it**: there the declaration's own span is the only container.
+- *Observed — killed:* `Parse links to "d09db356…", want the window that starts closest to it, 31..70 (e05ecc76…) and not 1..40 (d09db356…)`.
 - *Compiles and vets:* yes.
 
-**M7 — `CountGraph` called once per job with the total instead of once per edge by provenance.**
-- *Why the code exists:* the provenance split is the phase's headline claim, and a total tells a dashboard nothing about it.
-- *Fixture that separates mutant from original:* `TestTheGraphCountersMoveExactlyOnce` with a fixture producing **both** labels. A fixture producing one label leaves the two series indistinguishable.
-- *Must fail:* `TestTheGraphCountersMoveExactlyOnce`
-- *Expected (verify and correct):* `{provenance="resolved"} moved by 0, {provenance="syntactic"} by 0, {provenance=""} by 1`
-- *Compiles and vets:* **check.** If the label value is validated by a closed set at the call site, the mutant may panic instead — rewrite it as "both increments use `syntactic`" in that case, which is a labelling error rather than a cardinality one.
+**M7a — `CountGraph` called once per job with the edge count as its label.**
+- *Observed — killed, and the plan's "check whether it compiles" is answered:* it compiles and does not panic — a `CounterVec` accepts any label value — and the kill comes from the **series set**, not the delta: `read 10 graph series, want 9`. Every series is initialised at startup, so a new one is a label outside the closed set.
+- **M7b — every edge counted as `syntactic`**, the labelling-error form the plan asked for as a fallback. *Observed — killed, with the cleaner message:* `counters moved map[…{provenance="syntactic"}:4], want map[…{provenance="resolved"}:2 …{provenance="syntactic"}:2 …]`.
+- *Compiles and vets:* both, the second with `_ = e`.
 
 **M8 — the job log line drops `reason`.**
-- *Why the code exists:* it is the only place an operator learns that a repository's edges are all syntactic because the toolchain is missing, rather than because the code has no cross-package calls.
-- *Fixture that separates mutant from original:* `TestTheJobLogNamesWhatTheGraphStageProducedAndWhyItStopped`, capturing zerolog's output. **This mutation exists because the log line is a side effect and P3's sweep found side effects with no reader** — the test is the reader.
-- *Must fail:* `TestTheJobLogNamesWhatTheGraphStageProducedAndWhyItStopped`
-- *Expected (verify and correct):* `log line has no "reason" field: {"level":"warn","symbols":12,…}`
+- *Why the code exists:* it is the only place an operator learns that a repository's edges are all syntactic because the toolchain is missing rather than because the code has no in-repo calls.
+- *Observed — killed, six assertions:* `the log line has no "reason" field: map[edges:5 external:1 … unnameable:1]`, plus `the job log says reason <nil>, want "load_error"` and the same for the other four reasons.
 - *Compiles and vets:* yes.
 
 **M9 — the boot probe for the `go` binary removed, so `GoBin` is empty.**
-- *Why the code exists:* an indexer with no toolchain must say so once at boot rather than produce a repository of syntactic edges that looks like a property of the code.
-- *Fixture that separates mutant from original:* a boot test with `PATH` emptied, asserting the boot log line and `reason=no_toolchain` on the first job. Verify what `Resolve` does with an empty `GoBin` — if `Policy.Validate` refuses it, the failure surfaces as `Reason` and the boot line is the only thing the mutation removes.
-- *Must fail:* `TestTheJobLogNamesWhatTheGraphStageProducedAndWhyItStopped`'s no-toolchain subtest
-- *Expected (verify and correct):* `reason "load_error", want "no_toolchain"`
+- *Observed — killed:* `want {… goBin:/home/alamin/.local/go/bin/go …}, got {… goBin: …}` from `TestLimitsAreWiredToTheCapsTheyName`. And the plan's "verify what `Resolve` does with an empty `GoBin`" is answered: `Validate` refuses it with `ErrNoToolchain` and **no subprocess starts**, which is what `TestAResolverFailureLeavesEveryEdgeSyntacticAndTheJobIntact/there_is_no_toolchain` asserts with the *real* loader rather than the fake.
+- **M9b — the `ix.logToolchain()` call removed from `main`.** *Observed — survivor.* Whole suite `ok`. `main` has no test harness in this binary; the function's three branches are covered, its one call site is not. Recorded rather than papered over.
 - *Compiles and vets:* yes.
 
 **M10 — `TYPECHECK=false` still runs the stage.**
-- *Why the code exists:* the kill switch is the operator's answer to a toolchain they cannot ship, and a knob that does nothing is worse than no knob (P3's review round found two).
-- *Fixture that separates mutant from original:* a hermetic run with the flag off and a resolver that **panics if called** — the strongest form, since asserting "edges are syntactic" also passes if the resolver ran and failed.
-- *Must fail:* `TestAResolverFailureLeavesEveryEdgeSyntacticAndTheJobIntact`'s disabled subtest
-- *Expected (verify and correct):* `panic: resolver called with TYPECHECK=false` surfacing as a test failure with `reason "ok", want "disabled"`.
+- *Fixture that separates mutant from original:* a resolver that **fails the test if it is called at all** — asserting that the edges are syntactic also passes when the resolver ran and failed. It reports rather than panics, because a panic ends the binary and is an incident rather than a kill (rule 7).
+- *Observed — killed, three assertions:* `the type-checker ran with TYPECHECK=false`, `the job log says reason load_error, want "disabled"`, and `counters moved map[… reason="load_error"]:1], want map[… reason="disabled"]:1]`.
 - *Compiles and vets:* yes.
 
-**M11 — `unnameable` dropped from the log line and from the stage's return.**
-- *Why the code exists:* a call the AST cannot name is a call that produced no edge; without the count, a repository of `fns[i]()` calls looks like a repository with no calls.
-- *Fixture that separates mutant from original:* the hermetic fixture containing `fns[i]()`. **Same shape as M8: a side effect whose reader is a log assertion.**
-- *Must fail:* `TestTheJobLogNamesWhatTheGraphStageProducedAndWhyItStopped`
-- *Expected (verify and correct):* `log line has no "unnameable" field`
+**M11 — `unnameable` dropped from the log line.**
+- *Observed — killed:* `the log line has no "unnameable" field: map[edges:5 external:1 job:job1 level:info … reason:ok …]`.
 - *Compiles and vets:* yes.
 
-- [ ] **Step 4: Commit**
+**M12 — the graph pass parses the stripped `src` rather than the raw `body`.** *(Task 3's debt 1)*
+- *Why the code exists:* `Key` is a byte offset into the bytes on disk, and `StripDocs` removes the prose bytes while keeping their line terminators.
+- *Fixture that separates mutant from original:* `TestTheGraphPassParsesTheRawBodyAndNotTheStrippedSource`, the **only** test in the package that runs with `STRIP_DOC_COMMENTS=true` and a resolver. Every other test has `src == body` and cannot tell the two apart. The test asserts first that stripping still moves offsets at all, so it cannot become vacuous.
+- *Observed — killed:* `0 of the two calls to G resolved under STRIP_DOC_COMMENTS=true: the keys are offsets into bytes nothing else holds`. Nothing else in the suite moved — which is the whole danger: under the eval's configuration the resolution rate goes to zero with no error anywhere.
+- *Compiles and vets:* yes.
 
-**Definition of Done**
-- Every call site is an edge before resolution; resolution changes labels and targets and never the edge count.
-- No line in the stage copies a package-level fact onto a row.
-- A resolver failure, a missing toolchain, an expired budget and `TYPECHECK=false` each produce a complete graph of syntactic edges, a distinct reason, a counted outcome and a `done` job.
-- The stage runs on `jobCtx`, proven by a live test whose budget is spent before the stage starts.
-- Symbols link to the containing span, most specific first, with a window-overlap fixture proving the tie-break.
-- The job log names symbols, edges, the provenance split, `external`, `unnameable` and `reason`.
-- M1–M11 recorded with observed output.
+**M13 — a `Target` is matched to a definition by equality with its `StartLine`.** *(Task 3's debt 2)*
+- *Why the code exists:* a target is the declaration's own line; a `Def`'s range begins at its doc comment.
+- *Fixture that separates mutant from original:* any documented declaration — `G` at 11..16 resolving to line 12 hermetically, and every one of the live fixture's three resolutions.
+- *Observed — killed:* `the edge to G at a.go:7 points at "", want G's own id "187cb795…": the target's line 12 is inside G's range and is not its first line`, and live, all three resolutions collapse to syntactic.
+- *Compiles and vets:* yes.
+
+**M14 — `removeScratch` returns the first error instead of restoring permissions and retrying.** *(Task 3's debt 5)*
+- *Why the code exists:* in proxy mode the go command writes the module cache read-only, and `os.RemoveAll` then leaks the whole job tree, not merely the cache.
+- *Fixture that separates mutant from original:* a tree with a `0555` directory holding a `0400` file — **with the control in the same test**: `os.RemoveAll` must fail on it first, or a passing `removeScratch` would prove only that removing a directory works.
+- *Observed — killed:* `removeScratch: unlinkat …/go/modcache/example.com/mod@v1.0.0/go.mod: permission denied`.
+- *Plan defect, minor:* deleting the retry outright is a **build break** (`errors`, `io/fs` and `path/filepath` lose their only uses) and therefore void; returning the first error is the same behaviour and a one-token edit.
+- *Compiles and vets:* yes, as `return err`.
+
+**M15 — the counter's reason set loses `policy`.** *(Task 3's debt 4)*
+- *Why the code exists:* `metrics` cannot import `symbols` — that would link `go/packages` into the gateway — so the vocabulary is written out twice and a test is what keeps the copy honest.
+- *Observed — killed:* `metrics.TypecheckReasons is [deadline disabled load_error no_module no_toolchain ok], want symbols' own set [deadline disabled load_error no_module no_toolchain ok policy]`.
+- *Compiles and vets:* yes.
+
+**M16 — the go caches are placed inside the checkout (`filepath.Join(dir, "gohome")`).**
+- *Why the code exists:* `go list ./...` walks the checkout, and in proxy mode the module cache holds `go.mod` files of its own.
+- *Observed — killed:* `policy {… Home:…/job1/gohome …}, want {… Home:…/job1.gohome …}`.
+- *Compiles and vets:* yes.
+
+**M17 — the edge's tail is the file's first declaration rather than the enclosing one.**
+- *Why the code exists:* a wrong tail is a wrong answer to "who calls this" that looks exactly like a right one.
+- **FINDING — the hermetic fixture could not kill this, and the live one could.** Every call in the first version of `graphRepo` was inside its file's *first* declaration, so "the enclosing declaration" and "the first declaration" were the same string and `TestTheEdgeTailIsTheDeclarationTheCallIsIn` passed under the mutant. The live fixture killed it — `Base calls Sprintf-> at calc/calc.go:27`, `Count calls Count->Count at use.go:12` (a self-call that is not one). The fixture now puts a call inside `G`, the second declaration.
+- *Observed — killed, after the fixture was fixed:* `F calls Print-> at a.go:14 (syntactic): the edge leaves F, want G`.
+- *Compiles and vets:* yes.
+
+**M18 — the graph write runs on `jobCtx` rather than on the record budget.**
+- *Why the code exists:* the deviation above. The type-check is *supposed* to spend the job's remaining time; a write on that context turns the outcome spec:196 blesses into a failed job.
+- *Observed — killed:* live, `the job failed instead of indexing: context deadline exceeded`; hermetically, `the graph write ran on the job's own budget (…): the type-check spends it`.
+- *Compiles and vets:* yes.
+
+**M19 — `CountTypecheck` is not called.**
+- *Observed — killed, six assertions:* `counters moved map[…{provenance="syntactic"}:5], want map[…{provenance="syntactic"}:5 codetrail_typecheck_total{reason="load_error"}:1]` and one per reason.
+- *Compiles and vets:* yes.
+
+**M20 — the stage stops timing itself (`ObserveTypecheck` dropped).**
+- *Why the code exists:* it is the only instrument that says what the precision costs.
+- *Fixture:* the counter vector, which carries `codetrail_typecheck_seconds_count` **and asserts the case where it must not move** — with `TYPECHECK=false` nothing ran, so there is nothing to time.
+- *Observed — killed:* `counters moved map[… resolved:2 … syntactic:3 … reason="ok":1], want map[… codetrail_typecheck_seconds_count:1 …]`.
+- *Compiles and vets:* yes, with `_ = start`.
+
+**M21 — `unparsed` dropped from the per-job line.**
+- *Observed — killed:* `the unparsed count is not in the log: {"level":"warn",…,"vanished":0,"unstrippable":0,"tokenless":0,"message":"some of this repository produced no spans"}`.
+- *Compiles and vets:* yes.
+
+**M22 — the containment check loses its upper bound (`line > c.end` dropped).**
+- **FINDING — a survivor turned into a kill by a fixture, and the bug it hides is a wrong citation.** With the bound gone, a definition whose first line is inside *no* span links to the nearest span that starts below it — which belongs to a **different declaration**. It survived the whole suite at first, because the greatest-start rule usually picks the right container anyway. The shape that separates them is the stripped corpus, where a span starts at the `func` keyword and the definition starts at the doc comment above it.
+- *Fixture:* `TestADeclarationWithNoSpanStillGetsASymbolWithANullLink`, extended to name **`G`** as well as `F`. `F` alone cannot see it — `F` is the first declaration in the file and has nothing above it to be wrongly linked to.
+- *Observed — killed, after the fixture named G:* `G links to span c9a215dd…; with the doc comment stripped its first line is inside no span, and the nearest one below it belongs to another declaration`.
+- *Compiles and vets:* yes.
+
+**M23 — every indexable file is parsed as Go (`f.Lang != ""` instead of `== "go"`).**
+- *Observed — killed:* `the unparsed count is not in the log: …"unparsed":2…` — the markdown and the YAML join the count, and a repository of prose would report itself as unparseable Go.
+- *Compiles and vets:* yes.
+
+*Considered and excluded:* dropping the "first definition wins" rule in the tail map (no fixture — it needs two declarations sharing a start line, which is legal and absent from every fixture here; the same gap Task 2's M4 records for `SymbolID`); mutating `loadMode` (Task 3's, measured there); and reversing `resolved`/`syntactic` in the stage's own counters, which the whole-vector assertion already covers as a swap.
+
+- [x] **Step 4: Commit**
+
+**Definition of Done** — all met.
+- Every call site is an edge before resolution; the edge *set* is asserted equal with and without a resolver, not merely the count (M1, and `TestEveryCallIsAnEdgeBeforeAnythingIsResolved`).
+- No line in the stage copies a package-level fact onto a row, and the fixture that proves it is a repository whose type-check **failed** while three of its six edges resolved.
+- A resolver failure, a missing toolchain, an expired budget, `no_module` and `TYPECHECK=false` each produce a complete graph of syntactic edges, a distinct reason in the log, a counted outcome and a `done` job — five subtests, each asserting the whole counter delta.
+- The stage runs on `jobCtx`, proven hermetically by the deadline it was handed and live by a job whose budget is spent in `putSpans` before it starts, with the control in the same test. **The write does not**, which is a recorded deviation with M18 as its proof.
+- Symbols link to the containing span, most specific first, with a window-overlap fixture for the tie-break and a stripped-corpus fixture for the upper bound.
+- The job log names symbols, edges, the provenance split, `external`, `unnameable` and `reason`; `unparsed` joins the existing soft-loss line.
+- M1–M23 recorded with observed output, M9b recorded as a survivor with its reason, M3 recorded as a void mutation with the two variants that are not.
 
 ---
 
@@ -1381,14 +1427,14 @@ New section, in the register the existing README uses. It must say, in these ter
 ## Definition of done for P4
 
 - [ ] Definitions come from the AST, spelled by the same function that spells a span's symbol, with a live assertion that the two agree across a whole corpus.
-- [ ] Edges are attempted through `go/packages` with type information; where `types.Info.Uses` resolves a call to an object **that has a symbol row in this repository**, the edge is `resolved` and points at it; everywhere else it is `syntactic` with a null target, enforced by a CHECK constraint rather than by convention.
-- [ ] Provenance is per row. One repository carries both labels, and a fixture with two packages — one loadable, one not — pins it by naming an edge in each. No line of code copies a package-level fact onto a row.
+- [x] Edges are attempted through `go/packages` with type information; where `types.Info.Uses` resolves a call to an object **that has a symbol row in this repository**, the edge is `resolved` and points at it; everywhere else it is `syntactic` with a null target, enforced by a CHECK constraint rather than by convention. *(Tasks 2, 3 and 4.)*
+- [x] Provenance is per row. One repository carries both labels, and a fixture with two packages — one loadable, one not — pins it by naming an edge in each. No line of code copies a package-level fact onto a row. *(Task 4. The live fixture is stronger than the plan asked for: its type-check **fails**, and two of its three resolved edges are inside the package that failed.)*
 - [x] The type-check runs inside the sandbox, on the job's own remaining budget, with an environment allowlist that a hostile parent environment cannot widen and that makes a recording proxy receive zero requests. *(Task 3. The zero is paired with a control that fetches, so it is evidence rather than an absence.)*
-- [ ] A type-check failure — missing toolchain, absent module, expired budget, disabled by knob — produces a complete graph of syntactic edges, a distinct counted reason, a log line, and a `done` job.
+- [x] A type-check failure — missing toolchain, absent module, expired budget, disabled by knob — produces a complete graph of syntactic edges, a distinct counted reason, a log line, and a `done` job. *(Task 4, five reasons, each asserting the whole counter delta.)*
 - [ ] "Who calls this" is a recursive CTE that terminates on self-calls, cycles and diamonds, reports depth and call sites, and never traverses a name.
 - [ ] Approximate, name-matched callers are a separate labelled set at depth 1, with their own count.
 - [ ] Graph endpoints answer `404` for an unknown symbol, `410` for an evicted repo, `400` naming the rule for a bad `depth`, `limit` or `name`, and `500` opaquely with a request id; none of them touch the answer or refusal counters.
-- [ ] Eviction takes the graph with it, in one `DELETE`.
+- [x] Eviction takes the graph with it, in one `DELETE`. *(Task 2 at the schema, Task 4 end to end through a real job.)*
 - [ ] Every mutation recorded with observed output; every survivor recorded as a survivor with what it revealed; the whole-branch sweep run after the last merge.
 
 **Not in P4, deliberately:** no `imports` or `references` edges (Open question 7). No LLM tool loop — §8's `definition_of` and `callers_of` are P7's tools and this phase ships the endpoints beneath them. No console (P5). No eval harness (P6); nothing in this phase touches the two-arm corpus design. No incremental re-index (P7): a new commit is a new repo id and a full graph. No second language (§7). No `/metrics` on the indexer, so this phase's four instruments join P3's three with nowhere to be scraped from.
@@ -1409,7 +1455,7 @@ Nothing here is blocking. Each is something the spec does not settle, with the t
    *Recommendation:* **they do not share identity.** Symbols carry their own `start_line`/`end_line` and link to a span by containment, nullable. Three reasons: a declaration longer than `MaxDeclLines` has no span with its range, so an identity-sharing design loses exactly the biggest declarations; span ids are `hash(repo, path, start, end, digest)` and therefore change when a body changes, which would make a symbol's identity change with its implementation; and the eval's window arm chunks the same file differently, so a shared identity would make the graph strategy-dependent. The cost is a deviation from §3's column list, recorded in the migration's comment.
 
 4. **What `go/packages` may reach.** §6 says type-checking "requires module downloads" and says nothing about from where — while §4's whole design is an allowlist of hosts, because the alternative is an SSRF.
-   *Recommendation:* **`GOPROXY=off` by default**, with `GOVCS=*:off`, `GOTOOLCHAIN=local`, `GOWORK=off`, `GOENV=off`, **`GOPACKAGESDRIVER=off`**, `CGO_ENABLED=0`, scratch-local `GOMODCACHE`/`GOCACHE`/`GOPATH`/`GOTMPDIR`, and an environment allowlist rather than an inherited environment. (`GOPACKAGESDRIVER=off` was added in Task 3: without it `go/packages` runs a binary named `gopackagesdriver` found on the *operator's* `PATH` in place of the go command. Task 3 also found that the settings closed **by omission** — `GOFLAGS`, `GOPRIVATE`, `GOROOT`, `GOEXPERIMENT`, `GODEBUG`, `LD_PRELOAD`, `HTTPS_PROXY` — are the ones a mutation can be built against, and that naming them with a safe value would make the allowlist untestable.) An operator can set `TYPECHECK_GOPROXY` to a proxy they trust; `direct` and any `,direct` fallback are refused, because that is the setting that turns a stranger's `require` line into an outbound `git` to a host of their choosing. The cost is stated plainly: with the default, only standard-library-only packages type-check, and everything else is honestly syntactic.
+   *Recommendation:* **`GOPROXY=off` by default**, with `GOVCS=*:off`, `GOTOOLCHAIN=local`, `GOWORK=off`, `GOENV=off`, **`GOPACKAGESDRIVER=off`**, `CGO_ENABLED=0`, scratch-local `GOMODCACHE`/`GOCACHE`/`GOPATH`/`GOTMPDIR`, and an environment allowlist rather than an inherited environment. (`GOPACKAGESDRIVER=off` was added in Task 3: without it `go/packages` runs a binary named `gopackagesdriver` found on the *operator's* `PATH` in place of the go command. Task 3 also found that the settings closed **by omission** — `GOFLAGS`, `GOPRIVATE`, `GOROOT`, `GOEXPERIMENT`, `GODEBUG`, `LD_PRELOAD`, `HTTPS_PROXY` — are the ones a mutation can be built against, and that naming them with a safe value would make the allowlist untestable.) An operator can set `TYPECHECK_GOPROXY` to a proxy they trust — wired in Task 4 and refused **at boot**, which is the line between the two failures: a missing toolchain is the operator's environment and downgrades a label, while a proxy naming `direct` is a setting that would turn a stranger's `go.mod` into an outbound connection of their choosing, so the first must not stop a worker and the second must not start one. `direct` and any `,direct` fallback are refused, because that is the setting that turns a stranger's `require` line into an outbound `git` to a host of their choosing. The cost is stated plainly: with the default, only standard-library-only packages type-check, and everything else is honestly syntactic.
 
 5. **What `pkg` means.** §3 lists the column and never defines it.
    *Recommendation:* the **package clause name** from the AST (`store`), not the import path. The import path needs a module-aware load, which is the thing that is allowed to fail; a column whose meaning depended on whether the type-check ran would be a per-package fact leaking into a per-row column, which is the failure §6 is written against. Two packages named `store` in one repository are distinguished by `path`. Revisit if a console needs import paths.
@@ -1427,6 +1473,7 @@ Nothing here is blocking. Each is something the spec does not settle, with the t
    *Recommendation:* probe with `exec.LookPath` at boot, log one line when it is absent, count `no_toolchain` per job, and **do not refuse to boot** — an indexer that cannot type-check still indexes, and refusing would make a missing toolchain worse than a syntactic graph. P8's image must include a toolchain, and the README says so, because the failure mode otherwise is CI resolving and production not, which is the silent downgrade §8 calls the failure that costs a week.
 
 10. **`go/packages` gives no hook to put its subprocess in a process group, and its cache is not covered by any cap.** P1 kills the whole process group on deadline; `packages.Load` runs `go list` through its own `exec.Command` and the plan cannot reach it. Separately, `MAX_REPO_BYTES` is measured on the clone, and `GOCACHE`/`GOMODCACHE` are written afterwards.
+    *Answered in Task 4 for the third item, and it needed code rather than a note:* `removeScratch` restores the directories' write permission and retries, because `os.RemoveAll` over a read-only module cache leaks **the whole job tree**, not merely the cache. The caches also moved *beside* the checkout rather than under it — the job's scratch directory **is** the checkout, and `go list ./...` walks whatever is inside it.
     *Recommendation:* accept both for P4 and write them down. **Measured in Task 3 and it changes the size of the second half:** with `NeedDeps` the only subprocess is `go list`, and the caches a job leaves behind are ~0.7MB rather than the ~92MB `-export=true` writes for a package importing `net/http`. A third item joins the list: in proxy mode the module cache is written **read-only**, so `runJob`'s `defer os.RemoveAll(dir)` fails with `permission denied` and the scratch directory leaks. Not reachable under the shipped default, where nothing is fetched. The blast radius is bounded in practice — the caches live under the job's scratch directory, which `runJob` removes and which the worker sweeps at boot and exit — but "bounded in practice" is not "enforced", and the honest form is a README line plus the `TYPECHECK=false` kill switch. Revisit by measuring cache growth over a real corpus; if it matters, the fix is a `du` check after the stage, matching the clone's, or a driver we fork ourselves.
 
 11. **Last-segment matching for `definition_of`.** P3's lexical arm reaches `Store.Get` through its parts, so a user who found a method by searching will type `Get`.
