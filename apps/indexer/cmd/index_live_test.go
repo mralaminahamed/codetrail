@@ -940,6 +940,7 @@ func TestIndexingWritesAGraphForTheFixtureRepoLive(t *testing.T) {
 	want := map[string]any{
 		"level": "warn", "symbols": 9.0, "edges": 6.0, "resolved": 3.0,
 		"syntactic": 3.0, "external": 2.0, "unnameable": 0.0, "reason": "load_error",
+		"packages": 2.0, "loaded": 1.0, "failed": 1.0,
 	}
 	for k, v := range want {
 		if got := line[k]; got != v {
@@ -1033,4 +1034,188 @@ func TestTheGraphStageSharesTheJobDeadlineLive(t *testing.T) {
 	if resolved != 3 {
 		t.Fatalf("the control resolved %d call sites, want 3: the fixture no longer resolves anything, so the run above proves nothing", resolved)
 	}
+}
+
+// The identity assertion this phase owes the rest of the system: a symbol is
+// spelled the same way in a span and in the graph.
+//
+// chunk.classify and symbols.Parse call one exported function to name a
+// declaration, and Task 1's unit tests pin that function. What they cannot see
+// is a caller that stopped using it — the two spellings would agree in every
+// hermetic fixture written against either one. This reads a whole corpus back
+// out of Postgres and compares the two columns that a divergence would split.
+func TestTheGraphAndTheSpansAgreeOnEverySymbolNameLive(t *testing.T) {
+	st := liveStore(t)
+	run := indexLive(t, st, liveJob{name: "identity", strategy: chunk.StrategyAST})
+
+	names := map[string]bool{}
+	for _, s := range run.symbols {
+		names[s.Name] = true
+	}
+	var named int
+	for _, sp := range run.spans {
+		if sp.Symbol == "" {
+			continue
+		}
+		named++
+		if !names[sp.Symbol] {
+			t.Errorf("span %s names symbol %q, which the graph does not spell: %v",
+				sp.sig(), sp.Symbol, slices.Sorted(maps.Keys(names)))
+		}
+	}
+	// Without this the test passes on a corpus whose spans name nothing, which
+	// is exactly what a chunker that stopped setting Symbol would produce.
+	if named == 0 {
+		t.Fatal("no span carries a symbol, so the agreement above is between two empty sets")
+	}
+	// Both directions would be wrong to assert: Table is a symbol with no span
+	// of its own, because the chunker sub-windowed a declaration longer than
+	// MaxDeclLines. The claim is that a span's symbol is always a definition,
+	// not that a definition always has one.
+	if names["Table"] && named == len(names) {
+		t.Fatal("every definition has a span naming it, so this fixture no longer holds the sub-windowed case")
+	}
+}
+
+// Spec:190 on a repository rather than on a fixture: the label is a per-row
+// property, so one repository carries both, and the assertion names an edge in
+// each package rather than counting them — a count passes under a mutant that
+// swaps which package got which label.
+//
+// The fixture's own shape is what makes it evidence: calc/ does not load
+// (broken.go is not parseable Go) and the root package does, and *both*
+// packages carry both labels. A stage that stamped the load outcome onto its
+// rows would put six syntactic edges here and look entirely healthy.
+func TestAResolvedEdgeAndASyntacticEdgeCoexistInOneRepoLive(t *testing.T) {
+	st := liveStore(t)
+	run := indexLive(t, st, liveJob{name: "coexist", strategy: chunk.StrategyAST})
+	sites := run.callSites(t)
+
+	for _, want := range []string{
+		// The package that failed to load, both labels.
+		"Total calls Push->Machine.Push at calc/use.go:7 (resolved)",
+		"Render calls Sprintf-> at calc/calc.go:27 (syntactic)",
+		// The package that loaded, both labels.
+		"Report calls Count->Count at use.go:12 (resolved)",
+		"Count calls len-> at use.go:7 (syntactic)",
+	} {
+		if !slices.Contains(sites, want) {
+			t.Errorf("no edge %q; the repository's call sites are:\n      %s",
+				want, strings.Join(sites, "\n      "))
+		}
+	}
+
+	line := logLine(t, run.log, "symbol graph")
+	// The per-package split the reason word cannot carry. Three distinct
+	// values, so a log line that read one of them twice is visible here.
+	for k, want := range map[string]any{"packages": 2.0, "loaded": 1.0, "failed": 1.0} {
+		if got, ok := line[k]; !ok {
+			t.Errorf("the job log has no %q field: %v", k, line)
+		} else if got != want {
+			t.Errorf("the job log says %s=%v, want %v", k, got, want)
+		}
+	}
+}
+
+// Spec §3 for the graph: re-indexing one commit converges on the same rows.
+// Ids rather than counts, because PutGraph replaces wholesale and two runs can
+// agree on how many edges there are and disagree on which.
+func TestReindexingTheSameCommitConvergesLive(t *testing.T) {
+	st := liveStore(t)
+	first := indexLive(t, st, liveJob{name: "graph-converge", strategy: chunk.StrategyAST})
+	second := indexLive(t, st, liveJob{name: "graph-converge", strategy: chunk.StrategyAST})
+
+	if first.repoID != second.repoID {
+		t.Fatalf("one commit got two repo ids: %s and %s", first.repoID, second.repoID)
+	}
+	if !slices.Equal(symbolIDs(first), symbolIDs(second)) {
+		t.Errorf("the second index wrote a different set of symbols:\n %v\n %v",
+			symbolIDs(first), symbolIDs(second))
+	}
+	if !slices.Equal(edgeIDs(first), edgeIDs(second)) {
+		t.Errorf("the second index wrote a different set of edges:\n %v\n %v",
+			edgeIDs(first), edgeIDs(second))
+	}
+	// Equal ids with unequal rows would mean the replace dropped a column
+	// rather than a row, which the ids alone cannot see.
+	if !slices.Equal(second.callSites(t), first.callSites(t)) {
+		t.Errorf("the same edge ids came back with different call sites:\n %v\n %v",
+			first.callSites(t), second.callSites(t))
+	}
+	syms, edges, err := st.CountGraph(context.Background(), second.repoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if syms != len(wantSymbols) || edges != len(wantCallSites) {
+		t.Fatalf("%d symbols and %d edges after two indexes of one commit, want %d and %d",
+			syms, edges, len(wantSymbols), len(wantCallSites))
+	}
+}
+
+// The per-edge architecture stated as a property (spec §6): the edge set is the
+// AST's, and type information only ever upgrades rows. So the same fixture
+// indexed with and without the type-checker produces the same edge ids, and
+// differs in provenance and target alone.
+func TestTheEdgeCountIsTheSameWithAndWithoutTypecheckingLive(t *testing.T) {
+	st := liveStore(t)
+	with := indexLive(t, st, liveJob{name: "same-edges", strategy: chunk.StrategyAST})
+	without := indexLive(t, st, liveJob{name: "same-edges", strategy: chunk.StrategyAST,
+		tweak: func(ix *indexer) { ix.lim.typecheck = false }})
+
+	if !slices.Equal(edgeIDs(with), edgeIDs(without)) {
+		t.Fatalf("type-checking changed the edge set:\n with %v\n without %v",
+			edgeIDs(with), edgeIDs(without))
+	}
+	if !slices.Equal(symbolIDs(with), symbolIDs(without)) {
+		t.Errorf("type-checking changed the symbol set: %d and %d rows",
+			len(with.symbols), len(without.symbols))
+	}
+	// Every row of the second run is syntactic with a null target, and every
+	// other column of the pair is equal — which is what makes provenance and
+	// to_symbol_id the *only* difference rather than merely a difference.
+	off := map[string]edgeRow{}
+	for _, e := range without.edges {
+		off[e.ID] = e
+	}
+	var upgraded int
+	for _, e := range with.edges {
+		o := off[e.ID]
+		if o.Provenance != string(models.ProvenanceSyntactic) || o.To != "" {
+			t.Errorf("with TYPECHECK=false, edge to %s at %s:%d is %s with target %q",
+				o.ToName, o.Path, o.Line, o.Provenance, o.To)
+		}
+		if e.From != o.From || e.ToName != o.ToName || e.Path != o.Path ||
+			e.Line != o.Line || e.Kind != o.Kind {
+			t.Errorf("edge %s differs in more than its label:\n %+v\n %+v", e.ID, e, o)
+		}
+		if e.Provenance != o.Provenance {
+			upgraded++
+		}
+	}
+	// The control: without a row that actually differs, the equality above
+	// would hold on a build where the type-checker never ran at all.
+	if upgraded == 0 {
+		t.Fatal("no edge changed label between the two runs, so the type-checker resolved nothing in either")
+	}
+	if got := logLine(t, without.log, "symbol graph")["reason"]; got != symbols.ReasonDisabled {
+		t.Errorf("the disabled run says reason %v, want %q", got, symbols.ReasonDisabled)
+	}
+}
+
+func symbolIDs(r liveRun) []string {
+	out := make([]string, 0, len(r.symbols))
+	for _, s := range r.symbols {
+		out = append(out, s.ID)
+	}
+	slices.Sort(out)
+	return out
+}
+
+func edgeIDs(r liveRun) []string {
+	out := make([]string, 0, len(r.edges))
+	for _, e := range r.edges {
+		out = append(out, e.ID)
+	}
+	slices.Sort(out)
+	return out
 }
