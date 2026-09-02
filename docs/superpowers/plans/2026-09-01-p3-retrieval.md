@@ -1850,6 +1850,7 @@ Three decisions the plan did not make, made here and recorded rather than discov
 - *Must fail:* `TestGetSpanIsScopedToItsRepositoryLive`
 - *Observed:* killed. `a span of 450ef7df52ceb623922dc23882f4a749 was served under e8db6409713bfa871d12bb3e49cac7da: <nil>`.
 - *Compiles and vets:* yes. `OR true` rather than deleting the predicate, because dropping it unbinds `$1` and pgx answers a protocol error — a void mutation, not a behaviour change (rule 2).
+
 - [x] **Step 4: Commit**
 
 ```bash
