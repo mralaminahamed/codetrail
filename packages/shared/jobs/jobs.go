@@ -38,6 +38,10 @@ type Job struct {
 	Status   Status `json:"status"`
 	Attempts int    `json:"attempts"`
 	Error    string `json:"error,omitempty"`
+	// RepoID is what this job produced, and is how a caller who submitted a
+	// repository names it afterwards: the id is hash(key, commit) and only the
+	// indexer ever saw the commit. Empty until Complete writes it.
+	RepoID string `json:"repo_id,omitempty"`
 }
 
 // DefaultRetryBase and DefaultRetryMax bound the wait between attempts. Small
@@ -65,11 +69,13 @@ func New(pool *pgxpool.Pool) *Queue {
 	return &Queue{pool: pool, RetryBase: DefaultRetryBase, RetryMax: DefaultRetryMax}
 }
 
-const cols = `id, remote, ref, status, attempts, error`
+// coalesce because repo_id is NULL on every job that has not completed, and
+// "" is what that means to a caller.
+const cols = `id, remote, ref, status, attempts, error, coalesce(repo_id, '')`
 
 func scan(row pgx.Row) (Job, error) {
 	var j Job
-	err := row.Scan(&j.ID, &j.Remote, &j.Ref, &j.Status, &j.Attempts, &j.Error)
+	err := row.Scan(&j.ID, &j.Remote, &j.Ref, &j.Status, &j.Attempts, &j.Error, &j.RepoID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Job{}, ErrNotFound
 	}
@@ -138,15 +144,19 @@ func (q *Queue) Lease(ctx context.Context, worker string, d time.Duration) (Job,
 	return j, true, nil
 }
 
-// Complete marks the job done, but only for the worker still holding the
-// lease. A worker whose lease expired has had its job reclaimed, and finishing
-// it here would mark done a clone that another worker is still running — the
-// exact crash path leases exist to survive.
-func (q *Queue) Complete(ctx context.Context, id, worker string) error {
+// Complete marks the job done and records the repo it produced, but only for
+// the worker still holding the lease. A worker whose lease expired has had its
+// job reclaimed, and finishing it here would mark done a clone that another
+// worker is still running — the exact crash path leases exist to survive.
+//
+// repoID is written here rather than at enqueue because it is hash(key,
+// commit) and the commit is not known until the clone has run.
+func (q *Queue) Complete(ctx context.Context, id, worker, repoID string) error {
 	tag, err := q.pool.Exec(ctx, `
 		UPDATE jobs SET
-			status='done', leased_by=NULL, leased_until=NULL, error='', updated_at=now()
-		WHERE id=$1 AND leased_by=$2`, id, worker)
+			status='done', leased_by=NULL, leased_until=NULL, error='',
+			repo_id=$3, updated_at=now()
+		WHERE id=$1 AND leased_by=$2`, id, worker, repoID)
 	if err != nil {
 		return err
 	}
@@ -187,6 +197,38 @@ func (q *Queue) Fail(ctx context.Context, id, worker, reason string, maxAttempts
 		return ErrNotLeased
 	}
 	return nil
+}
+
+// Sweep deletes terminal jobs that stopped changing more than keepFor ago and
+// returns how many went. Spec §14 left the rule to P3; it is JOB_HISTORY_HOURS,
+// 168h by default.
+//
+// By age, not by count, and never on re-enqueue. Dropping a repository's
+// terminal jobs when it is submitted again — the cheap bound — 404s a job id a
+// caller still holds, at a moment chosen by an unrelated stranger submitting
+// the same URL, and a caller cannot tell that from an id that was never real.
+// "Keep the newest N" does the same thing under a flood, to jobs that are
+// minutes old and still being polled. An age window is the only one of the
+// three that can be stated to a caller: a job id is readable for a week after
+// it finishes.
+//
+// What it does not bound is a flood inside the window; that control is a rate
+// limit on submission, which does not exist yet.
+//
+// status IN ('done','failed') is not a filter on the interesting rows, it is
+// the safety property: a pending or leased row is the lease, and deleting one
+// hands the same repository to a second worker with no record of the first,
+// however old it is.
+func (q *Queue) Sweep(ctx context.Context, keepFor time.Duration) (int, error) {
+	tag, err := q.pool.Exec(ctx, `
+		DELETE FROM jobs
+		WHERE status IN ('done', 'failed')
+		  AND updated_at < now() - $1::interval`,
+		fmt.Sprintf("%d milliseconds", keepFor.Milliseconds()))
+	if err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), nil
 }
 
 func (q *Queue) Get(ctx context.Context, id string) (Job, error) {
