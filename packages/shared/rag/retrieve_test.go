@@ -272,6 +272,14 @@ func TestARepoIndexedByAnotherModelIsAnError(t *testing.T) {
 			if len(st.vecCalls) != 0 {
 				t.Fatal("the arms ran anyway")
 			}
+			// The failed result still carries what was configured to run. A
+			// caller that reads an error as a caller-facing outcome — the
+			// gateway does, for a repo with no spans — reports the mode it
+			// retrieved in and a top score of null from this, and a zero
+			// Result would give it mode "" and a similarity of 0.
+			if out.Mode != ModeHybrid || !out.VectorRan || !math.IsNaN(out.TopScore) {
+				t.Errorf("a failed retrieval returned %+v", out)
+			}
 		})
 	}
 }

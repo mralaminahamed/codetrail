@@ -259,10 +259,12 @@ func (h *Handler) search(c echo.Context) error {
 	}
 	ctx := c.Request().Context()
 	out, err := h.Rag.Search(ctx, r.ID, q, limit)
-	if err != nil {
-		// No answer counter here. Those three outcomes are spec §10's for a
-		// question that was asked; a search is a ranked list, and counting its
-		// failures as answer errors would put two populations in one rate.
+	// An empty corpus ranks nothing, which is an empty list rather than a
+	// failure. No answer counter here either: those three outcomes are spec
+	// §10's for a question that was asked; a search is a ranked list, and
+	// counting its failures as answer errors would put two populations in one
+	// rate.
+	if err != nil && !noSpans(err) {
 		return h.fail(c, err, "search")
 	}
 	newer, err := h.newer(ctx, r.ID)
@@ -314,7 +316,9 @@ func (h *Handler) ask(c echo.Context) error {
 	}
 	ctx := c.Request().Context()
 	out, err := h.Rag.Search(ctx, r.ID, q, limit)
-	if err != nil {
+	// A repository with no spans has nothing to rank, so out carries no hits
+	// and Decide reaches no_spans below. Anything else is ours.
+	if err != nil && !noSpans(err) {
 		metrics.CountAnswer("error")
 		return h.fail(c, err, "ask")
 	}
@@ -346,6 +350,15 @@ func (h *Handler) ask(c echo.Context) error {
 		Mode: out.Mode, TopScore: number(out.TopScore), Floor: floor,
 	})
 }
+
+// noSpans is the retriever's report that this repository holds nothing to rank:
+// SpanEmbedder answers store.ErrNotFound for a corpus with no spans in it.
+//
+// An outcome, not a failure — the same reading the repo and span routes above
+// already give ErrNotFound. Filing it as an error would move the error counter
+// for a corpus that is merely empty and make spec §10's no_spans refusal
+// unreachable in every mode that runs the vector arm, which is the default.
+func noSpans(err error) bool { return errors.Is(err, store.ErrNotFound) }
 
 // detail says what the reason means in words, from the closed set of reasons
 // and the configured floor — never from anything the caller sent. Spec §10

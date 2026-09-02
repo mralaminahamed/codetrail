@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"maps"
 	"math"
@@ -92,6 +93,10 @@ type fakeStore struct {
 	vector, lexical []models.Cite
 	model           string
 	dim             int
+	// embedderErr is what a repository with no spans answers: the real store
+	// reports that as ErrNotFound, and it is the one arm failure the handler
+	// must not read as a failure at all.
+	embedderErr error
 }
 
 func newStore() *fakeStore {
@@ -164,6 +169,9 @@ func (f *fakeStore) LexicalSearch(context.Context, string, []string, int) ([]mod
 }
 
 func (f *fakeStore) SpanEmbedder(context.Context, string) (string, int, error) {
+	if f.embedderErr != nil {
+		return "", 0, f.embedderErr
+	}
 	return f.model, f.dim, f.err
 }
 
@@ -466,6 +474,78 @@ func TestAskRefusesWhenNothingWasRetrieved(t *testing.T) {
 	// NaN, so the honest encoding is null.
 	if v, ok := out["top_score"]; !ok || v != nil {
 		t.Errorf("top_score %v, want null", v)
+	}
+}
+
+// A repository indexed with no spans is the likeliest way a caller meets spec
+// §10's distinction, and it used to be a 500: SpanEmbedder answers ErrNotFound
+// for a corpus with nothing in it, and the retrieval path filed that as a
+// failure — which moved the error counter and made no_spans unreachable in
+// every mode that runs the vector arm.
+//
+// A real Retriever over the fake store, not a stubbed one: the outcome turns on
+// what the store answers, and a fake retriever returning a refusal directly
+// would assert nothing about the path that produces it. Both affected modes,
+// because vector-only reaches the same call and a fix keyed on hybrid would
+// leave it broken.
+//
+// The reason is asserted, not merely the refusal: the three reasons are three
+// different facts about the corpus, and a mutant refusing for another one
+// passes a check that only reads refused:true.
+func TestARepoWithNoSpansRefusesRatherThanErrors(t *testing.T) {
+	for _, mode := range []rag.Mode{rag.ModeHybrid, rag.ModeVector} {
+		t.Run(string(mode), func(t *testing.T) {
+			st := newStore()
+			// Wrapped the way the real store wraps it, so a handler comparing
+			// with == rather than errors.Is fails here.
+			st.embedderErr = fmt.Errorf("%w: repo %s has no spans", store.ErrNotFound, fixtureRepoID)
+			h := hermeticHandler(st, &rag.Retriever{
+				Store: st, Emb: embed.NewFake(fixtureDim), Mode: mode,
+				K: 60, Candidates: 40, Split: true, Floor: rag.DefaultFloor(),
+			})
+
+			before := counters(t)
+			rec := do(mount(h), http.MethodPost, "/api/repos/repo-1/ask", `{"q":"sampler"}`)
+			moved := movedSince(t, before)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("an empty corpus is a refusal, got %d: %s", rec.Code, rec.Body)
+			}
+			out := body(t, rec)
+			if out["refused"] != true || out["reason"] != string(rag.ReasonNoSpans) {
+				t.Errorf("refused %v reason %v, want true and %q", out["refused"], out["reason"], rag.ReasonNoSpans)
+			}
+			if d, _ := out["detail"].(string); d == "" {
+				t.Errorf("a refusal with no detail: %s", rec.Body)
+			}
+			// The response still says what ran and that it scored nothing: a
+			// refusal built from a zero Result would report mode "" and a
+			// top score of 0, which is a real cosine similarity.
+			if out["mode"] != string(mode) {
+				t.Errorf("mode %v, want %q", out["mode"], mode)
+			}
+			if v, ok := out["top_score"]; !ok || v != nil {
+				t.Errorf("top_score %v, want null", v)
+			}
+			// The whole movement, so a mutant that also counts an error fails.
+			want := map[string]float64{
+				`codetrail_answer_total{outcome="refused"}`:  1,
+				`codetrail_refusal_total{reason="no_spans"}`: 1,
+			}
+			if !maps.Equal(moved, want) {
+				t.Errorf("counters moved %v, want %v", moved, want)
+			}
+
+			// The same corpus on the search route ranks nothing, which is an
+			// empty list and not a failure either.
+			rec = do(mount(h), http.MethodPost, "/api/repos/repo-1/search", `{"q":"sampler"}`)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("search over an empty corpus: want 200, got %d: %s", rec.Code, rec.Body)
+			}
+			out = body(t, rec)
+			if out["count"] != float64(0) || out["mode"] != string(mode) {
+				t.Errorf("search body %s", rec.Body)
+			}
+		})
 	}
 }
 

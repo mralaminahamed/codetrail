@@ -590,6 +590,91 @@ func TestARefusalAnErrorAndAValidationFailureAreThreeOutcomesLive(t *testing.T) 
 	}
 }
 
+// emptyRepo is an indexed repository whose index holds no spans, which is what
+// the indexer leaves behind for a tree of unsupported extensions and for an AST
+// strategy over files that declare nothing. PutRepo without PutSpans is that
+// row exactly.
+func emptyRepo(t *testing.T, st *store.Store, name string) models.Repo {
+	t.Helper()
+	ctx := context.Background()
+	remote := "https://github.com/codetrail-live/" + name
+	commit := store.Digest(name)[:40]
+	repo := models.Repo{ID: store.RepoID(remote, commit), Remote: remote, Ref: "main",
+		Commit: commit, SizeBytes: 4096, IndexedAt: time.Now().Add(-72 * time.Hour)}
+	// One file, of a language walk does not classify: the repository was
+	// indexed and holds content, and still no span was written for it.
+	f := models.File{ID: store.FileID(repo.ID, "LICENSE"), RepoID: repo.ID, Path: "LICENSE",
+		Blob: store.Digest("license")[:40], Lines: 3}
+	if err := st.PutRepo(ctx, repo, []models.File{f}); err != nil {
+		t.Fatal(err)
+	}
+	// Asserted rather than assumed: the whole test below is about a corpus with
+	// no spans, and one that quietly had some would pass for the wrong reason.
+	n, err := st.CountSpans(ctx, repo.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("the empty corpus holds %d spans", n)
+	}
+	return repo
+}
+
+// Spec §10 at the outcome most likely to reach a real user: a repository that
+// was indexed and produced no spans. The corpus has nothing to rank, which is a
+// refusal — and until this was fixed the two modes that run the vector arm
+// answered 500, so the error counter moved and no_spans was unreachable at the
+// shipped default.
+//
+// All three modes, because the defect was in the vector arm's own precondition:
+// lexical mode reached the refusal already and is the control that shows the
+// other two now agree with it.
+func TestARepoIndexedWithNoSpansRefusesInEveryMode(t *testing.T) {
+	st := liveStore(t)
+	repo := emptyRepo(t, st, "no-spans")
+
+	for _, mode := range []rag.Mode{rag.ModeHybrid, rag.ModeVector, rag.ModeLexical} {
+		t.Run(string(mode), func(t *testing.T) {
+			h := liveHandler(t, st, mode, rag.DefaultFloor())
+			before := counters(t)
+			res, rec := ask(t, h, repo.ID, "how does the machine push a running total")
+			moved := movedSince(t, before)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("%s: an empty corpus is a refusal, got %d: %s", mode, rec.Code, rec.Body)
+			}
+			// The reason, not merely the refusal: no_spans and below_floor are
+			// different facts about this repository.
+			if !res.Refused || res.Reason != string(rag.ReasonNoSpans) {
+				t.Fatalf("%s: refused=%v reason=%q, want a no_spans refusal: %s",
+					mode, res.Refused, res.Reason, rec.Body)
+			}
+			if res.Mode != string(mode) || res.TopScore != nil {
+				t.Errorf("%s: mode %q top_score %v", mode, res.Mode, res.TopScore)
+			}
+			want := map[string]float64{
+				`codetrail_answer_total{outcome="refused"}`:  1,
+				`codetrail_refusal_total{reason="no_spans"}`: 1,
+			}
+			if !maps.Equal(moved, want) {
+				t.Errorf("%s: counters moved %v, want %v — a refusal must not move the error counter",
+					mode, moved, want)
+			}
+
+			// Search ranks rather than refuses, so the same corpus is an empty
+			// list there, and a 200: nothing to rank is not a failure.
+			rec = post(t, h, "/api/repos/"+repo.ID+"/search", `{"q":"machine"}`)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("%s: search over an empty corpus: %d %s", mode, rec.Code, rec.Body)
+			}
+			out := body(t, rec)
+			if out["count"] != float64(0) || out["mode"] != string(mode) {
+				t.Errorf("%s: search body %s", mode, rec.Body)
+			}
+		})
+	}
+}
+
 // repoRoutesFor is every route keyed on a repo id, which is the set the
 // 404/410 distinction has to hold across rather than on the one route a test
 // happened to drive.

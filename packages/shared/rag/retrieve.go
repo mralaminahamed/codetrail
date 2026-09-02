@@ -77,6 +77,13 @@ type Result struct {
 // knows what "retrieval latency" covers, and the handler is the only thing
 // that knows whether the request ended as an answer, a refusal or an error.
 // Splitting them is what stops one call site counting both.
+//
+// A failed arm returns the empty result the arms were going to fill rather than
+// a zero Result, so it still carries what was configured to run: the mode, and
+// whether the vector arm was part of it. Not every failure here is a failure to
+// the caller — a repo with no spans is store.ErrNotFound, and the gateway
+// answers that as a refusal — and a refusal built from a zero Result would
+// report mode "" and a top score of 0, which is a real cosine similarity.
 func (r *Retriever) Search(ctx context.Context, repoID, q string, limit int) (Result, error) {
 	if err := r.validate(limit); err != nil {
 		return Result{}, err
@@ -88,10 +95,10 @@ func (r *Retriever) Search(ctx context.Context, repoID, q string, limit int) (Re
 	if res.VectorRan {
 		qv, err := r.embedQuery(ctx, repoID, q)
 		if err != nil {
-			return Result{}, err
+			return res, err
 		}
 		if vector, err = r.Store.VectorSearch(ctx, repoID, qv, r.Candidates); err != nil {
-			return Result{}, err
+			return res, err
 		}
 		if len(vector) > 0 {
 			res.TopScore = float64(vector[0].Score)
@@ -102,7 +109,7 @@ func (r *Retriever) Search(ctx context.Context, repoID, q string, limit int) (Re
 		// The terms, never the question: to_tsquery reads &, |, !, : and ( as
 		// operators, and most questions about code contain one.
 		if lexical, err = r.Store.LexicalSearch(ctx, repoID, Terms(q, r.Split), r.Candidates); err != nil {
-			return Result{}, err
+			return res, err
 		}
 	}
 
