@@ -202,8 +202,9 @@ func workerID() string {
 // one on its caps, and burn them all to terminal. Failing one boot is the
 // diagnosable version of that.
 //
-// A value that is not a number at all is config.GetInt's own refusal, which
-// takes precedence: MAX_REPO_FILES=2OOOO has no range to be outside of.
+// A value that is not a number at all is config.GetInt's own refusal, and that
+// knob's range is not checked on top of it: MAX_REPO_FILES=2OOOO has no range
+// to be outside of.
 //
 // KEEP_REPOS is here for the same reason and a worse consequence: Evict reads a
 // keep of 0 as "keep nothing" and deletes every repo, so the one knob where a
