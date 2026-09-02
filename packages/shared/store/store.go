@@ -1,5 +1,5 @@
 // Package store is the Postgres system of record: repos, files, spans, their
-// embeddings, and (from P3) the symbol graph.
+// embeddings, and (from P4) the symbol graph.
 //
 // One datastore, not two. The graph questions this product answers — who calls
 // this, what does it import — are relational, and pgvector puts the embeddings
