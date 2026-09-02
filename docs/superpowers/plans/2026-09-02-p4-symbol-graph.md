@@ -176,6 +176,8 @@ Land Task 1 first if more than one is ready: it is the only task that touches `c
 - **The symbol's spelling is not re-derived; it moves.** `chunk.classify` writes a method as `Store.Get` and that string is already in `spans.symbol`, in P3's lexical `tsvector` (through `replace(symbol, '.', ' ')`) and in every citation a user has seen. A second derivation in `symbols` would agree on the day it was written and drift on the day someone adds generic receivers. So `classify` becomes `chunk.Decl` and both callers use it. **The cheap alternative — copy the switch — is what this project has already been bitten by twice** (`kind=file`'s meaning, and `models.go`'s comment about it), both times because two places stated the same fact independently.
 - **`Decl` returns the range too, not only the name.** A span's range starts at the doc comment (`astChunks` does `if doc := docOf(d); doc != nil { start = line(fset, doc.Pos()) }`), and a definition that started at the `func` keyword would differ from its own span by however many lines the doc comment is. One function returns one range and the two cannot disagree.
 - **A definition exists whether or not a span does.** `MaxDeclLines` sub-windows a long declaration into `kind=file` spans, so the biggest functions in a repository have no span of their own — and they are the ones most worth asking "who calls this" about. Definitions are the AST's, not the chunker's, so a 3,000-line function is one `Def` and several spans. Task 2 links them by containment.
+
+  > **Measured, and it refines Task 2's claim.** The hole opens at `WindowLines`, not at `MaxDeclLines`. A declaration over `MaxDeclLines` but shorter than one window is sub-windowed into exactly **one** `kind=file` span whose range *equals* the declaration's — measured on `symbols/testdata/long.gotxt` (a 27-line declaration, `MaxDeclLines=10`, the shipped `WindowLines=40`: one span, 3..29, identical to the `Def`). So "an exact-range match would be null for the largest declarations" is true only for declarations longer than a window; between the two thresholds an exact match still finds a span, and it finds one that is a window rather than the declaration. Containment is right either way, and this is the reason the fixture scales the window down (`MaxDeclLines=10`, `WindowLines=10`, `WindowOverlap=2` → 3..12, 11..20, 19..28, 27..29) rather than trusting the defaults to produce the hole.
 - **`Pkg` is the package clause name (`f.Name.Name`), not the import path.** The import path is not knowable without a module-aware load, and this pass must work when that load fails — which §6 says is expected. The file's directory is already in `Path`, so a column holding the directory would be a copy. Open question 5 records what is lost: two packages named `store` in one repository are distinguishable only by path.
 - **A call's `Name` is the last identifier of the callee**, which is exactly what spec:84 says a syntactic edge knows: "it calls something named `Close`". `pkg.Fn` → `Fn`; `s.Get` → `Get`; `x.y.Z` → `Z`; `Close` → `Close`. Nothing here can tell a package qualifier from a variable — that is what the type-checker is for — so recording `s.Get` as a name would record a receiver *expression* as though it were a type.
 - **A callee that is not an identifier or a selector produces no edge and is counted.** `f()()`, `fns[i]()`, `func(){}()` — there is no name to record, and an edge with an empty `to_name` would violate the `NOT NULL` §3 gives it and would mean "calls something called nothing". `File.Unnameable` carries the count so the indexer can log it beside `vanished`, `unstrippable` and `tokenless`, which is the existing shape for a per-job soft loss.
@@ -183,7 +185,7 @@ Land Task 1 first if more than one is ready: it is the only task that touches `c
 - **A call belongs to the top-level declaration that encloses it**, found by iterating `f.Decls` and `ast.Inspect`ing each. A call inside a func literal inside `var handler = func() { g() }` belongs to the `var` declaration, because that is the only definition there is. There is no code outside a declaration in Go, so no call is orphaned.
 - **`Parse` returns an error only when the file does not parse**, in which case there are no definitions and no calls for it — matching `chunk`, which falls back to windows. The caller counts it; it is not a job failure.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Fixtures are `.gotxt` under `testdata/`, following `chunk`'s convention (a `.go` file under `testdata` would be compiled by the toolchain and would have to be valid for the whole module).
 
@@ -207,7 +209,11 @@ func TestOffsetsAndRangesSurviveDocCommentStripping(t *testing.T)
 
 **`TestOffsetsAndRangesSurviveDocCommentStripping` is the load-bearing one and it is not obvious.** `StripDocs` blanks doc bytes and keeps every `\n`, so byte offsets and line numbers are expected to be identical between stripped and unstripped source — but the *ranges* are not, because a blanked doc comment is no longer a comment and `Decl` therefore starts the definition at the `func` keyword. So the test asserts **offsets equal, ranges not necessarily equal**, and records the measured difference. If it turns out offsets move, Task 3's whole keying scheme is wrong and must be found here rather than in a resolution rate nobody can explain.
 
-- [ ] **Step 2: Implement**
+> **MEASURED — the premise above is false, and this is the finding of Task 1.** `StripDocs` does *not* blank in place: it **removes the prose bytes and keeps only their line terminators** (`strip.go`'s copy loop skips every dropped byte that is not `\n` or `\r`). Line numbers are invariant; **byte offsets are not**. On `symbols/testdata/docs.gotxt`: the call to `len` is at offset 194 raw and 69 stripped, `errors.New` at 226 and 101, and the file goes from 265 bytes to 140 — every offset below a doc comment moves by the prose removed above it. Ranges move too (`Parse` is 5..14 raw, 8..14 stripped), as predicted.
+>
+> Three consequences. (a) The test is named for what it measures: `TestLineNumbersSurviveDocCommentStrippingAndOffsetsDoNot`, and it pins the offsets as values so the day stripping preserves length it says so. (b) **Task 3's "No `packages.Config.ParseFile` hook, and the reason is a measurement" is a false rationale** — the two streams do *not* share a coordinate system — and the comment it asks for would have been a false comment. (c) **Task 4 must hand the graph pass the indexer's raw `body`, never its stripped `src`** (`apps/indexer/cmd/main.go:486`), or with `STRIP_DOC_COMMENTS=true` every offset key misses and the resolution rate collapses to zero with no error anywhere. Open question 12's recommendation is wrong as written and is answered by "parse the same bytes", not by "they are the same bytes".
+
+- [x] **Step 2: Implement**
 
 `chunk.Decl` is `classify` with the range folded in:
 
@@ -220,68 +226,74 @@ func Decl(fset *token.FileSet, d ast.Decl) (models.SpanKind, string, int, int, b
 
 `symbols.Parse` parses with `parser.ParseComments|parser.SkipObjectResolution` — the same flags `chunk` uses, and `SkipObjectResolution` matters here: `ast.Object` resolution is the thing that would tempt a reader into believing this pass can bind names. It cannot. That is Task 3's job.
 
-- [ ] **Step 3: Run**
+- [x] **Step 3: Run**
 
 `go test ./packages/shared/symbols/ ./packages/shared/chunk/ -count=1 -v`
 
-- [ ] **Step 4: Commit, then prove the tests discriminate**
+- [x] **Step 4: Commit, then prove the tests discriminate**
 
 **M1 — `chunk.Decl` drops the receiver, naming a method `Get`.**
 - *Why the code exists:* `spans.symbol`, the lexical index and every citation already spell a method `Store.Get`; the graph must use the same string or one symbol has two names in one system.
 - *Fixture that separates mutant from original:* `twoget.gotxt`, which declares `Store.Get` and `Cache.Get`. **A fixture with one `Get` cannot:** the assertion would still find "a definition named Get" and the collision that makes the receiver load-bearing would not exist.
-- *Must fail:* `TestAMethodIsNamedByItsReceiverBase`, and `TestEveryDeclarationsSymbolIsSpelledAsItsChunkSpellsIt` *only after* the mutation is applied to `Decl` rather than to a copy — which is the point of the move.
-- *Expected (verify and correct):* `definition 2 is named "Get", want "Cache.Get"`
-- *Compiles and vets:* yes — `recvBase`'s result is discarded, but `recvBase` still has its other caller inside `Decl`'s guard. **Check that:** if the mutation leaves `recvBase` unused it is a build break and must be spelled as `_ = base` instead.
+- *Must fail:* `TestAMethodIsNamedByItsReceiverBase`, and the existing chunk tests.
+- *Observed — killed, in both packages:* `parse_test.go:110: definition 1 is func/"Get" twoget sample.go 7..8, want func/"Store.Get" twoget sample.go 7..8`, plus `ast_test.go:49: chunk 3 is func/Add, want func/Counter.Add`, `ast_test.go:160: chunk 0 is "Push", want "Stack.Push"`, and three more in `chunk`. One edit, five failures in two packages: that is what the move buys.
+- **Plan defect — the "must fail" claim above was backwards.** `TestEveryDeclarationsSymbolIsSpelledAsItsChunkSpellsIt` **passes** under M1 applied to `Decl`, because both packages read the same function and move together. It fails only when a *second* derivation exists — verified by applying M8's copy and then M1 to `Decl` alone: `definition 1 is func/"Get" 7..8, its span is func/"Store.Get" 7..8`. The cross-package test detects **drift between two derivations**, which is precisely the failure a copy would cause and the reason M8 is worth refusing.
+- *Compiles and vets:* yes — `base` is still read by the `if` guard, so nothing is left unused. (The build-break warning belongs to M2, not here: see below.)
 
 **M2 — the definition's range starts at the declaration rather than at its doc comment.**
 - *Why the code exists:* a span starts at the doc comment, so a definition that did not would differ from its own span and `span_id` linkage would go from exact to approximate for every documented declaration in the corpus.
 - *Fixture that separates mutant from original:* `docs.gotxt`, a declaration with a three-line doc comment. **A fixture of undocumented declarations cannot** — and an undocumented corpus is not hypothetical, it is what `STRIP_DOC_COMMENTS=true` produces.
 - *Must fail:* `TestADefinitionsRangeIncludesItsDocComment`
-- *Expected (verify and correct):* `definition Parse spans 8..14, its chunk spans 5..14`
-- *Compiles and vets:* yes.
+- *Observed — killed:* `parse_test.go:136: Parse starts at line 8, which holds "func Parse(src []byte) error {", want its doc comment`, plus six more in `symbols` and two in `chunk` (`ast_test.go:82: ErrGone starts at line 9 …`).
+- **Plan defect — the predicted message could not happen.** `definition Parse spans 8..14, its chunk spans 5..14` assumes the definition and the chunk can disagree; under one shared `Decl` they move together, so the def-vs-chunk comparison **passes** under M2. What kills it is the assertion anchored on the fixture's own line text. Both assertions are kept: the comparison catches a copy, the anchor catches a shared wrong answer.
+- **Plan defect — M2 is the mutation that breaks the build, not M1.** Deleting the `if doc != nil` block leaves `doc` assigned and never read: `packages/shared/chunk/ast.go:70:6: declared and not used: doc`. Spelled `_ = doc`, it compiles, vets and kills.
+- *Compiles and vets:* yes, as `_ = doc`.
 
 **M3 — calls keyed by line instead of by byte offset.**
 - *Why the code exists:* two calls on one line are two edges, and Task 2 hashes this key into the edge id, so a line key silently merges them.
 - *Fixture that separates mutant from original:* `calls.gotxt` containing `a(b(), b())`. **A fixture with one call per line cannot**, and one call per line is what every hand-written fixture looks like unless it is written for this.
 - *Must fail:* `TestTwoCallsOnOneLineAreTwoCalls`
-- *Expected (verify and correct):* `got 1 call to b, want 2` — verify whether the mutant yields one call or two calls with equal keys; the second is the more likely shape and changes the message.
+- *Observed — killed:* `parse_test.go:245: two calls to b on line 12 share the key 12, so they are one edge` (and the stripping test, which pins the offsets as values). **The predicted alternative was the real one:** the mutant yields *two* calls with *equal keys*, so an assertion of `len(calls) == 2` would have passed. The assertion is on the keys being distinct, not on the count.
 - *Compiles and vets:* yes.
 
 **M4 — the callee name keeps the whole selector expression (`s.Get` rather than `Get`).**
 - *Why the code exists:* spec:84 — a syntactic edge "knows it calls something named `Close`". `s` is a variable, not a type, and this pass cannot tell the difference; storing `s.Get` records a receiver expression as though it were a qualified name, and no `to_name` would ever match a definition.
 - *Fixture that separates mutant from original:* the `TestTheCalleeNameIsItsLastSegment` table, whose rows are `pkg.Fn`, `s.Get`, `x.y.Z`, `Close`. The `x.y.Z` row is the one that separates "last segment" from "the two last segments".
 - *Must fail:* `TestTheCalleeNameIsItsLastSegment`
-- *Expected (verify and correct):* `callee 2 named "s.Get", want "Get"`
+- *Observed — killed:* `parse_test.go:266: callee 0 named "pkg.Fn", want "Fn"` — index 0, because the mutant catches every selector, not only the method call.
+- *Also run, M4b — only nested selectors keep two segments:* `parse_test.go:266: callee 2 named "y.Z", want "Z"`. This is the run that proves the `x.y.Z` row earns its place: M4b is invisible to the other three rows.
 - *Compiles and vets:* yes.
 
 **M5 — an unnameable callee is recorded with an empty name instead of counted.**
 - *Why the code exists:* `edges.to_name` is `NOT NULL` in §3, and an edge naming nothing is not a weaker claim than a syntactic edge, it is a meaningless one.
 - *Fixture that separates mutant from original:* `calls.gotxt`'s `fns[i]()` and `f()()`. Every other fixture in this package has a nameable callee.
 - *Must fail:* `TestACalleeWithNoNameIsCountedRatherThanGuessed`
-- *Expected (verify and correct):* `got 5 calls and 0 unnameable, want 3 calls and 2 unnameable`
+- *Observed — killed:* `parse_test.go:280: got 9 calls and 0 unnameable, want 6 and 3`. The fixture holds three unnameable callees (`fns[0]()`, `f()()`, `func(){ b() }()`) and six nameable ones; the inner calls of the last two are themselves nameable, which is why the counts are 6/3 rather than the predicted 3/2.
 - *Compiles and vets:* yes.
 
 **M6 — calls are collected file-wide rather than per declaration, with `FromStart` set to the first declaration.**
 - *Why the code exists:* an edge's tail must be the definition the call is *in*, or "who calls this" names the wrong function — which is a wrong answer that looks exactly like a right one.
 - *Fixture that separates mutant from original:* `calls.gotxt` has three declarations and puts the call in the **last**. A fixture with one declaration cannot see this at all, and a fixture whose call is in the first declaration passes under the mutant by coincidence.
 - *Must fail:* `TestACallInsideAFuncLiteralBelongsToTheEnclosingDeclaration`
-- *Expected (verify and correct):* `call to g is in declaration starting at line 3, want 21`
+- *Observed — killed:* `parse_test.go:317: call to g is in the declaration starting at line 3, want 22` — 22 rather than 21 is where the fixture's `var handler` doc comment starts; the shape is exactly as predicted.
 - *Compiles and vets:* yes.
 
 **M7 — `Parse` reports a parse error as a fatal error rather than an empty file.**
 - *Why the code exists:* an unparseable file is a normal thing in a stranger's repository and `chunk` already windows it rather than failing; a graph pass that fails the job on one bad file is stricter than the chunker for no reason.
 - *Fixture that separates mutant from original:* a fixture that does not parse (reuse `chunk/testdata/broken.gotxt`).
-- *Must fail:* the parse-error subtest of `TestAFileWithNoDeclarationsHasNoDefinitions` — **add one if it is not there**, because as listed above no test in this task feeds `Parse` something unparseable.
-- *Expected (verify and correct):* `Parse returned error "expected declaration, found …", want an empty File`
+- *Must fail:* the parse-error subtest of `TestAFileWithNoDeclarationsHasNoDefinitions` — added; it reads `chunk/testdata/broken.gotxt`, so both packages agree on what "does not parse" means.
+- *Observed — killed:* `parse_test.go:205: Parse returned 10 definitions, 0 calls, pkg "broken" and 0 unnameable with error "symbols: parse sample.go: sample.go:6:1: expected operand, found '}' (and 2 more errors)", want an empty File`. The mutation that has teeth is not "error instead of empty" (the original returns both) but **returning the partial AST go/parser recovers**: ten definitions whose ranges are the parser's guesses about code that is not there. `f` is never nil when the source is in memory, so the mutant asserts rather than panicking.
 - *Compiles and vets:* yes.
 
 **M8 — `astChunks` keeps its own copy of the naming switch instead of calling `Decl`.**
 - *Why the code exists:* this is the whole point of the task, and it is the mutation that tests the *refactor* rather than the code.
-- *Fixture that separates mutant from original:* **none, and that is the finding to record.** Re-introducing the duplicate leaves every test in both packages passing, because the copy is correct on the day it is made. The instrument is not a test; it is `grep -c 'recvBase' packages/shared/chunk/*.go` returning 1, and a comment on `Decl` saying why. Record this as a **known survivor** with its reason: what this refactor buys is not a behaviour today, it is that M1 applied in one place fails tests in two packages.
+- *Fixture that separates mutant from original:* **none, and that is the finding to record.** Re-introducing the duplicate leaves every test in both packages passing, because the copy is correct on the day it is made. Record this as a **known survivor** with its reason: what this refactor buys is not a behaviour today, it is that M1 applied in one place fails tests in two packages.
 - *Must fail:* nothing. Recorded as a survivor.
+- *Observed — survivor, as predicted:* with `classify` restored beside `Decl` and `astChunks` calling the copy, `go test ./packages/shared/symbols/ ./packages/shared/chunk/` is `ok` and `ok`. Then applying **M1 to `Decl` alone**, with the copy in place, fails `TestEveryDeclarationsSymbolIsSpelledAsItsChunkSpellsIt/twoget.gotxt`: `definition 1 is func/"Get" 7..8, its span is func/"Store.Get" 7..8`. So the survivor is real and the cross-package test is what would catch the drift the copy makes possible.
+- **Plan defect — the instrument as written does not work.** `grep -c 'recvBase' packages/shared/chunk/*.go` counts *lines in one file* and returns 5, not 1, because `recvBase` is defined there and is self-recursive. The instrument that works is `grep -rln recvBase packages apps`, which must return exactly `packages/shared/chunk/ast.go`.
 - *Compiles and vets:* yes.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 gofmt -l apps packages && go vet ./... && go test ./... -count=1
@@ -302,12 +314,12 @@ named — edges.to_name is NOT NULL and an edge naming nothing is not a
 weaker claim, it is an empty one."
 ```
 
-**Definition of Done**
+**Definition of Done** — all met; see the notes above for the two deviations (the stripping premise and the M1/M2 predictions).
 - One derivation of a symbol's name in the repository, called from both `chunk` and `symbols`, with a test that compares the two packages' output rather than each against a literal.
 - A definition exists for a declaration too long to have a span of its own.
 - `doc.go` and `tools.go` shapes yield zero definitions, matching their zero spans.
 - Two calls on one line are two calls; a callee with no name is counted, not guessed.
-- Byte offsets are pinned as invariant under `StripDocs`, with the measured behaviour of the *ranges* recorded beside it.
+- ~~Byte offsets are pinned as invariant under `StripDocs`~~ — **measured false.** Line numbers are invariant, byte offsets are not, and the measurement is pinned as values with the consequence for Tasks 3 and 4 recorded above.
 - M1–M8 recorded with observed output, M8 recorded as a survivor with its reason.
 
 ---
