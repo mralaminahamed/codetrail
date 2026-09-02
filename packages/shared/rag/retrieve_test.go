@@ -199,8 +199,10 @@ func TestModeHybridRunsBoth(t *testing.T) {
 }
 
 // The floor reads this number, so it has to be the vector arm's own
-// similarity. The fused top score is 1/61 for any non-empty result, which
-// would look like a plausible score and mean nothing.
+// similarity. Measured under a mutant that read the fused score instead: this
+// fixture's fused top is 0.0325224 — 1/61 + 1/62, a function of the ranks and
+// of nothing else — which looks like a plausible small similarity and says
+// nothing about quality.
 func TestTopScoreIsTheVectorArmsBestSimilarity(t *testing.T) {
 	r, _, _ := retriever(t, ModeHybrid)
 	got := search(t, r, 10)
