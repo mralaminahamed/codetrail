@@ -4,8 +4,10 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -18,9 +20,12 @@ import (
 	"github.com/mralaminahamed/codetrail/apps/gateway/internal/server"
 	"github.com/mralaminahamed/codetrail/packages/shared/admit"
 	"github.com/mralaminahamed/codetrail/packages/shared/config"
+	"github.com/mralaminahamed/codetrail/packages/shared/embed"
 	"github.com/mralaminahamed/codetrail/packages/shared/jobs"
 	"github.com/mralaminahamed/codetrail/packages/shared/logger"
 	"github.com/mralaminahamed/codetrail/packages/shared/metrics"
+	"github.com/mralaminahamed/codetrail/packages/shared/rag"
+	"github.com/mralaminahamed/codetrail/packages/shared/store"
 )
 
 // pinger is what readinessFor needs of the store. An interface so the
@@ -103,6 +108,114 @@ func newHandler(log zerolog.Logger, q handler.Enqueuer) *handler.Handler {
 	return &handler.Handler{Policy: admit.NewPolicy(allowedHosts()), Jobs: q, Log: log}
 }
 
+// queryEmbedTimeout bounds one embed call on the read path. The indexer hands
+// its embedder the job deadline; a query has no such budget, and a hung model
+// would otherwise hold a request open for as long as it liked.
+const queryEmbedTimeout = 15 * time.Second
+
+// newRetriever builds what the read path retrieves with, and refuses to boot on
+// any knob it cannot serve.
+//
+// The gateway needs an embedder because retrieval embeds the *question*, which
+// makes EMBED_PROVIDER, EMBED_MODEL, EMBED_DIM and OLLAMA_URL gateway
+// configuration for the first time. It boots-or-dies on them exactly as the
+// indexer does, and the cost is real and stated: with EMBED_PROVIDER=ollama and
+// Ollama down, submission and job polling go down with retrieval. Parity is
+// chosen over booting into a degraded mode because a degraded mode is the
+// silent downgrade spec §8 calls the failure that costs a week, and there is no
+// state in this codebase for one. The embedder is built even in lexical mode,
+// where nothing calls it, for the same reason: one boot contract, not three.
+//
+// The embedder is built last, after every knob that costs nothing to check, so
+// a typo in RETRIEVAL_MODE fails before a round trip rather than after it.
+func newRetriever(ctx context.Context, log zerolog.Logger, st rag.Searcher) (*rag.Retriever, error) {
+	mode, err := rag.ParseMode(config.Get("RETRIEVAL_MODE", string(rag.ModeHybrid)))
+	if err != nil {
+		return nil, err
+	}
+	// Fuse takes k as an argument and guards nothing: k = -1 makes 1/(k+1) an
+	// infinity and k <= -2 inverts the ranking, both silently, and config.GetInt
+	// parses "-1" happily. 60 is the constant from the paper the method comes
+	// from and is not measured against this corpus.
+	k := config.GetInt("RETRIEVAL_RRF_K", 60)
+	if k < 0 {
+		return nil, fmt.Errorf("RETRIEVAL_RRF_K must not be negative, got %d", k)
+	}
+	// 40 per arm, which is pgvector 0.8.6's own hnsw.ef_search default on the
+	// pinned image — read from pg_settings.boot_val, not assumed. Asking the
+	// ANN index for more rows than ef_search degrades recall with no error,
+	// and hnsw.iterative_scan is off by default, so nothing compensates.
+	candidates := config.GetInt("RETRIEVAL_CANDIDATES", 40)
+	if candidates < 1 {
+		return nil, fmt.Errorf("RETRIEVAL_CANDIDATES must be positive, got %d", candidates)
+	}
+	split, err := splitIdentifiers()
+	if err != nil {
+		return nil, err
+	}
+	floor, err := scoreFloor()
+	if err != nil {
+		return nil, err
+	}
+	emb, err := embed.FromEnv(ctx, store.EmbeddingDim, store.CheckDim, queryEmbedTimeout)
+	if err != nil {
+		return nil, err
+	}
+
+	// Both gauges at boot, so a dashboard shows the floor — and that nobody has
+	// measured it — before the first query rather than after it.
+	metrics.SetFloor(floor.Value, floor.Calibrated)
+	log.Info().
+		Str("mode", string(mode)).Int("rrf_k", k).Int("candidates", candidates).
+		Bool("split_identifiers", split).
+		Float64("score_floor", floor.Value).Bool("floor_calibrated", floor.Calibrated).
+		Str("embed_model", emb.Model()).Int("embed_dim", emb.Dim()).
+		Msg("retrieval configured; the score floor is not calibrated, its value is measured in P6")
+
+	return &rag.Retriever{
+		Store: st, Emb: emb, Mode: mode,
+		K: k, Candidates: candidates, Split: split, Floor: floor,
+	}, nil
+}
+
+// splitIdentifiers reports whether a query's camel-case parts are added to its
+// terms. Parsed rather than compared against "true", like STRIP_DOC_COMMENTS:
+// LEXICAL_SPLIT_IDENTIFIERS=yes would otherwise read as false and quietly
+// narrow every lexical query.
+func splitIdentifiers() (bool, error) {
+	v := config.Get("LEXICAL_SPLIT_IDENTIFIERS", "true")
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("LEXICAL_SPLIT_IDENTIFIERS must be a boolean, got %q", v)
+	}
+	return b, nil
+}
+
+// scoreFloor reads ANSWER_SCORE_FLOOR and refuses what a cosine similarity
+// cannot produce, the way chunk.Options and walk.Limits refuse their own.
+//
+// Parsed here rather than through config, because config.GetInt answers its
+// default for anything it cannot parse and a floor that silently reverts to -1
+// on a typo is a filter an operator believes is running.
+//
+// Calibrated is false whatever the value: the flag says *codetrail* measured
+// this number, and spec:315 puts that in P6. An operator's own number is still
+// not one this project has evidence for.
+func scoreFloor() (rag.Floor, error) {
+	f := rag.DefaultFloor()
+	if v := config.Get("ANSWER_SCORE_FLOOR", ""); v != "" {
+		n, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return rag.Floor{}, fmt.Errorf("ANSWER_SCORE_FLOOR must be a number, got %q", v)
+		}
+		f.Value = n
+	}
+	if err := f.Validate(); err != nil {
+		return rag.Floor{}, err
+	}
+	return f, nil
+}
+
 // newServer assembles what the binary serves: probes, router, policy, queue and
 // logger. A function so a test can drive the assembly, because the mistakes
 // here are silent: server.New's probes with no API mounted behind them answer
@@ -134,6 +247,13 @@ func main() {
 	}
 	defer st.Close()
 	log.Info().Msg("postgres ready, schema up to date")
+
+	// Nothing serves from it yet — the read endpoints are the next task — but
+	// boot depends on it now, because a gateway that starts without a working
+	// embedder can only fail one request at a time.
+	if _, err := newRetriever(ctx, log, st); err != nil {
+		log.Fatal().Err(err).Msg("bad retrieval config")
+	}
 
 	e := newServer(log, st)
 

@@ -18,6 +18,9 @@ import (
 	"github.com/mralaminahamed/codetrail/apps/gateway/internal/handler"
 	"github.com/mralaminahamed/codetrail/packages/shared/admit"
 	"github.com/mralaminahamed/codetrail/packages/shared/jobs"
+	"github.com/mralaminahamed/codetrail/packages/shared/models"
+	"github.com/mralaminahamed/codetrail/packages/shared/rag"
+	"github.com/mralaminahamed/codetrail/packages/shared/store"
 )
 
 type fakeQueue struct{}
@@ -35,6 +38,19 @@ type deadStore struct{ pool *pgxpool.Pool }
 func (deadStore) Ping(context.Context) error { return errors.New("postgres is down") }
 func (d deadStore) Pool() *pgxpool.Pool      { return d.pool }
 func (deadStore) Close()                     {}
+
+// The retrieval arms, which nothing in this file calls: the retriever is
+// constructed at boot and served from in the next task. They return the error a
+// dead store would.
+func (deadStore) VectorSearch(context.Context, string, []float32, int) ([]models.Cite, error) {
+	return nil, errors.New("postgres is down")
+}
+func (deadStore) LexicalSearch(context.Context, string, []string, int) ([]models.Cite, error) {
+	return nil, errors.New("postgres is down")
+}
+func (deadStore) SpanEmbedder(context.Context, string) (string, int, error) {
+	return "", 0, errors.New("postgres is down")
+}
 
 func serve(e *echo.Echo, method, path, body string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
@@ -168,5 +184,177 @@ func TestNewServerAssemblesWhatMainServes(t *testing.T) {
 	// And the assembled handler logs, so a 500 in production is not silent.
 	if !strings.Contains(logged.String(), out.RequestID) {
 		t.Errorf("no log line for request %s: %s", out.RequestID, logged.String())
+	}
+}
+
+// bootEnv is the configuration every boot test starts from: the fake embedder,
+// so no test depends on an Ollama being up on the machine it runs on. The
+// default provider is ollama, and a developer with one running would otherwise
+// get a different result from CI.
+func bootEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("EMBED_PROVIDER", "fake")
+}
+
+func boot(t *testing.T) (*rag.Retriever, *bytes.Buffer, error) {
+	t.Helper()
+	var logged bytes.Buffer
+	r, err := newRetriever(context.Background(), zerolog.New(&logged).Level(zerolog.InfoLevel), deadStore{})
+	return r, &logged, err
+}
+
+// An embedder of the wrong width means every query is ranked against a column
+// it cannot be compared to. The indexer refuses to boot for this; a gateway
+// that did not would answer confident nonsense on every query instead.
+func TestGatewayRefusesToBootOnAnEmbedderOfTheWrongWidth(t *testing.T) {
+	bootEnv(t)
+	t.Setenv("EMBED_DIM", "64")
+	if _, _, err := boot(t); !errors.Is(err, store.ErrDimMismatch) {
+		t.Fatalf("want ErrDimMismatch, got %v", err)
+	}
+}
+
+// Parity with the indexer, and the cost of it: with EMBED_PROVIDER=ollama and
+// nothing listening, the gateway does not start at all. The alternative — boot
+// into a mode where retrieval 503s and submission works — is a silent
+// downgrade, and there is no state in this codebase for one.
+func TestGatewayRefusesToBootWhenTheEmbedderIsUnreachable(t *testing.T) {
+	// A listener that is closed: well-formed address, nothing there.
+	gone := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	url := gone.URL
+	gone.Close()
+
+	t.Setenv("EMBED_PROVIDER", "ollama")
+	t.Setenv("OLLAMA_URL", url)
+	_, _, err := boot(t)
+	if err == nil {
+		t.Fatal("the gateway booted with no embedder behind it")
+	}
+	if !strings.Contains(err.Error(), "EMBED_MODEL=") {
+		t.Fatalf("the error does not name the knob to look at: %v", err)
+	}
+}
+
+// A typo in RETRIEVAL_MODE must not fall back to a mode the operator did not
+// ask for: the mode decides which arms run, and a service retrieving
+// differently than it was configured to is unreadable from the outside.
+func TestGatewayRefusesToBootOnAnUnknownRetrievalMode(t *testing.T) {
+	bootEnv(t)
+	t.Setenv("RETRIEVAL_MODE", "hybrid ")
+	if _, _, err := boot(t); err == nil {
+		t.Fatal("a mode with a trailing space was accepted")
+	}
+	t.Setenv("RETRIEVAL_MODE", "Hybrid")
+	if _, _, err := boot(t); err == nil {
+		t.Fatal("a mode of the wrong case was accepted")
+	}
+}
+
+// Fail closed like chunk.Options and walk.Limits. A floor outside the cosine
+// range is a misconfiguration, not a preference: 7 refuses every answer there
+// can ever be, and 0.5 spelt "0,5" would silently revert to the default and
+// leave an operator believing a filter is running.
+func TestGatewayRefusesAFloorOutsideTheCosineRange(t *testing.T) {
+	for _, v := range []string{"7", "-1.5", "NaN", "0,5", "half"} {
+		t.Run(v, func(t *testing.T) {
+			bootEnv(t)
+			t.Setenv("ANSWER_SCORE_FLOOR", v)
+			if _, _, err := boot(t); err == nil {
+				t.Fatalf("ANSWER_SCORE_FLOOR=%s was accepted", v)
+			}
+		})
+	}
+}
+
+// Fuse divides by k+rank and has no guard of its own — Task 1 left this here on
+// purpose. k=-1 makes the top hit's contribution +Inf and k<=-2 inverts the
+// ranking, and neither says anything at any point.
+func TestGatewayRefusesAFusionConstantFuseCannotSurvive(t *testing.T) {
+	bootEnv(t)
+	for _, v := range []string{"-1", "-2"} {
+		t.Setenv("RETRIEVAL_RRF_K", v)
+		if _, _, err := boot(t); err == nil {
+			t.Fatalf("RETRIEVAL_RRF_K=%s was accepted", v)
+		}
+	}
+	t.Setenv("RETRIEVAL_RRF_K", "0")
+	if _, _, err := boot(t); err != nil {
+		t.Fatalf("k=0 is reciprocal rank with no discount, not a misconfiguration: %v", err)
+	}
+	t.Setenv("RETRIEVAL_RRF_K", "60")
+	t.Setenv("RETRIEVAL_CANDIDATES", "0")
+	if _, _, err := boot(t); err == nil {
+		t.Fatal("a candidate depth of 0 was accepted; both arms would return nothing")
+	}
+}
+
+// The gauges are how an operator sees a guess as a guess, and they are read
+// from the same value the retriever runs with rather than set from a literal
+// somewhere else.
+func TestTheFloorGaugeIsSetFromTheConfiguredValue(t *testing.T) {
+	bootEnv(t)
+	t.Setenv("ANSWER_SCORE_FLOOR", "0.25")
+	r, _, err := boot(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Floor.Value != 0.25 || r.Floor.Calibrated {
+		t.Fatalf("retriever floor %+v, want 0.25 uncalibrated", r.Floor)
+	}
+	body := serve(newRouter(func() bool { return true }, &handler.Handler{}), http.MethodGet, "/metrics", "").Body.String()
+	for _, want := range []string{
+		"codetrail_score_floor 0.25",
+		// An operator's own number is still not one this project measured.
+		"codetrail_score_floor_calibrated 0",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("/metrics does not carry %q", want)
+		}
+	}
+}
+
+// The shipped defaults, all of them, in one place: hybrid because spec §8
+// defines retrieval as hybrid, k=60 from the paper, 40 candidates because that
+// is pgvector's hnsw.ef_search default, and a floor of -1 that cannot exclude
+// anything. If any of these moves, the README moved with it.
+func TestTheDefaultRetrieverIsHybridAtTheUncalibratedFloor(t *testing.T) {
+	bootEnv(t)
+	r, logged, err := boot(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Mode != rag.ModeHybrid || r.K != 60 || r.Candidates != 40 || !r.Split {
+		t.Errorf("mode=%s k=%d candidates=%d split=%v", r.Mode, r.K, r.Candidates, r.Split)
+	}
+	if r.Floor != rag.DefaultFloor() || r.Floor.Value != -1 || r.Floor.Calibrated {
+		t.Errorf("floor %+v, want -1 uncalibrated", r.Floor)
+	}
+	if r.Store == nil || r.Emb == nil {
+		t.Fatalf("retriever built without a store or an embedder: %+v", r)
+	}
+	// The boot log is one of the four places the floor has to say it is a
+	// placeholder (the payload, the gauges, this line, the README).
+	line := logged.String()
+	if !strings.Contains(line, `"score_floor":-1`) || !strings.Contains(line, `"floor_calibrated":false`) {
+		t.Errorf("the boot log does not carry the floor and its calibration: %s", line)
+	}
+	if !strings.Contains(line, "not calibrated") {
+		t.Errorf("the boot log does not say the floor is uncalibrated: %s", line)
+	}
+}
+
+// LEXICAL_SPLIT_IDENTIFIERS is what P6 sweeps to find out whether query-side
+// splitting helps, so it has to reach the retriever, and a value that is not a
+// boolean must not read as false.
+func TestSplittingIdentifiersIsAKnobThatFailsClosed(t *testing.T) {
+	bootEnv(t)
+	t.Setenv("LEXICAL_SPLIT_IDENTIFIERS", "false")
+	r, _, err := boot(t)
+	if err != nil || r.Split {
+		t.Fatalf("split=%v err=%v, want it off", r != nil && r.Split, err)
+	}
+	t.Setenv("LEXICAL_SPLIT_IDENTIFIERS", "yes please")
+	if _, _, err := boot(t); err == nil {
+		t.Fatal("a non-boolean was accepted")
 	}
 }
