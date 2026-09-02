@@ -31,13 +31,27 @@ func newEmbedder(ctx context.Context, timeout time.Duration) (embed.Embedder, er
 // first chunkable file and spending its attempts. That is the same trade
 // limitsFrom makes: failing one boot is the diagnosable version of failing
 // every repository in the queue.
+//
+// The first parse error wins over the range check below, because a value that
+// never became a number has no range to be outside of.
 func chunkOptions() (chunk.Options, error) {
 	def := chunk.Defaults()
+	var err error
+	get := func(key string, d int) int {
+		n, e := config.GetInt(key, d)
+		if e != nil && err == nil {
+			err = e
+		}
+		return n
+	}
 	opt := chunk.Options{
 		Strategy:      chunk.Strategy(config.Get("CHUNK_STRATEGY", string(def.Strategy))),
-		WindowLines:   config.GetInt("CHUNK_WINDOW_LINES", def.WindowLines),
-		WindowOverlap: config.GetInt("CHUNK_WINDOW_OVERLAP", def.WindowOverlap),
-		MaxDeclLines:  config.GetInt("CHUNK_MAX_DECL_LINES", def.MaxDeclLines),
+		WindowLines:   get("CHUNK_WINDOW_LINES", def.WindowLines),
+		WindowOverlap: get("CHUNK_WINDOW_OVERLAP", def.WindowOverlap),
+		MaxDeclLines:  get("CHUNK_MAX_DECL_LINES", def.MaxDeclLines),
+	}
+	if err != nil {
+		return chunk.Options{}, err
 	}
 	if err := opt.Validate(); err != nil {
 		return chunk.Options{}, err

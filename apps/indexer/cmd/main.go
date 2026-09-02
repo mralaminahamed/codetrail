@@ -202,15 +202,21 @@ func workerID() string {
 // one on its caps, and burn them all to terminal. Failing one boot is the
 // diagnosable version of that.
 //
+// A value that is not a number at all is config.GetInt's own refusal, which
+// takes precedence: MAX_REPO_FILES=2OOOO has no range to be outside of.
+//
 // KEEP_REPOS is here for the same reason and a worse consequence: Evict reads a
 // keep of 0 as "keep nothing" and deletes every repo, so the one knob where a
 // zero would silently destroy data is the one that must not boot with it.
 func limitsFrom() (limits, error) {
 	var err error
 	get := func(key string, def int) int {
-		n := config.GetInt(key, def)
-		if n <= 0 && err == nil {
-			err = fmt.Errorf("%s must be positive, got %d", key, n)
+		n, e := config.GetInt(key, def)
+		if e == nil && n <= 0 {
+			e = fmt.Errorf("%s must be positive, got %d", key, n)
+		}
+		if e != nil && err == nil {
+			err = e
 		}
 		return n
 	}

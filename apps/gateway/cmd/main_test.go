@@ -416,3 +416,46 @@ func TestSplittingIdentifiersIsAKnobThatFailsClosed(t *testing.T) {
 		t.Fatal("a non-boolean was accepted")
 	}
 }
+
+// Every integer knob the gateway reads, with a letter O for a zero. Before
+// this, all five booted on their defaults and logged the default back: a
+// service retrieving 40 candidates while its operator wrote 4O is the same
+// wrong-but-quiet class as a floor that reverted to -1, and the range checks
+// beside them never saw the value.
+//
+// The bad value has to be one Atoi rejects but a human reads as the number, so
+// the test covers the mistake that actually happens rather than "abc".
+func TestGatewayRefusesAnIntegerKnobThatIsNotAnInteger(t *testing.T) {
+	for _, key := range []string{
+		"RETRIEVAL_RRF_K", "RETRIEVAL_CANDIDATES", "EMBED_DIM",
+	} {
+		t.Run(key, func(t *testing.T) {
+			bootEnv(t)
+			t.Setenv(key, "4O")
+			_, _, err := boot(t)
+			if err == nil {
+				t.Fatalf("%s=4O booted", key)
+			}
+			if !strings.Contains(err.Error(), key) || !strings.Contains(err.Error(), "4O") {
+				t.Errorf("the error names neither the setting nor the value: %v", err)
+			}
+		})
+	}
+	for _, key := range []string{"ANSWER_MAX_SPANS", "ANSWER_MAX_CHARS"} {
+		t.Run(key, func(t *testing.T) {
+			t.Setenv(key, "4O")
+			_, err := answerBudget()
+			if err == nil {
+				t.Fatalf("%s=4O booted", key)
+			}
+			if !strings.Contains(err.Error(), key) || !strings.Contains(err.Error(), "4O") {
+				t.Errorf("the error names neither the setting nor the value: %v", err)
+			}
+		})
+	}
+	// And the defaults still boot: a refusal that fired on an unset knob would
+	// pass every assertion above and start nothing.
+	if b, err := answerBudget(); err != nil || b != rag.DefaultBudget() {
+		t.Fatalf("the defaults must boot: %+v, %v", b, err)
+	}
+}
