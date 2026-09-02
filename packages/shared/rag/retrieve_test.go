@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -395,25 +396,98 @@ func scrape(t *testing.T) string {
 	return string(b)
 }
 
-// A lexical-only run has no cosine similarity, and observing its NaN would
-// make the histogram's _sum NaN for the life of the process — every quantile
-// and every average over it, permanently, with no error anywhere. The floor's
-// whole calibration story reads that histogram in P6.
+// figures reads the retrieval metrics out of a scrape and parses their values,
+// so the assertions below are on the movement an operator would see.
 //
-// Latency is recorded here too, labelled by mode: it is the retriever that
-// knows what "retrieval latency" covers.
-func TestALexicalOnlyRunIsTimedAndDoesNotPoisonTheTopScoreHistogram(t *testing.T) {
-	r, _, _ := retriever(t, ModeLexical)
-	search(t, r, 10)
-
-	body := scrape(t)
-	for _, line := range strings.Split(body, "\n") {
-		if strings.HasPrefix(line, "codetrail_retrieval_top_score_sum") && strings.Contains(line, "NaN") {
-			t.Fatalf("the top-score histogram is poisoned: %s", line)
+// The movement and never the value: promauto registers every series at init, so
+// a histogram nobody observed scrapes as _sum 0 / _count 0 — indistinguishable
+// from one whose observations happen to sum to zero, and equally free of NaN.
+// A deleted observation is only visible as a delta that did not happen.
+func figures(t *testing.T) map[string]float64 {
+	t.Helper()
+	out := map[string]float64{}
+	for _, line := range strings.Split(scrape(t), "\n") {
+		if !strings.HasPrefix(line, "codetrail_retrieval_") {
+			continue
 		}
+		name, value, ok := strings.Cut(line, " ")
+		if !ok {
+			continue
+		}
+		v, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			t.Fatalf("unparseable metric line %q", line)
+		}
+		out[name] = v
 	}
-	const timed = `codetrail_retrieval_seconds_count{mode="lexical"} 0`
-	if strings.Contains(body, timed) {
-		t.Fatalf("retrieval was not timed under its own mode: %s", timed)
+	if len(out) == 0 {
+		t.Fatal("no retrieval metrics are registered; the assertions here would prove nothing")
+	}
+	return out
+}
+
+const (
+	topScoreSum   = "codetrail_retrieval_top_score_sum"
+	topScoreCount = "codetrail_retrieval_top_score_count"
+)
+
+// The instrument the floor is calibrated from in P6, pinned to an observation
+// rather than to the absence of one. This is the histogram that carries the
+// argument for shipping an uncalibrated floor — that P3 ships the mechanism and
+// the instrument — so the observation must not be deletable with the suite
+// green: the count moves by exactly one retrieval, and the sum moves by the
+// score that retrieval reported.
+//
+// Latency is asserted the same way and for the same reason, one-sided in the
+// other direction: it is the retriever that knows what "retrieval latency"
+// covers, and it is labelled by the mode that ran.
+func TestTheTopScoreHistogramObservesTheScoreThatWasRetrieved(t *testing.T) {
+	r, _, _ := retriever(t, ModeHybrid)
+	before := figures(t)
+	got := search(t, r, 10)
+	after := figures(t)
+
+	// Restated where the delta is read: the sum below means nothing unless the
+	// number the retrieval reported is known here.
+	if got.TopScore != 0.75 {
+		t.Fatalf("fixture: the vector arm's best is %v, want 0.75", got.TopScore)
+	}
+	if n := after[topScoreCount] - before[topScoreCount]; n != 1 {
+		t.Fatalf("the top-score histogram took %v observations for one retrieval, want 1", n)
+	}
+	// The score itself, not merely that something was observed: a histogram
+	// handed the fused score, or a constant, moves the count identically.
+	if sum := after[topScoreSum] - before[topScoreSum]; math.Abs(sum-got.TopScore) > 1e-9 {
+		t.Fatalf("the histogram's sum moved by %v for a retrieval that scored %v", sum, got.TopScore)
+	}
+	const timed = `codetrail_retrieval_seconds_count{mode="hybrid"}`
+	if n := after[timed] - before[timed]; n != 1 {
+		t.Fatalf("one hybrid retrieval was timed %v times under its own mode", n)
+	}
+}
+
+// A lexical-only run has no cosine similarity at all, and observing its NaN
+// would make the histogram's _sum NaN for the life of the process — every
+// quantile and every average over it, permanently, with no error anywhere.
+//
+// So this run must move the latency histogram and leave the top-score one
+// exactly where it was. Both halves are deltas: "the sum is not NaN" is also
+// true of a histogram that was never observed, which is what let the
+// observation above be deleted with this suite green.
+func TestALexicalOnlyRunIsTimedAndObservesNoTopScore(t *testing.T) {
+	r, _, _ := retriever(t, ModeLexical)
+	before := figures(t)
+	search(t, r, 10)
+	after := figures(t)
+
+	if math.IsNaN(after[topScoreSum]) {
+		t.Fatalf("the top-score histogram is poisoned: %s is NaN", topScoreSum)
+	}
+	if n := after[topScoreCount] - before[topScoreCount]; n != 0 {
+		t.Fatalf("a lexical-only run put %v observations in the top-score histogram", n)
+	}
+	const timed = `codetrail_retrieval_seconds_count{mode="lexical"}`
+	if n := after[timed] - before[timed]; n != 1 {
+		t.Fatalf("one lexical retrieval was timed %v times under its own mode", n)
 	}
 }
