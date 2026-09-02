@@ -634,11 +634,77 @@ func TestAnAnsweredQuestionIsCountedAsAnswered(t *testing.T) {
 // A rejected question never reached the answerer. Counting it as an error would
 // inflate the rate spec §10 wants readable with callers' typing mistakes.
 func TestAValidationFailureIsCountedAsNoAnswerOutcomeAtAll(t *testing.T) {
-	st, rt := newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)}
-	before := counters(t)
-	do(mount(hermeticHandler(st, rt)), http.MethodPost, "/api/repos/repo-1/ask", `{"q":"???"}`)
-	if moved := movedSince(t, before); len(moved) != 0 {
-		t.Errorf("a 400 moved %v", moved)
+	for _, req := range []string{`{"q":"???"}`, `{"q":"sampler","mode":"vector"}`} {
+		st, rt := newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)}
+		before := counters(t)
+		rec := do(mount(hermeticHandler(st, rt)), http.MethodPost, "/api/repos/repo-1/ask", req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: want 400, got %d: %s", req, rec.Code, rec.Body)
+		}
+		if moved := movedSince(t, before); len(moved) != 0 {
+			t.Errorf("%s: a 400 moved %v", req, moved)
+		}
+	}
+}
+
+// mode is a response field, not a request one. It was accepted and dropped —
+// echo's binder ignores a key no struct field claims — so a caller could ask
+// for vector, be answered 200, and read "hybrid" back as if it were an echo.
+//
+// Refused rather than honoured because Search takes no mode argument: a mode
+// this endpoint accepted would still retrieve in the process's own. The
+// configured mode is refused too, since a caller cannot know which one that is.
+func TestAModeInTheRequestBodyIsRefusedRatherThanIgnored(t *testing.T) {
+	const detail = "mode is not a request field: it is configured per process and reported in the response"
+	for _, tc := range []struct{ name, mode string }{
+		{"the mode this server runs", "lexical"},
+		{"another mode it could have run", "vector"},
+		{"not a mode at all", "bogus"},
+		{"empty", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, err := json.Marshal(map[string]string{"q": "sampler", "mode": tc.mode})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, route := range []string{"search", "ask"} {
+				st := newStore()
+				rt := &fakeRetriever{res: result(rag.ModeLexical, 0.83, true)}
+				rec := do(mount(hermeticHandler(st, rt)), http.MethodPost,
+					"/api/repos/repo-1/"+route, string(b))
+				if rec.Code != http.StatusBadRequest {
+					t.Fatalf("%s: want 400, got %d: %s", route, rec.Code, rec.Body)
+				}
+				// The exact detail, not just the status: a 400 that named the
+				// wrong rule would read as a pass, and the whole complaint about
+				// this field is that it was answered without being read.
+				out := body(t, rec)
+				if out["rule"] != "form" || out["error"] != detail {
+					t.Errorf("%s: body %s does not name the rule that fired", route, rec.Body)
+				}
+				if len(rt.calls) != 0 {
+					t.Errorf("%s: a refused request retrieved anyway: %v", route, rt.calls)
+				}
+			}
+		})
+	}
+}
+
+// The other half of the same claim: without the field the request is served,
+// and the mode reported back is the one this server retrieves in — never the
+// one that was asked for, which is what makes refusing the field honest.
+func TestTheModeAResponseReportsIsTheOneTheServerRetrievedIn(t *testing.T) {
+	for _, route := range []string{"search", "ask"} {
+		st := newStore()
+		rt := &fakeRetriever{res: result(rag.ModeLexical, 0.83, true)}
+		rec := do(mount(hermeticHandler(st, rt)), http.MethodPost,
+			"/api/repos/repo-1/"+route, `{"q":"sampler"}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: want 200, got %d: %s", route, rec.Code, rec.Body)
+		}
+		if out := body(t, rec); out["mode"] != string(rag.ModeLexical) {
+			t.Errorf("%s: the response says mode %v, want %q", route, out["mode"], rag.ModeLexical)
+		}
 	}
 }
 

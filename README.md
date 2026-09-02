@@ -327,6 +327,13 @@ on purpose — a question in a query string is logged by every proxy, load balan
 between the caller and the process, and it is the one string here that must not be. It is not in
 any of codetrail's own log lines either.
 
+**`mode` is a response field, not a request one.** A body that names one is a `400` naming the rule
+— including when it names the mode this process happens to run, which is not something a caller can
+know. Retrieval mode is set once by `RETRIEVAL_MODE` and `Retriever.Search` takes no argument for
+it, so a `mode` the endpoint accepted would still retrieve in the process's own. Until it was
+refused, echo's binder dropped the unknown key and the response's own `mode` read as an echo of what
+had been asked for: `{"mode":"vector"}` was answered `200` with `"mode":"hybrid"`.
+
 The knobs: `RETRIEVAL_MODE`, `RETRIEVAL_RRF_K`, `RETRIEVAL_CANDIDATES`,
 `LEXICAL_SPLIT_IDENTIFIERS`, `ANSWER_SCORE_FLOOR`, `ANSWER_MAX_SPANS`, `ANSWER_MAX_CHARS`, and —
 new to the gateway, because it has to embed the question — `EMBED_PROVIDER`, `EMBED_MODEL`,
