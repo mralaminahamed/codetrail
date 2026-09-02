@@ -1,0 +1,3 @@
+module example.test/newgo
+
+go 1.99.0

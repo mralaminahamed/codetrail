@@ -1,0 +1,5 @@
+module example.test/absent
+
+go 1.27
+
+require example.com/nope v1.0.0
