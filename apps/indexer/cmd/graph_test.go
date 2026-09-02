@@ -337,6 +337,13 @@ func TestAResolverFailureLeavesEveryEdgeSyntacticAndTheJobIntact(t *testing.T) {
 			wantMoved := map[string]float64{
 				`codetrail_graph_edges_total{provenance="syntactic"}`: 4,
 				`codetrail_typecheck_total{reason="` + tc.want + `"}`: 1,
+				// The stage times what it ran. With the knob off it ran
+				// nothing, so there is nothing to time — and that absence is
+				// asserted rather than left as a gap in the vector.
+				"codetrail_typecheck_seconds_count": 1,
+			}
+			if tc.want == symbols.ReasonDisabled {
+				delete(wantMoved, "codetrail_typecheck_seconds_count")
 			}
 			if !maps.Equal(moved, wantMoved) {
 				t.Errorf("counters moved %v, want %v", moved, wantMoved)
@@ -575,6 +582,7 @@ func TestTheGraphCountersMoveExactlyOnce(t *testing.T) {
 		`codetrail_graph_edges_total{provenance="resolved"}`:  2,
 		`codetrail_graph_edges_total{provenance="syntactic"}`: 2,
 		`codetrail_typecheck_total{reason="ok"}`:              1,
+		"codetrail_typecheck_seconds_count":                   1,
 	}
 	if moved := movedGraphCounters(t, before); !maps.Equal(moved, want) {
 		t.Fatalf("counters moved %v, want %v", moved, want)
@@ -736,6 +744,17 @@ func graphCounters(t *testing.T) map[string]float64 {
 	}
 	out := map[string]float64{}
 	for _, line := range strings.Split(string(raw), "\n") {
+		// The histogram's own count is here because a stage that stopped
+		// timing itself is otherwise a side effect nothing reads back.
+		if strings.HasPrefix(line, "codetrail_typecheck_seconds_count ") {
+			series, value, _ := strings.Cut(line, " ")
+			v, err := strconv.ParseFloat(value, 64)
+			if err != nil {
+				t.Fatalf("metric %q: %v", line, err)
+			}
+			out[series] = v
+			continue
+		}
 		if !strings.HasPrefix(line, "codetrail_graph_edges_total{") &&
 			!strings.HasPrefix(line, "codetrail_typecheck_total{") {
 			continue
@@ -752,8 +771,8 @@ func graphCounters(t *testing.T) map[string]float64 {
 	}
 	// Every series is initialised at startup, so an empty read means the
 	// counters are not registered and every assertion below would be vacuous.
-	if len(out) != len(metrics.GraphProvenances)+len(metrics.TypecheckReasons) {
-		t.Fatalf("read %d graph series, want %d", len(out), len(metrics.GraphProvenances)+len(metrics.TypecheckReasons))
+	if want := len(metrics.GraphProvenances) + len(metrics.TypecheckReasons) + 1; len(out) != want {
+		t.Fatalf("read %d graph series, want %d", len(out), want)
 	}
 	return out
 }
