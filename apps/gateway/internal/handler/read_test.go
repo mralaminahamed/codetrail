@@ -99,6 +99,11 @@ type fakeStore struct {
 	embedderErr error
 
 	touched []string
+	// How many span reads the handler actually made. The citation memo cannot
+	// change a response — the same span renders the same citation — so its only
+	// observable effect is this number, and without it the memo is a line any
+	// mutation may delete for free.
+	spanReads int
 	// The limit the last listing asked for. Recorded because the default is a
 	// number nothing else can see: the fake would answer its one row whatever
 	// it was handed.
@@ -179,6 +184,7 @@ func (f *fakeStore) RepoStats(context.Context, string) (store.Stats, error) {
 }
 
 func (f *fakeStore) GetSpan(_ context.Context, _, spanID string) (models.Span, error) {
+	f.spanReads++
 	if f.spanErr != nil {
 		return models.Span{}, f.spanErr
 	}
