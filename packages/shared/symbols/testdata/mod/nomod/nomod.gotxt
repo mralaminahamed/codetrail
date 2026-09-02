@@ -1,0 +1,5 @@
+package nomod
+
+func Helper() int { return 1 }
+
+func Use() int { return Helper() }

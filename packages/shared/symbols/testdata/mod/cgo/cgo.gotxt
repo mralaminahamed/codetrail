@@ -1,0 +1,11 @@
+package cgofix
+
+/*
+#cgo LDFLAGS: -lcodetrail_must_never_link
+static int helper(void) { return 1; }
+*/
+import "C"
+
+func Helper() int { return int(C.helper()) }
+
+func Use() int { return Helper() }

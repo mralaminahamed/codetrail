@@ -1,0 +1,5 @@
+package thirdparty
+
+import "golang.org/x/mod/semver"
+
+func Newer(a, b string) bool { return semver.Compare(a, b) > 0 }
