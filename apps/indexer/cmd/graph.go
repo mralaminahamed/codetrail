@@ -68,6 +68,12 @@ func (ix *indexer) runGraph(jobCtx, writeCtx context.Context, l zerolog.Logger, 
 	ev.Int("symbols", len(g.symbols)).Int("edges", len(g.edges)).
 		Int("resolved", g.resolved).Int("syntactic", g.syntactic).
 		Int("external", g.stats.External).Int("unnameable", g.unnameable).
+		// The per-package split, which reason cannot carry: load_error is one
+		// word for "none of them loaded" and for "one of nine did not", and
+		// those are different repositories to an operator deciding whether to
+		// open the proxy.
+		Int("packages", g.stats.Packages).Int("loaded", g.stats.Loaded).
+		Int("failed", g.stats.Failed).
 		Str("reason", g.stats.Reason).Msg("symbol graph")
 
 	for _, e := range g.edges {

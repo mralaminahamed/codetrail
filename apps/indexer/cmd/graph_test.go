@@ -563,6 +563,7 @@ func TestTheJobLogNamesWhatTheGraphStageProducedAndWhyItStopped(t *testing.T) {
 		"level": "info", "message": "symbol graph",
 		"symbols": 4.0, "edges": 5.0, "resolved": 2.0, "syntactic": 3.0,
 		"external": 1.0, "unnameable": 1.0, "reason": "ok",
+		"packages": 2.0, "loaded": 2.0, "failed": 0.0,
 	}
 	for k, v := range want {
 		if got, ok := line[k]; !ok {

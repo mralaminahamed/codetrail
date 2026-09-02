@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="787" height="822" viewBox="0 0 787 822" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="14">
+<rect width="787" height="822" rx="12" fill="#0f1319"/>
+<path d="M0 12 a12 12 0 0 1 12 -12 h763 a12 12 0 0 1 12 12 v28 h-787 z" fill="#1b212b"/>
+<circle cx="24" cy="20" r="6" fill="#ff5f57"/>
+<circle cx="44" cy="20" r="6" fill="#febc2e"/>
+<circle cx="64" cy="20" r="6" fill="#28c840"/>
+<text x="393.5" y="25" fill="#8b949e" font-size="12" text-anchor="middle">codetrail — who calls this, and what each edge knows about its target</text>
+<text x="28.0" y="62" fill="#7ee787" xml:space="preserve">$ </text>
+<text x="44.8" y="62" fill="#c9d1d9" xml:space="preserve">curl -s &quot;$API/repos/$REPO/symbols?name=Event.Msg&quot; | jq -c &#x27;.symbols[0]&#x27;</text>
+<text x="28.0" y="88" fill="#8b949e" xml:space="preserve">{&quot;id&quot;:&quot;5550bfec578e8ee512ccaf568b912578&quot;,&quot;name&quot;:&quot;Event.Msg&quot;,&quot;pkg&quot;:&quot;zerolog&quot;,</text>
+<text x="28.0" y="114" fill="#8b949e" xml:space="preserve">&quot;kind&quot;:&quot;func&quot;,&quot;path&quot;:&quot;event.go&quot;,&quot;start_line&quot;:111,&quot;end_line&quot;:120,</text>
+<text x="28.0" y="140" fill="#8b949e" xml:space="preserve">&quot;span_id&quot;:&quot;f571b5c528f7a6a80930e988dfa0cf83&quot;}</text>
+<text x="28.0" y="192" fill="#7ee787" xml:space="preserve">$ </text>
+<text x="44.8" y="192" fill="#c9d1d9" xml:space="preserve">curl -s &quot;$API/repos/$REPO/symbols/$SYM/callers?limit=3&quot; &gt; callers.json</text>
+<text x="28.0" y="218" fill="#7ee787" xml:space="preserve">$ </text>
+<text x="44.8" y="218" fill="#c9d1d9" xml:space="preserve">jq -r &#x27;.callers[] | &quot;\(.provenance)  \(.symbol.name)  \(.call.path):\(.call.line)&quot;&#x27; \</text>
+<text x="28.0" y="244" fill="#c9d1d9" xml:space="preserve">     callers.json</text>
+<text x="28.0" y="270" fill="#e8a33f" xml:space="preserve">resolved  writeLog  internal/cbor/examples/genLog.go:43</text>
+<text x="28.0" y="296" fill="#e8a33f" xml:space="preserve">resolved  Logger.Print  log.go:457</text>
+<text x="28.0" y="322" fill="#e8a33f" xml:space="preserve">resolved  Logger.Printf  log.go:465</text>
+<text x="28.0" y="374" fill="#7ee787" xml:space="preserve">$ </text>
+<text x="44.8" y="374" fill="#c9d1d9" xml:space="preserve">jq -c &#x27;.approximate | {matched_on, count, truncated}&#x27; callers.json</text>
+<text x="28.0" y="400" fill="#8b949e" xml:space="preserve">{&quot;matched_on&quot;:&quot;name&quot;,&quot;count&quot;:3,&quot;truncated&quot;:true}</text>
+<text x="28.0" y="426" fill="#7ee787" xml:space="preserve">$ </text>
+<text x="44.8" y="426" fill="#c9d1d9" xml:space="preserve">jq -r &#x27;.approximate.callers[] | &quot;\(.provenance)  \(.symbol.name) -&gt; \(.to_name)  \</text>
+<text x="28.0" y="452" fill="#c9d1d9" xml:space="preserve">     \(.call.path):\(.call.line)&quot;&#x27; callers.json</text>
+<text x="28.0" y="478" fill="#8b949e" xml:space="preserve">syntactic  BenchmarkLogEmpty -&gt; Msg  benchmark_test.go:20</text>
+<text x="28.0" y="504" fill="#8b949e" xml:space="preserve">syntactic  BenchmarkDisabled -&gt; Msg  benchmark_test.go:30</text>
+<text x="28.0" y="530" fill="#8b949e" xml:space="preserve">syntactic  BenchmarkInfo -&gt; Msg  benchmark_test.go:40</text>
+<text x="28.0" y="582" fill="#7ee787" xml:space="preserve">$ </text>
+<text x="44.8" y="582" fill="#c9d1d9" xml:space="preserve">git -C zerolog show dfd11cca:log.go | sed -n &#x27;457p&#x27;</text>
+<text x="28.0" y="608" fill="#8b949e" xml:space="preserve">    e.CallerSkipFrame(1).Msg(fmt.Sprint(v...))</text>
+<text x="28.0" y="660" fill="#7ee787" xml:space="preserve">$ </text>
+<text x="44.8" y="660" fill="#c9d1d9" xml:space="preserve">jq -r &#x27;.callers[1].citation.digest&#x27; callers.json</text>
+<text x="28.0" y="686" fill="#e8a33f" xml:space="preserve">4ecbf7eac36a26f16522d9d5ee604e64315b6f8ed83eee9b40921f1af21edd3d</text>
+<text x="28.0" y="738" fill="#7ee787" xml:space="preserve">$ </text>
+<text x="44.8" y="738" fill="#c9d1d9" xml:space="preserve">git -C zerolog show dfd11cca:log.go | sed -n &#x27;453,459p&#x27; \</text>
+<text x="28.0" y="764" fill="#c9d1d9" xml:space="preserve">     | head -c -1 | sha256sum</text>
+<text x="28.0" y="790" fill="#e8a33f" xml:space="preserve">4ecbf7eac36a26f16522d9d5ee604e64315b6f8ed83eee9b40921f1af21edd3d  -</text>
+</svg>
