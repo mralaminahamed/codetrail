@@ -23,6 +23,7 @@ import (
 	"github.com/mralaminahamed/codetrail/packages/shared/jobs"
 	"github.com/mralaminahamed/codetrail/packages/shared/models"
 	"github.com/mralaminahamed/codetrail/packages/shared/store"
+	"github.com/mralaminahamed/codetrail/packages/shared/symbols"
 	"github.com/mralaminahamed/codetrail/packages/shared/testdb"
 )
 
@@ -174,12 +175,18 @@ type liveJob struct {
 	// prepare adds to the checkout after the fixture is copied, for the things
 	// a committed tree cannot hold portably.
 	prepare func(t *testing.T, dir string)
+	// tweak adjusts the worker itself, for the properties that are about when
+	// a stage runs rather than about what is on disk.
+	tweak func(ix *indexer)
 }
 
 type liveRun struct {
-	repoID string
-	files  []fileRow
-	spans  []spanRow
+	repoID  string
+	files   []fileRow
+	spans   []spanRow
+	symbols []symbolRow
+	edges   []edgeRow
+	log     string
 }
 
 // indexLive runs one whole job against Postgres: the real walk, the real
@@ -190,7 +197,7 @@ func indexLive(t *testing.T, st *store.Store, j liveJob) liveRun {
 	ctx := context.Background()
 
 	q := &fakeQueue{}
-	ix, _ := testIndexer(t, q)
+	ix, logged := testIndexer(t, q)
 	// The fixture is a repository, not a snippet: big.go alone is 2,466 bytes,
 	// past testIndexer's 1KB cap, and a file the walk skips for size is a
 	// missing span rather than a failure that says so.
@@ -227,6 +234,15 @@ func indexLive(t *testing.T, st *store.Store, j liveJob) liveRun {
 	}
 	ix.walk = walk.Files
 	ix.put, ix.putSpans, ix.evict = st.PutRepo, st.PutSpans, st.Evict
+	// The real type-checker on the real checkout, and the real write. The
+	// fixture repository is a module whose packages import only the standard
+	// library, so it type-checks with GOPROXY=off and nothing here reaches the
+	// network.
+	ix.graph, ix.putGraph = symbols.Resolve, st.PutGraph
+	ix.lim.goBin, ix.lim.goProxy = goToolchain(), symbols.ProxyOff
+	if j.tweak != nil {
+		j.tweak(ix)
+	}
 
 	remote := "https://github.com/codetrail-live/" + j.name
 	ix.runJob(ctx, jobs.Job{
@@ -244,7 +260,96 @@ func indexLive(t *testing.T, st *store.Store, j liveJob) liveRun {
 	if err := st.Pool().QueryRow(ctx, `SELECT id FROM repos WHERE remote = $1`, remote).Scan(&repoID); err != nil {
 		t.Fatalf("no repo row for %s: %v", remote, err)
 	}
-	return liveRun{repoID: repoID, files: readFiles(t, st, repoID), spans: readSpans(t, st, repoID)}
+	return liveRun{
+		repoID: repoID, files: readFiles(t, st, repoID), spans: readSpans(t, st, repoID),
+		symbols: readSymbols(t, st, repoID), edges: readEdges(t, st, repoID), log: logged.String(),
+	}
+}
+
+type symbolRow struct {
+	ID, Path, Name, Pkg, SpanID string
+	Kind                        models.SpanKind
+	Start, End                  int
+}
+
+// sig is what a reviewer can check against the committed file: what the
+// definition is called, what it is, and which lines it occupies.
+func (s symbolRow) sig() string {
+	return fmt.Sprintf("%s|%s|%s|%d|%d", s.Path, s.Kind, s.Name, s.Start, s.End)
+}
+
+type edgeRow struct {
+	ID, From, To, ToName, Path, Provenance, Kind string
+	Line                                         int
+}
+
+func readSymbols(t *testing.T, st *store.Store, repoID string) []symbolRow {
+	t.Helper()
+	rows, err := st.Pool().Query(context.Background(), `
+		SELECT id, path, name, pkg, kind, start_line, end_line, coalesce(span_id, '')
+		FROM symbols WHERE repo_id = $1 ORDER BY path COLLATE "C", start_line, name`, repoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []symbolRow
+	for rows.Next() {
+		var s symbolRow
+		if err := rows.Scan(&s.ID, &s.Path, &s.Name, &s.Pkg, &s.Kind, &s.Start, &s.End, &s.SpanID); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func readEdges(t *testing.T, st *store.Store, repoID string) []edgeRow {
+	t.Helper()
+	rows, err := st.Pool().Query(context.Background(), `
+		SELECT id, from_symbol_id, coalesce(to_symbol_id, ''), to_name, kind, provenance, path, line
+		FROM edges WHERE repo_id = $1 ORDER BY path COLLATE "C", line, to_name, id`, repoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []edgeRow
+	for rows.Next() {
+		var e edgeRow
+		if err := rows.Scan(&e.ID, &e.From, &e.To, &e.ToName, &e.Kind, &e.Provenance, &e.Path, &e.Line); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// callSites spells each edge the way the fixture reads: which definition it
+// leaves, what it calls, where the call is, and how much the row knows about
+// its target.
+func (r liveRun) callSites(t *testing.T) []string {
+	t.Helper()
+	names := map[string]string{}
+	for _, s := range r.symbols {
+		names[s.ID] = s.Name
+	}
+	out := make([]string, 0, len(r.edges))
+	for _, e := range r.edges {
+		to := ""
+		if e.To != "" {
+			if to = names[e.To]; to == "" {
+				t.Errorf("edge %s points at %s, which is not a symbol of this repo", e.ID, e.To)
+			}
+		}
+		out = append(out, fmt.Sprintf("%s calls %s->%s at %s:%d (%s)",
+			names[e.From], e.ToName, to, e.Path, e.Line, e.Provenance))
+	}
+	return out
 }
 
 func readFiles(t *testing.T, st *store.Store, repoID string) []fileRow {
@@ -336,7 +441,10 @@ var wantASTSpans = []string{
 	"calc/calc.go|type|Machine|14|17",
 	"calc/calc.go|func|Machine.Push|19|23",
 	"calc/calc.go|func|Render|25|28",
+	"calc/use.go|func|Total|3|10",
 	"config.yaml|file||1|3",
+	"use.go|func|Count|5|8",
+	"use.go|func|Report|10|13",
 }
 
 // The same bytes under the baseline arm. big.go tiles from line 1 rather than
@@ -353,9 +461,11 @@ var wantWindowSpans = []string{
 	"big.go|file||181|208",
 	"calc/broken.go|file||1|4",
 	"calc/calc.go|file||1|28",
+	"calc/use.go|file||1|10",
 	"config.yaml|file||1|3",
 	"doc.go|file||1|5",
 	"tools.go|file||1|9",
+	"use.go|file||1|13",
 }
 
 // Every regular file the walk saw, span-bearing or not. go.mod and logo.png are
@@ -366,11 +476,13 @@ var wantFiles = []fileRow{
 	{Path: "big.go", Lang: "go", Lines: 208},
 	{Path: "calc/broken.go", Lang: "go", Lines: 4},
 	{Path: "calc/calc.go", Lang: "go", Lines: 28},
+	{Path: "calc/use.go", Lang: "go", Lines: 10},
 	{Path: "config.yaml", Lang: "yaml", Lines: 3},
 	{Path: "doc.go", Lang: "go", Lines: 5},
 	{Path: "go.mod", Lang: "", Lines: 3},
 	{Path: "logo.png", Lang: "", Lines: 2},
 	{Path: "tools.go", Lang: "go", Lines: 9},
+	{Path: "use.go", Lang: "go", Lines: 13},
 }
 
 // The phase's headline claim, end to end: a repository goes in and citable
@@ -712,14 +824,17 @@ func TestNoSpanHoldsALinkTargetLive(t *testing.T) {
 	}
 }
 
-// Eviction is one DELETE that cascades (spec §3), and spans are a new dependent
-// of repos.
-func TestEvictionRemovesSpansEndToEndLive(t *testing.T) {
+// Eviction is one DELETE that cascades (spec §3), and spans, symbols and edges
+// are all dependents of repos.
+func TestEvictionRemovesSpansAndTheGraphEndToEndLive(t *testing.T) {
 	ctx := context.Background()
 	st := liveStore(t)
 	run := indexLive(t, st, liveJob{name: "evict", strategy: chunk.StrategyAST})
 	if n, err := st.CountSpans(ctx, run.repoID); err != nil || n == 0 {
 		t.Fatalf("nothing to evict: %d spans, %v", n, err)
+	}
+	if syms, edges, err := st.CountGraph(ctx, run.repoID); err != nil || syms == 0 || edges == 0 {
+		t.Fatalf("no graph to evict: %d symbols, %d edges, %v", syms, edges, err)
 	}
 	if _, err := st.Evict(ctx, 0, 100); err != nil {
 		t.Fatal(err)
@@ -733,5 +848,189 @@ func TestEvictionRemovesSpansEndToEndLive(t *testing.T) {
 	}
 	if got := readFiles(t, st, run.repoID); len(got) != 0 {
 		t.Fatalf("%d file rows outlived their repo", len(got))
+	}
+	syms, edges, err := st.CountGraph(ctx, run.repoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if syms != 0 || edges != 0 {
+		t.Fatalf("%d symbols and %d edges outlived their repo", syms, edges)
+	}
+}
+
+// The graph the fixture repository owes, by hand from the committed files.
+// Counting symbols would pass against a stage that named them all "Get".
+var wantSymbols = []string{
+	"big.go|var|Table|3|208",
+	"calc/calc.go|const|Base|5|6",
+	"calc/calc.go|var|Add|8|12",
+	"calc/calc.go|type|Machine|14|17",
+	"calc/calc.go|func|Machine.Push|19|23",
+	"calc/calc.go|func|Render|25|28",
+	"calc/use.go|func|Total|3|10",
+	"use.go|func|Count|5|8",
+	"use.go|func|Report|10|13",
+}
+
+// And its call sites. calc/ does not type-check — broken.go is not parseable
+// Go — while the root package does, and both labels are here: the two calls
+// inside the failing package still resolve, because a package that fails to
+// load still resolves most of its identifiers (spec:190). fmt.Sprintf leaves
+// the repository and len is a builtin, so neither has a symbols row to point
+// at and both keep the null target that makes syntactic mean something.
+var wantCallSites = []string{
+	"Render calls Sprintf-> at calc/calc.go:27 (syntactic)",
+	"Total calls Push->Machine.Push at calc/use.go:7 (resolved)",
+	"Total calls Render->Render at calc/use.go:9 (resolved)",
+	"Count calls len-> at use.go:7 (syntactic)",
+	"Report calls Count->Count at use.go:12 (resolved)",
+	"Report calls Sprintf-> at use.go:12 (syntactic)",
+}
+
+// The phase's headline claim end to end: a repository goes in and a graph
+// comes out whose every edge says how much it knows.
+//
+// The fixture is the one that can tell a per-edge label from a per-repo one.
+// Its type-check *fails* — reason load_error, because calc/broken.go does not
+// parse — and three of its six edges are still resolved, two of them inside
+// the package that failed. A stage that stamped the job's outcome onto its
+// rows would write six syntactic edges here and look entirely healthy.
+func TestIndexingWritesAGraphForTheFixtureRepoLive(t *testing.T) {
+	st := liveStore(t)
+	run := indexLive(t, st, liveJob{name: "graph", strategy: chunk.StrategyAST})
+
+	got := make([]string, 0, len(run.symbols))
+	for _, s := range run.symbols {
+		got = append(got, s.sig())
+	}
+	if !slices.Equal(got, wantSymbols) {
+		t.Fatalf("symbols:\n got %s\nwant %s",
+			strings.Join(got, "\n      "), strings.Join(wantSymbols, "\n      "))
+	}
+	if sites := run.callSites(t); !slices.Equal(sites, wantCallSites) {
+		t.Fatalf("call sites:\n got %s\nwant %s",
+			strings.Join(sites, "\n      "), strings.Join(wantCallSites, "\n      "))
+	}
+
+	// The link is by containment, and Table is the declaration that proves it:
+	// it is longer than CHUNK_MAX_DECL_LINES, so the chunker sub-windowed it
+	// and no span carries its range.
+	spans := map[string]string{}
+	for _, sp := range run.spans {
+		spans[sp.sig()] = sp.ID
+	}
+	for _, tc := range []struct{ symbol, span string }{
+		{"big.go|var|Table|3|208", "big.go|file||3|42"},
+		{"calc/calc.go|func|Machine.Push|19|23", "calc/calc.go|func|Machine.Push|19|23"},
+	} {
+		for _, s := range run.symbols {
+			if s.sig() != tc.symbol {
+				continue
+			}
+			if want := spans[tc.span]; s.SpanID != want {
+				t.Errorf("%s links to span %q, want %s (%s)", tc.symbol, s.SpanID, tc.span, want)
+			}
+		}
+	}
+	if _, ok := spans["big.go|file||3|208"]; ok {
+		t.Fatal("a span carries Table's own range, so this fixture cannot tell containment from equality")
+	}
+
+	line := logLine(t, run.log, "symbol graph")
+	want := map[string]any{
+		"level": "warn", "symbols": 9.0, "edges": 6.0, "resolved": 3.0,
+		"syntactic": 3.0, "external": 2.0, "unnameable": 0.0, "reason": "load_error",
+	}
+	for k, v := range want {
+		if got := line[k]; got != v {
+			t.Errorf("the job log says %s=%v, want %v", k, got, v)
+		}
+	}
+}
+
+// Spec:196: a type-check that fails outright downgrades the repository's edges
+// and the job still completes.
+//
+// The failure is a go directive newer than the toolchain, which fails before
+// any network activity under GOTOOLCHAIN=local — the whole module is refused,
+// so this is the per-repository half of the claim that the test above makes
+// per package.
+func TestATypecheckFailureStillCompletesTheJobLive(t *testing.T) {
+	st := liveStore(t)
+	run := indexLive(t, st, liveJob{name: "notoolchain", strategy: chunk.StrategyAST,
+		prepare: func(t *testing.T, dir string) {
+			if err := os.WriteFile(filepath.Join(dir, "go.mod"),
+				[]byte("module example.com/fixture\n\ngo 1.99.0\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}})
+
+	if len(run.symbols) != len(wantSymbols) {
+		t.Fatalf("%d symbols, want %d: a failed type-check costs labels, not definitions",
+			len(run.symbols), len(wantSymbols))
+	}
+	for _, e := range run.edges {
+		if e.Provenance != string(models.ProvenanceSyntactic) || e.To != "" {
+			t.Errorf("edge to %s at %s:%d is %s with target %q, want syntactic and null",
+				e.ToName, e.Path, e.Line, e.Provenance, e.To)
+		}
+	}
+	if len(run.edges) != len(wantCallSites) {
+		t.Errorf("%d edges, want the same %d as a successful run", len(run.edges), len(wantCallSites))
+	}
+	if got := logLine(t, run.log, "symbol graph")["reason"]; got != symbols.ReasonLoadError {
+		t.Errorf("the job log says reason %v, want %q", got, symbols.ReasonLoadError)
+	}
+}
+
+// Spec:194: one deadline for the whole job. The type-check draws on what the
+// clone and the chunker left of it, so a job whose budget is spent by the time
+// the stage starts resolves nothing and says why.
+//
+// The control is the other half and it is in the same test: the same fixture
+// with an intact budget resolves three call sites, so the zero is evidence
+// rather than an absence. A generous deadline alone cannot tell a stage that
+// shares the budget from one that opens its own.
+func TestTheGraphStageSharesTheJobDeadlineLive(t *testing.T) {
+	st := liveStore(t)
+	spent := indexLive(t, st, liveJob{name: "deadline", strategy: chunk.StrategyAST,
+		tweak: func(ix *indexer) {
+			ix.lim.clone.Deadline = 3 * time.Second
+			write := ix.putSpans
+			// The spans land and the job's budget is gone by the time the
+			// stage after them starts. Deterministic rather than timed: the
+			// wait ends when the deadline does.
+			ix.putSpans = func(ctx context.Context, repo string, sp []store.EmbeddedSpan, model string, dim int) error {
+				if err := write(ctx, repo, sp, model, dim); err != nil {
+					return err
+				}
+				<-ctx.Done()
+				return nil
+			}
+		}})
+
+	if got := logLine(t, spent.log, "symbol graph")["reason"]; got != symbols.ReasonDeadline {
+		t.Fatalf("the job log says reason %v, want %q", got, symbols.ReasonDeadline)
+	}
+	for _, e := range spent.edges {
+		if e.Provenance != string(models.ProvenanceSyntactic) {
+			t.Errorf("edge to %s at %s:%d is %s on a budget that was already spent",
+				e.ToName, e.Path, e.Line, e.Provenance)
+		}
+	}
+	if len(spent.edges) != len(wantCallSites) || len(spent.symbols) != len(wantSymbols) {
+		t.Errorf("%d symbols and %d edges, want %d and %d: an expired budget costs labels, not rows",
+			len(spent.symbols), len(spent.edges), len(wantSymbols), len(wantCallSites))
+	}
+
+	intact := indexLive(t, st, liveJob{name: "deadline-control", strategy: chunk.StrategyAST})
+	var resolved int
+	for _, e := range intact.edges {
+		if e.Provenance == string(models.ProvenanceResolved) {
+			resolved++
+		}
+	}
+	if resolved != 3 {
+		t.Fatalf("the control resolved %d call sites, want 3: the fixture no longer resolves anything, so the run above proves nothing", resolved)
 	}
 }

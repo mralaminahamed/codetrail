@@ -154,6 +154,11 @@ func (p Policy) Validate() error {
 	return p.validateProxy()
 }
 
+// ValidateProxy is validateProxy without the rest of a Policy, so a caller
+// reading the setting from its environment can refuse it at boot rather than
+// once per job.
+func ValidateProxy(proxy string) error { return Policy{Proxy: proxy}.validateProxy() }
+
 // validateProxy refuses direct anywhere in the list. GOPROXY separates its
 // elements with , and |, and a direct element turns a stranger's require line
 // into an outbound git to a host of their choosing — which is what GOVCS also

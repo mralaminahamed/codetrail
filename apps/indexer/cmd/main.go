@@ -29,6 +29,7 @@ import (
 	"github.com/mralaminahamed/codetrail/packages/shared/logger"
 	"github.com/mralaminahamed/codetrail/packages/shared/models"
 	"github.com/mralaminahamed/codetrail/packages/shared/store"
+	"github.com/mralaminahamed/codetrail/packages/shared/symbols"
 )
 
 // queue is the slice of jobs.Queue this worker uses. An interface so the loop
@@ -57,6 +58,12 @@ type limits struct {
 	// often that is enforced; see sweepJobs.
 	jobHistory time.Duration
 	sweepEvery time.Duration
+	// typecheck is the graph stage's kill switch and goProxy the module proxy
+	// it may use; goBin is the go binary this process found at boot, empty
+	// when there is none. See logToolchain for why an empty one still boots.
+	typecheck bool
+	goBin     string
+	goProxy   string
 }
 
 // indexer is the worker: a queue, the steps of a job, and the caps.
@@ -69,6 +76,11 @@ type indexer struct {
 	walk     func(ctx context.Context, root string, lim walk.Limits) ([]walk.File, error)
 	put      func(ctx context.Context, r models.Repo, files []models.File) error
 	putSpans func(ctx context.Context, repoID string, spans []store.EmbeddedSpan, model string, dim int) error
+	// graph is the type-checker and putGraph the graph write, seams for the
+	// same reason as the rest: the labelling is testable without forking a
+	// compiler twice per assertion.
+	graph    func(ctx context.Context, p symbols.Policy) (map[symbols.Key]symbols.Target, symbols.Stats)
+	putGraph func(ctx context.Context, repoID string, syms []models.Symbol, edges []models.Edge) error
 	evict    func(ctx context.Context, keep, keepTombstones int) (int, error)
 	emb      embed.Embedder
 	// opt and strip are the chunking decisions, read once at boot rather than
@@ -128,6 +140,8 @@ func main() {
 		walk:     walk.Files,
 		put:      st.PutRepo,
 		putSpans: st.PutSpans,
+		graph:    symbols.Resolve,
+		putGraph: st.PutGraph,
 		evict:    st.Evict,
 		emb:      emb,
 		opt:      opt,
@@ -144,6 +158,7 @@ func main() {
 	ix.sweepHome()
 	defer ix.sweepHome()
 
+	ix.logToolchain()
 	log.Info().Str("worker", ix.id).Msg("indexer up")
 	ix.run(ctx)
 }
@@ -169,7 +184,7 @@ func (ix *indexer) home() string { return filepath.Join(ix.scratch, ix.id) }
 // directory from a live one's, and removing the wrong one is the collision
 // above with extra steps. A worker killed hard therefore still leaks its tree.
 func (ix *indexer) sweepHome() {
-	if err := os.RemoveAll(ix.home()); err != nil {
+	if err := removeScratch(ix.home()); err != nil {
 		ix.log.Warn().Err(err).Str("dir", ix.home()).Msg("could not clear the worker's scratch tree")
 	}
 }
@@ -221,7 +236,23 @@ func limitsFrom() (limits, error) {
 		}
 		return n
 	}
+	// The two graph knobs are read the same way and refused the same way: a
+	// value that is not a boolean, and a proxy that would fetch from a host a
+	// stranger's go.mod names, are both operator errors a job cannot fix. The
+	// go binary is not a knob at all — its absence is a downgrade, not a
+	// misconfiguration, so it is looked up and never refused.
+	typecheck, terr := typecheckEnabled()
+	if terr != nil && err == nil {
+		err = terr
+	}
+	proxy, perr := typecheckProxy()
+	if perr != nil && err == nil {
+		err = perr
+	}
 	return limits{
+		typecheck: typecheck,
+		goBin:     goToolchain(),
+		goProxy:   proxy,
 		clone: clone.Limits{
 			MaxBytes: int64(get("MAX_REPO_BYTES", 256<<20)),
 			Deadline: time.Duration(get("JOB_DEADLINE_SECONDS", 600)) * time.Second,
@@ -348,18 +379,25 @@ func (ix *indexer) runJob(ctx context.Context, job jobs.Job) {
 	}
 
 	dir := filepath.Join(ix.home(), job.ID)
+	// The go command's caches, beside the checkout rather than under it: it is
+	// this job's alone, so nothing a stranger's build wrote outlives the job
+	// and no two jobs share a cache one of them filled — but inside the
+	// checkout, `go list ./...` would walk it and a fetched module would bring
+	// a go.mod of its own into the tree being type-checked.
+	goHome := dir + ".gohome"
 	// Removed before and after, and both are load-bearing. Before: git clone
 	// refuses a non-empty destination, so a checkout left by a crash would fail
 	// every retry of this job on the leftover rather than on the repository.
 	// After: a failed job that leaves its checkout behind fills the disk one
 	// failure at a time, and clone.Run's own cleanup concedes it does not
 	// survive a descendant that outlived the process-group kill.
-	if err := os.RemoveAll(dir); err != nil {
+	if err := errors.Join(removeScratch(dir), removeScratch(goHome)); err != nil {
 		l.Error().Err(err).Msg("could not clear the scratch directory")
 		ix.fail(ctx, l, job.ID, err.Error())
 		return
 	}
-	defer os.RemoveAll(dir)
+	defer removeScratch(dir)
+	defer removeScratch(goHome)
 
 	// One deadline for the whole job (spec §6): clone, read, chunk, embed and
 	// write share it, so a slow clone cannot buy itself extra time by failing
@@ -387,7 +425,7 @@ func (ix *indexer) runJob(ctx context.Context, job jobs.Job) {
 	// a different file next week. And by remote.Key rather than the row's
 	// spelling, so two case-variant submissions are one repository.
 	repoID := store.RepoID(remote.Key, res.Commit)
-	rows, spans, err := ix.index(jobCtx, l, repoID, res.Dir, files)
+	rows, spans, parsed, err := ix.index(jobCtx, l, repoID, res.Dir, files)
 	if err != nil {
 		l.Warn().Err(err).Msg("indexing failed")
 		ix.fail(ctx, l, job.ID, err.Error())
@@ -407,12 +445,26 @@ func (ix *indexer) runJob(ctx context.Context, job jobs.Job) {
 		return
 	}
 
-	// The queue writes that close the job run on their own budget, derived from
+	// The writes that close the job out run on their own budget, derived from
 	// the process and not from jobCtx: the job's deadline is what has just
 	// expired on a job that ran out of time, and a write on it does not land —
 	// leaving the row 'leased' with no reason on it until the lease runs out.
 	done, cancelDone := context.WithTimeout(ctx, recordDeadline)
 	defer cancelDone()
+
+	// After putSpans, because a symbol's span_id references a row that has to
+	// exist and the containment link is computed against the ranges the
+	// chunker has just written. Before Complete, because the checkout goes
+	// when this function returns and the type-checker reads it.
+	if err := ix.runGraph(jobCtx, done, l, graphJob{
+		repoID: repoID, root: res.Dir, home: goHome,
+		parsed: parsed, files: rows, spans: spans,
+	}); err != nil {
+		l.Error().Err(err).Msg("writing the graph failed")
+		ix.fail(ctx, l, job.ID, err.Error())
+		return
+	}
+
 	if err := ix.q.Complete(done, job.ID, ix.id, repoID); err != nil {
 		// ErrNotLeased means this worker's lease expired and another indexer
 		// took the job. Losing that race is normal; completing someone else's
@@ -445,29 +497,31 @@ func (ix *indexer) runJob(ctx context.Context, job jobs.Job) {
 }
 
 // index reads every walked file a second time, chunks it and embeds the
-// chunks, returning the file rows and the spans ready to write.
+// chunks, returning the file rows, the spans ready to write, and what the
+// graph pass read out of the same bytes.
 //
 // The second read goes through walk.ReadRegular rather than os.ReadFile. The
 // walk counts lines and drops the bytes, so these bytes have to be read again,
 // and a plain read would follow a symlink swapped in after the walk — the hole
 // P1 closed — while every test in the walk package still passed, because they
 // test the function and not this caller.
-func (ix *indexer) index(ctx context.Context, l zerolog.Logger, repoID, root string, files []walk.File) ([]models.File, []store.EmbeddedSpan, error) {
+func (ix *indexer) index(ctx context.Context, l zerolog.Logger, repoID, root string, files []walk.File) ([]models.File, []store.EmbeddedSpan, []symbols.File, error) {
 	rows := make([]models.File, 0, len(files))
 	var spans []store.EmbeddedSpan
-	var vanished, unstrippable, tokenless int
+	var parsed []symbols.File
+	var vanished, unstrippable, tokenless, unparsed int
 	for _, f := range files {
 		// The job's deadline reaches the read stage here. MAX_FILE_BYTES bounds
 		// one read and MAX_REPO_FILES bounds how many there are, but neither
 		// bounds how long they take, and the walk's own check is behind us.
 		if err := ctx.Err(); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		row := models.File{ID: store.FileID(repoID, f.Path), RepoID: repoID, Path: f.Path, Lang: f.Lang, Lines: f.Lines}
 		body, _, err := walk.ReadRegular(filepath.Join(root, filepath.FromSlash(f.Path)), ix.lim.walk.MaxFileBytes)
 		if err != nil {
 			if !errors.Is(err, walk.ErrSkipped) {
-				return nil, nil, fmt.Errorf("reading %s: %w", f.Path, err)
+				return nil, nil, nil, fmt.Errorf("reading %s: %w", f.Path, err)
 			}
 			// Between the walk and now the entry stopped being an indexable
 			// regular file — swapped for a link, or grown past the cap. The row
@@ -481,6 +535,26 @@ func (ix *indexer) index(ctx context.Context, l zerolog.Logger, repoID, root str
 		rows = append(rows, row)
 		if !indexable(f, body) {
 			continue
+		}
+		// The graph pass parses the raw body, and never the stripped src
+		// below. StripDocs keeps every line number and removes the prose
+		// bytes, so the same call has different offsets in the two streams —
+		// while go/packages keys its resolutions against the file on disk.
+		// Stripped bytes here would make every lookup miss, with no error
+		// anywhere and a resolution rate of zero that reads as a repository
+		// with no in-repo calls. Pinned by
+		// TestTheGraphPassParsesTheRawBodyAndNotTheStrippedSource, which
+		// refuses to pass if stripping ever stops moving offsets.
+		if f.Lang == "go" {
+			pf, perr := symbols.Parse(f.Path, body)
+			if perr != nil {
+				// Same trade the chunker makes: a file that does not parse is
+				// normal in a stranger's repository, and it costs its own
+				// definitions rather than the job.
+				unparsed++
+			} else {
+				parsed = append(parsed, pf)
+			}
 		}
 		src := body
 		if ix.strip {
@@ -500,7 +574,7 @@ func (ix *indexer) index(ctx context.Context, l zerolog.Logger, repoID, root str
 			// Chunks errors only on an invalid Options, which chunkOptions
 			// refused at boot. Returned rather than ignored: it would mean the
 			// options changed under a running worker.
-			return nil, nil, fmt.Errorf("chunking %s: %w", f.Path, cerr)
+			return nil, nil, nil, fmt.Errorf("chunking %s: %w", f.Path, cerr)
 		}
 		tokenless += blank
 		for _, c := range cs {
@@ -516,14 +590,15 @@ func (ix *indexer) index(ctx context.Context, l zerolog.Logger, repoID, root str
 	// otherwise write a line per file into a log nobody can then read. Counted
 	// rather than dropped quietly — tokenless in particular is how a corpus
 	// shrinks without anyone noticing, since the job still succeeds.
-	if vanished > 0 || unstrippable > 0 || tokenless > 0 {
-		l.Warn().Int("vanished", vanished).Int("unstrippable", unstrippable).Int("tokenless", tokenless).
+	if vanished > 0 || unstrippable > 0 || tokenless > 0 || unparsed > 0 {
+		l.Warn().Int("vanished", vanished).Int("unstrippable", unstrippable).
+			Int("tokenless", tokenless).Int("unparsed", unparsed).
 			Msg("some of this repository produced no spans")
 	}
 	if err := ix.embedAll(ctx, spans); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return rows, spans, nil
+	return rows, spans, parsed, nil
 }
 
 // embedAll fills in each span's vector, EMBED_BATCH texts per request.
