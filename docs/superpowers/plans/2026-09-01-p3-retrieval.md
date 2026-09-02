@@ -1338,9 +1338,9 @@ hash(key, commit) and only the indexer ever saw the commit."
   - `type Searcher interface { VectorSearch(...); LexicalSearch(...); SpanEmbedder(...) }`
   - `type Retriever struct { Store Searcher; Emb embed.Embedder; Mode Mode; K, Candidates int; Split bool; Floor Floor }`
   - `func (r *Retriever) Search(ctx context.Context, repoID, q string, limit int) (Result, error)`
-  - `type Result struct { Hits []Fused; Spans map[string]models.Cite; TopScore float64; VectorRan bool; Mode Mode }`
+  - `type Result struct { Hits []Fused; Spans map[string]models.Span; TopScore float64; VectorRan bool; Mode Mode }` — **`models.Span`, not `models.Cite`**: a Cite carries whichever arm's score was on the row, and a reader could not tell a cosine similarity from a `ts_rank_cd`. Every score that means something is on the `Fused` hit, which says which arm it came from, and `rag.NewCitation` takes a `models.Span` anyway.
   - `var ErrModelMismatch = errors.New("rag: repo was indexed by another embedder")`
-  - `func embed.FromEnv(ctx context.Context, defaultDim int, timeout time.Duration) (Embedder, error)`
+  - `func embed.FromEnv(ctx context.Context, schemaDim int, checkDim func(int) error, timeout time.Duration) (Embedder, error)` — **four arguments, not three.** With the width read inside `FromEnv` and `store.CheckDim` run by the caller afterwards, a wrong `EMBED_DIM` under `EMBED_PROVIDER=ollama` spends a probe first and the message then blames `EMBED_MODEL` for the answer's width. Passing the check in keeps it before the round trip, keeps `store` (and pgx) out of `embed`, and keeps the indexer's existing kill — `errors.Is(err, store.ErrDimMismatch)` — valid.
   - metrics: `ObserveRetrieval(mode string, d time.Duration)`, `ObserveTopScore(float64)`, `CountAnswer(outcome string)`, `CountRefusal(reason string)`, `SetFloor(value float64, calibrated bool)`
 
 **Decisions, with their reasoning:**
@@ -1348,12 +1348,12 @@ hash(key, commit) and only the indexer ever saw the commit."
 - **The gateway needs an embedder, and that is new.** Retrieval embeds the *query*, so `EMBED_PROVIDER`, `EMBED_MODEL`, `EMBED_DIM` and `OLLAMA_URL` become gateway configuration. `newEmbedder` currently lives in `apps/indexer/cmd`, package `main`, and cannot be imported; it moves to `embed.FromEnv` so both binaries validate the same knobs the same way. `FromEnv` takes the width as an argument rather than importing `store`, so `embed` does not acquire a dependency on pgx; the caller still runs `store.CheckDim`.
 - **The gateway refuses to boot on a bad embedder, exactly as the indexer does.** The cost is real and stated: with `EMBED_PROVIDER=ollama` and Ollama down, submission and job polling go down with retrieval. Parity is chosen over a partial-service state machine because the alternative — booting into a degraded mode — is the "silent downgrade" §8 calls the failure that costs a week, and there are no states in this codebase for it yet. Listed in Open Questions with the alternative.
 - **The model guard is an error, not a refusal.** A repo indexed by another embedder is a *misconfiguration*: the corpus and the query are in different vector spaces, and every score is meaningless rather than low. Refusing would file it under "we had nothing to say", which is exactly the confusion §10 forbids in the other direction.
-- **Candidate depth is per arm and separate from the returned limit.** RRF needs depth to have anything to fuse: fusing two lists of 10 is mostly an intersection test. `RETRIEVAL_CANDIDATES` defaults to **40**, which is also pgvector's default `hnsw.ef_search` — asking the ANN index for more rows than `ef_search` degrades recall silently. **Verify `SHOW hnsw.ef_search` against the pinned image**; if the default differs, either match it or `SET LOCAL hnsw.ef_search` in the same transaction, and record which.
+- **Candidate depth is per arm and separate from the returned limit.** RRF needs depth to have anything to fuse: fusing two lists of 10 is mostly an intersection test. `RETRIEVAL_CANDIDATES` defaults to **40**, which is also pgvector's default `hnsw.ef_search` — asking the ANN index for more rows than `ef_search` degrades recall silently. **Verified against the pinned image** (pgvector 0.8.6 on Postgres 17): `SELECT boot_val FROM pg_settings WHERE name = 'hnsw.ef_search'` is **40**, so the default matches and no `SET LOCAL` is needed. Two notes from the same reading: the GUC is not registered until the extension's module is loaded into the session, so `SHOW hnsw.ef_search` on a fresh connection answers `unrecognized configuration parameter` until something touches a vector; and `hnsw.iterative_scan` is `off` by default, so nothing compensates for asking beyond `ef_search`.
 - **Timing is measured in the retriever, outcome is counted in the handler.** The retriever owns the two arms and is the only thing that knows what "retrieval latency" covers; the handler owns the response and is the only thing that knows whether the request ended as an answer, a refusal or an error. Splitting them is what stops a single call site double-counting.
 - **`codetrail_retrieval_top_score` is a histogram over `[0,1]`, and it is P3's contribution to P6.** It is the production instrument, not the calibration: §9 calibrates the floor from *the eval's* distribution over a generated golden set, where a hit is labelled correct. A Prometheus histogram has no labels for correctness and cannot distinguish a confident wrong answer from a confident right one. Say that in the metric's `Help` string, so nobody calibrates from Grafana.
 - **Every metric label is a closed set** (`metrics` package doc): `mode` ∈ 3, `outcome` ∈ 3, `reason` ∈ 3. No repo id, no path, no question.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `retrieve_test.go` is hermetic, against a fake `Searcher` and `embed.Fake`. The fake searcher is what makes arm behaviour controllable — an end-to-end test cannot separate the arms (rule 5).
 
@@ -1393,7 +1393,7 @@ func TestTheFloorGaugeIsSetFromTheConfiguredValue(t *testing.T)
 func TestTheDefaultRetrieverIsHybridAtTheUncalibratedFloor(t *testing.T)
 ```
 
-- [ ] **Step 2: Implement**
+- [x] **Step 2: Implement**
 
 `Search`: validate `limit`; `SpanEmbedder(repoID)` and compare against `r.Emb.Model()`; embed the query once (skipped entirely in lexical mode — an unnecessary model call on every lexical query is the sort of thing that only shows up in a bill); run the arms; `Fuse(r.K, vec, lex)`; trim to `limit`; record `TopScore` from the vector arm's first hit (`NaN` when it did not run).
 
@@ -1412,59 +1412,162 @@ topScore = promauto.NewHistogram(prometheus.HistogramOpts{
 })
 ```
 
-- [ ] **Step 3: Commit, then prove the tests discriminate**
+- [x] **Step 3: Commit, then prove the tests discriminate**
 
-**M1 — `Mode` ignored: always run both arms.**
+**M1 — `Mode` ignored: always run both arms** (both arm guards replaced by `true`).
 - *Why the code exists:* the mode is the switch that makes spec:316's experiment runnable without a code change.
 - *Fixture that separates mutant from original:* the call-recording fake `Searcher`. **A fixture that asserts on results cannot** — under `embed.Fake` both arms return nearly the same spans, so "the results look right" is true for every mode.
 - *Must fail:* `TestModeVectorDoesNotRunTheLexicalArm`
-- *Expected (verify and correct):* `lexical arm was queried in vector mode`
+- *Observed:* killed. `retrieve_test.go:137: lexical arm was queried in vector mode: [{repoID:repo-1 limit:40 q:[] terms:[parseconfig parse config handler]}]`, and a second kill `retrieve_test.go:155: vector arm was queried in lexical mode`. Predicted as `lexical arm was queried in vector mode` — correct, and the recorded call is printed with it, which is what says *what* was asked for.
+- *Compiles and vets:* yes; `if true` is a condition change, not a build break.
 
-**M2 — embed the query even in lexical mode.**
+**M2 — embed the query even in lexical mode** (`_, _ = r.Emb.Embed(ctx, []string{q})` before the arms).
 - *Why the code exists:* a model call per query that nothing reads.
 - *Fixture that separates mutant from original:* a counting `Embedder` wrapper. The results are identical either way, so nothing else can see it.
 - *Must fail:* `TestModeLexicalDoesNotRunTheVectorArmOrEmbedTheQuery`
-- *Expected (verify and correct):* `embedder called 1 time in lexical mode`
+- *Observed:* killed. `retrieve_test.go:158: embedder called 1 times in lexical mode`, plus an unpredicted second kill `retrieve_test.go:180: the query was embedded 2 times, want once` — the hybrid test counts the call as well as the lexical one, so "embedded once" is pinned from both sides.
+- *Compiles and vets:* yes; a blank assignment is a use.
 
 **M3 — `Candidates` replaced by `limit` in both arm calls.**
 - *Why the code exists:* fusion over two short lists degenerates into an intersection test.
-- *Fixture that separates mutant from original:* the fake records the limit it was asked for; and a second assertion that a span ranked 30th by the vector arm and 1st by the lexical arm survives into a top-10 fused result. With `limit=10` depth, that span is never seen.
+- *Fixture that separates mutant from original:* the fake records the limit it was asked for **and truncates to it, as a real arm does** — without the truncation, asking for the wrong depth changes nothing observable.
 - *Must fail:* `TestArmsAreQueriedAtCandidateDepthAndTrimmedAfterFusion`
-- *Expected (verify and correct):* `vector arm asked for 10 candidates, want 40`
+- *Observed:* killed. `retrieve_test.go:292: vector arm asked for 10 candidates and lexical for 10, want 40`. Predicted as `vector arm asked for 10 candidates, want 40` — corrected: the message names both arms.
+- *Compiles and vets:* yes.
 
-**M4 — the model guard deleted.**
+**M3b — trim each arm to `limit` before fusing instead of after** (added, because M3 dies on the depth assertion and leaves the *consequence* of depth unproven).
+- *Why the code exists:* the span the vector arm ranks 30th and the lexical arm 1st is the case fusion exists for.
+- *Fixture that separates mutant from original:* the same 30-span vector arm; `deep` is 30th there and 1st lexically.
+- *Must fail:* `TestArmsAreQueriedAtCandidateDepthAndTrimmedAfterFusion`
+- *Observed:* killed. `retrieve_test.go:296: first hit is "deep" at vector rank 0, want deep at 30`. **Worth recording:** `deep` is *still first* under the mutant, on its lexical rank alone — a test asserting only "deep comes back first" survives this. The rank assertion is what kills it.
+- *Compiles and vets:* yes.
+
+**M4 — the model guard deleted** (`_, _ = model, dim` in its place, or the two locals are unused and it is a build break).
 - *Why the code exists:* a query and a corpus in different vector spaces produce confident nonsense.
 - *Fixture that separates mutant from original:* the fake `SpanEmbedder` returning `"some-other-model"`. No real corpus in the suite has one.
 - *Must fail:* `TestARepoIndexedByAnotherModelIsAnError`
-- *Expected (verify and correct):* `got 3 hits and nil error, want ErrModelMismatch`
+- *Observed:* killed. `retrieve_test.go:265: got 5 hits and error <nil>, want ErrModelMismatch`. Predicted `got 3 hits and nil error` — the count is 5, the fixture's fused set.
+- *Compiles and vets:* yes, with the blank assignment. Without it the mutation is P1's "only breaks the build" mistake in a new spelling.
 
-**M5 — the model guard returns a refusal instead of an error.**
+**M5 — the model guard returns a refusal instead of an error** (an empty `Result` and a nil error).
 - *Why the code exists:* spec §10's distinction runs in both directions; a misconfiguration filed as "nothing to say" is the same lie as an error rate hiding a refusal.
 - *Fixture that separates mutant from original:* the same fake; the test asserts `errors.Is(err, ErrModelMismatch)` rather than "an unsuccessful outcome".
 - *Must fail:* `TestARepoIndexedByAnotherModelIsAnError`
+- *Observed:* killed. `retrieve_test.go:265: got 0 hits and error <nil>, want ErrModelMismatch` — the zero hit count is the whole difference from M4, which is why the assertion is on the error and not on the emptiness.
+- *Compiles and vets:* yes.
 
 **M6 — `TopScore` taken from the fused score instead of the vector similarity.**
 - *Why the code exists:* Task 1 proved the fused score carries no quality signal.
-- *Fixture that separates mutant from original:* the fake vector arm returns a top similarity of `0.83`; the fused top is `1/61 ≈ 0.0164`, and the test asserts the exact value. A test asserting only "TopScore > 0" survives.
+- *Fixture that separates mutant from original:* the fake vector arm's top similarity is `0.75` — **exactly representable in a float32**, which `models.Cite.Score` is; the plan's `0.83` arrives as `0.8299999833106995` and cannot be asserted exactly. A test asserting only "TopScore > 0" survives.
 - *Must fail:* `TestTopScoreIsTheVectorArmsBestSimilarity`
-- *Expected (verify and correct):* `TopScore 0.0163934, want 0.83`
+- *Observed:* killed. `retrieve_test.go:208: TopScore 0.03252247488101534, want 0.75`, plus two unpredicted kills: `TestLexicalOnlyResultsAreNotScoredForTheFloor` (`a lexical-only run scored 0.01639344262295082`) and `TestAnEmptyVectorArmHasNoTopScore`. **The plan's predicted value was wrong twice over**: the fused top here is `1/61 + 1/62 = 0.0325224`, not `1/61`, because the top span is in both arms. "The top hit always scores `1/(k+1)`" holds for a single arm; in hybrid the fused top is one of a small set of rank-determined values, which is the same point — a function of ranks alone — stated too specifically.
+- *Compiles and vets:* yes.
 
-**M7 — `store.CheckDim` deleted from the gateway's boot path.**
+**M7 — `store.CheckDim` deleted from the gateway's boot path** (replaced by `func(int) error { return nil }`).
 - *Why the code exists:* an embedder of the wrong width means every query is ranked against a column it cannot be compared to; the indexer refuses to boot for this and the gateway must too.
 - *Fixture that separates mutant from original:* `EMBED_DIM=64` in the boot test. Nothing in a default-configured test reaches it.
 - *Must fail:* `TestGatewayRefusesToBootOnAnEmbedderOfTheWrongWidth`
+- *Observed:* killed. `main_test.go:213: want ErrDimMismatch, got <nil>`
+- *Compiles and vets:* yes — `store` is still imported for `EmbeddingDim`, so the import does not go unused.
 
 **M8 — the floor's `Validate` skipped at boot.**
 - *Why the code exists:* fail closed, as `chunk.Options` and `walk.Limits` do.
-- *Fixture that separates mutant from original:* `ANSWER_SCORE_FLOOR=7` in the boot test.
+- *Fixture that separates mutant from original:* `ANSWER_SCORE_FLOOR=7` in the boot test — and `NaN`, which parses as a float and only `Validate` rejects.
 - *Must fail:* `TestGatewayRefusesAFloorOutsideTheCosineRange`
+- *Observed:* killed three times: `main_test.go:263: ANSWER_SCORE_FLOOR=7 was accepted`, `=-1.5`, `=NaN`. The `0,5` and `half` cases still failed the boot, at `ParseFloat` — so the test covers both guards and only the range half moves under this mutant.
+- *Compiles and vets:* yes.
 
 **M9 — `SetFloor` called with `calibrated: true`.**
 - *Why the code exists:* it is the gauge that shows an operator a guess as a guess.
-- *Fixture that separates mutant from original:* `TestTheFloorGaugeIsSetFromTheConfiguredValue`, reading the registry.
+- *Fixture that separates mutant from original:* `TestTheFloorGaugeIsSetFromTheConfiguredValue`, which scrapes `/metrics` through the router the binary serves rather than reading a variable.
 - *Must fail:* `TestTheFloorGaugeIsSetFromTheConfiguredValue`
+- *Observed:* killed. `main_test.go:311: /metrics does not carry "codetrail_score_floor_calibrated 0"`. The retriever's own `Floor.Calibrated` is untouched by this mutant, so the gauge assertion is the only thing that can see it — which is the point of scraping.
+- *Compiles and vets:* yes.
 
-- [ ] **Step 4: Commit**
+**M10 — the `RETRIEVAL_RRF_K >= 0` guard deleted at boot** (added: Task 1 deferred this guard here and the task as written did not mention it).
+- *Why the code exists:* `Fuse` divides by `k + rank` and guards nothing. `k = -1` makes the top hit's contribution `+Inf`; `k <= -2` inverts the ranking. `config.GetInt` parses `-1` happily.
+- *Fixture that separates mutant from original:* `RETRIEVAL_RRF_K=-1` and `-2` in the boot test, with `0` asserted to still boot — `k=0` is reciprocal rank with no discount and is a required call.
+- *Must fail:* `TestGatewayRefusesAFusionConstantFuseCannotSurvive`
+- *Observed:* killed. `main_test.go:277: RETRIEVAL_RRF_K=-1 was accepted`
+- *Compiles and vets:* yes.
+
+**M11 — the retriever's own `K < 0` guard deleted** (added: the eval builds a `Retriever` in code, spec §9, and never passes through the gateway's boot).
+- *Fixture that separates mutant from original:* `TestSearchRefusesAConfigurationFuseCannotSurvive`, which constructs the retriever directly.
+- *Observed:* killed. `retrieve_test.go:363: accepted` (subtest `negative_k`).
+- *Compiles and vets:* yes.
+
+**M12 — `Spans` carries every candidate instead of the returned hits** (added).
+- *Why the code exists:* the arms return `Candidates` rows each and the caller renders at most `limit` citations; the rest are spans no hit references.
+- *Fixture that separates mutant from original:* the 32-span fixture with a limit of 10. A fixture whose corpus is smaller than the limit cannot see this.
+- *Observed:* killed. `retrieve_test.go:305: carried 32 spans for 10 hits`
+- *Compiles and vets:* yes.
+
+**M13 — `Split` ignored: `Terms(q, true)`** (added).
+- *Why the code exists:* `LEXICAL_SPLIT_IDENTIFIERS` is what P6 sweeps to find out whether query-side splitting helps; a knob that does not reach the arm is not a knob.
+- *Fixture that separates mutant from original:* the split-off case, whose expected terms are strictly fewer. The split-on case passes under the mutant.
+- *Observed:* killed. `retrieve_test.go:329: split=false: terms ["parseconfig" "parse" "config" "handler"], want ["parseconfig" "handler"]`
+- *Compiles and vets:* yes.
+
+**M14 — the `NaN` guard removed from `metrics.ObserveTopScore`** (added; the import went with it, or it is a build break).
+- *Why the code exists:* one `NaN` observation makes a Prometheus histogram's `_sum` `NaN` for the life of the process — silently — and P6 calibrates the floor from exactly this histogram.
+- *Fixture that separates mutant from original:* a lexical-only run, which is where the `NaN` comes from, followed by a scrape of the real exposition. No assertion on a return value can see this.
+- *Must fail:* `TestALexicalOnlyRunIsTimedAndDoesNotPoisonTheTopScoreHistogram`
+- *Observed:* killed. `retrieve_test.go:402: the top-score histogram is poisoned: codetrail_retrieval_top_score_sum NaN`
+- *Compiles and vets:* yes, once `math` goes too.
+
+**M15 — retrieval is never timed** (`ObserveRetrieval` and its `start` deleted, and `time` with them).
+- *Why the code exists:* spec §11 asks for retrieval latency, and the retriever is the only thing that knows what it covers.
+- *Fixture that separates mutant from original:* the scrape, and the fact that `metrics`' `init` pre-creates the series at 0 — an absent series would make "not timed" and "never scraped" the same string.
+- *Observed:* killed. `retrieve_test.go:407: retrieval was not timed under its own mode: codetrail_retrieval_seconds_count{mode="lexical"} 0`
+- *Compiles and vets:* yes, with the import removed. Left in, it is a build break and a void mutation.
+
+**M16 — the floor gauge set from a literal rather than the configured value** (added).
+- *Observed:* killed. `main_test.go:311: /metrics does not carry "codetrail_score_floor 0.25"` — so both halves of that test's assertion are proven able to fail (M9 is the other).
+- *Compiles and vets:* yes.
+
+**M17 — the boot log claims the floor is calibrated** (added).
+- *Why the code exists:* the boot log is one of the four places the floor has to say it is a placeholder.
+- *Observed:* killed. `main_test.go:339: the boot log does not carry the floor and its calibration: {"level":"info","mode":"hybrid",…,"score_floor":-1,"floor_calibrated":true,…}`
+- *Compiles and vets:* yes.
+
+**M18 — the default `RETRIEVAL_MODE` flipped to `vector`** (added; Task 8 mutates the same default end to end).
+- *Observed:* killed. `main_test.go:327: mode=vector k=60 candidates=40 split=true`
+- *Compiles and vets:* yes.
+
+**M19 — the floor ships at `0.35`, calibrated** (added; the failure this whole design exists to prevent).
+- *Observed:* killed three times, in two tests: `main_test.go:330: floor {Value:0.35 Calibrated:true}, want -1 uncalibrated`, the boot-log assertion, and `main_test.go:302: retriever floor {Value:0.25 Calibrated:true}, want 0.25 uncalibrated` — the last one because the mutant also flips `Calibrated` for an operator-set value.
+- *Compiles and vets:* yes.
+
+**M20 — the width dropped from the model guard** (`model != r.Emb.Model()` only) (added).
+- *Why the code exists:* `embed.Fake` calls itself `fake-hashed-bow` at every width, so the name alone admits a corpus in a different space under the same label.
+- *Fixture that separates mutant from original:* the `same model at another width` subtest. The `another model` subtest passes under the mutant.
+- *Observed:* killed. `retrieve_test.go:265: got 5 hits and error <nil>, want ErrModelMismatch` (subtest `the_same_model_at_another_width` only).
+- *Compiles and vets:* yes.
+
+**M21 — `VectorRan` always true** (added).
+- *Why the code exists:* it is what tells `Decide` not to compare a cosine floor against a `ts_rank_cd`.
+- *Observed:* killed twice. `retrieve_test.go:169: a lexical-only result claims the vector arm ran` and `retrieve_test.go:229: a lexical-only result was refused by a cosine floor: refused/unscored` — the second is the consequence, and it is the one that matters.
+- *Compiles and vets:* yes.
+
+**M22 — the "one vector for one query" check deleted from `embedQuery`** (added). **Predicted survivor, and it survived.**
+- *Why the code exists:* an embedder that answers zero vectors would otherwise be an index-out-of-range panic, recovered by echo into a `500` with no cause in it.
+- *Observed:* **survived** the whole suite (`go test ./... -count=1` green). No fixture has an embedder that answers the wrong number of vectors, and writing one would test the guard and nothing else. Recorded rather than papered over: the guard stays, and what it converts is a panic into an error, not a wrong answer into a right one.
+- *Compiles and vets:* yes.
+
+**M23 — `OLLAMA_URL` no longer parsed for scheme and host** (added, against the moved code: the move has to keep P2's kills, not merely compile).
+- *Observed:* killed three times. `fromenv_test.go:143: the error does not name is not an http:// or https:// address: … Post "not%20a%20url%20at%20all/api/embed": unsupported protocol scheme ""`, and the same for `localhost:11435` and `http://`. The moved test discriminates exactly as it did in `apps/indexer/cmd`.
+- *Compiles and vets:* yes, with `net/url` removed.
+
+**M24 — an unknown `EMBED_PROVIDER` falls back to the fake.**
+- *Observed:* killed. `fromenv_test.go:98: a misspelt provider was accepted`
+- *Compiles and vets:* yes, with `_ = provider`.
+
+**M25 — the indexer boots without the schema's width check** (its wrapper passes a no-op).
+- *Why the code exists:* the wrapper is the only place the indexer's call to `embed.FromEnv` is pinned, now that the body has moved.
+- *Observed:* killed. `main_test.go:1363: want ErrDimMismatch, got <nil>`
+- *Compiles and vets:* yes.
+
+- [x] **Step 4: Commit**
 
 ```bash
 git commit -m "feat(rag): the retriever, and the gateway's own embedder
@@ -1487,11 +1590,24 @@ label for whether a hit was correct."
 
 **Definition of Done**
 - Three modes, each provably running only its own arms, switched by configuration.
-- Candidate depth separate from the returned limit, verified against `hnsw.ef_search`.
-- Model mismatch is an error and says so.
+- Candidate depth separate from the returned limit, verified against `hnsw.ef_search` (measured: `boot_val` is 40 on the pinned pgvector 0.8.6).
+- Model mismatch is an error and says so — on the model *and* on the width, because the fake names itself the same at every width.
 - Both binaries validate the embedder through one function.
 - Metrics exist with closed label sets, and the floor's gauges say uncalibrated.
-- M1–M9 recorded.
+- M1–M25 recorded, M22 recorded as a survivor with what it revealed.
+
+**Deviations from this task as written, and why:**
+- **`embed.FromEnv` takes four arguments, not three.** See Interfaces above: with the caller running `store.CheckDim` *after* `FromEnv`, a wrong `EMBED_DIM` under `EMBED_PROVIDER=ollama` spends a probe and the message blames `EMBED_MODEL`. `TestTheWidthIsCheckedBeforeTheProbe` pins the ordering with a server that fails the test if it is reached.
+- **`newEmbedder` is not deleted from the indexer; its body is.** What remains is a one-line wrapper around `embed.FromEnv(ctx, store.EmbeddingDim, store.CheckDim, timeout)`. Two reasons: the job fixtures build their embedder the way `main` does, and inlining the call at each site would leave the indexer's *own* arguments — the schema width and the check — pinned by nothing (M25 is the mutation that shows this).
+- **`Result.Spans` is `map[string]models.Span`, not `map[string]models.Cite`.** See Interfaces.
+- **`Search` validates its own configuration** (mode, `K >= 0`, `Candidates >= 1`, `limit >= 1`). The boot validators are the first line; this is the second, for the `Retriever` spec §9's eval constructs in code without passing through either binary's boot.
+- **The model guard is skipped in lexical mode**, along with the embed call. There is no vector to be in the wrong space, so reading the corpus's embedder would be a round trip that can only produce a refusal nothing asked for.
+- **The embedder is built in every mode, including `lexical`**, where nothing calls it. Parity is the stated decision (Open question 6) and one boot contract is easier to reason about than three; the cost is that `RETRIEVAL_MODE=lexical` still needs a reachable Ollama to start.
+- **`ANSWER_SCORE_FLOOR` is parsed with `strconv.ParseFloat` rather than through `config`.** `config.GetInt` answers its default for anything it cannot parse, and a floor that silently reverts to `-1` on a typo is a filter an operator believes is running. `Calibrated` stays false whatever the value: the flag says *codetrail* measured this number.
+- **`LEXICAL_SPLIT_IDENTIFIERS` is read here** (Task 3 named the knob and nothing read it).
+- **Nothing serves from the retriever yet.** `main` constructs it and discards it, so boot depends on the embedder now and the read endpoints wire it in Task 7. `storeHandle` grew `rag.Searcher` for that.
+- **Added tests:** `TestGatewayRefusesToBootWhenTheEmbedderIsUnreachable` (the boot-parity claim, which nothing else asserts), `TestGatewayRefusesAFusionConstantFuseCannotSurvive` (M10), `TestSplittingIdentifiersIsAKnobThatFailsClosed`, `TestAnEmptyVectorArmHasNoTopScore`, `TestTheLexicalArmIsAskedForTheQuerysTerms`, `TestAnArmErrorIsAnErrorAndNotAnEmptyResult`, `TestALexicalOnlyRunIsTimedAndDoesNotPoisonTheTopScoreHistogram` (M14, M15), `TestTheWidthIsCheckedBeforeTheProbe` and `TestAProbeThatAnswersTheWrongWidthRefusesToBoot`.
+- **Defect found in the task's own prediction:** M6's expected `TopScore 0.0163934` is wrong for a hybrid fixture — measured `0.0325224`, because the top span is in both arms. The claim it rests on ("a fused score is a function of ranks alone") is unaffected; the arithmetic behind it was stated too specifically. Corrected in the test comment as well, where it had been copied.
 
 ---
 
