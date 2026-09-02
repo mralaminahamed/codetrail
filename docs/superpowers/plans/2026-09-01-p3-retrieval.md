@@ -1883,6 +1883,36 @@ accident."
 
 **One residual risk, recorded rather than fixed.** "No question in a log line" holds for every line this handler writes, and the 500 path logs the underlying error, which nothing in this phase builds from the question: `embed.Fake` names an index, `ErrModelMismatch` names models. The one path that could carry question-derived text is a pgx error naming a `tsquery` — `rag.Terms` restricts terms to letters and digits precisely so `to_tsquery` cannot fail on them, so it is unreachable through this code, and it is the thing to check first if a lower layer ever starts interpolating.
 
+**Found after the phase, and fixed on this branch: the API accepted a `mode` it could not honour.** Measured against a running gateway — `{"q":"…","mode":"vector"}` was answered `200` with `"mode":"hybrid"`, and so was `"bogus"`. The mechanism was not a field that went unread: `searchRequest` never declared one, echo's binder drops a key no struct field claims, and the response reports the process's own mode — which is what made the drop look like an echo. **Refused rather than honoured**, because `Retriever.Search` takes no mode argument and spec:316's two-arm comparison runs through `evalrunner` against separate databases rather than through this API, so honouring it would add a switch with no consumer. Every mode is refused, the configured one included: which mode a process runs is not something a caller can know, and accepting a value on the chance it agrees is the same silence in a smaller form. An explicit `null` is absence. Verified live on both routes with the pre-fix and post-fix binaries side by side, and the three rejected asks moved no outcome counter — `codetrail_answer_total{outcome="refused"} 2` for the two that reached the answerer, `error` 0.
+
+**M19 — the mode check deleted** (the field stays declared, so this is a behaviour change and not a build break).
+- *Why the code exists:* a field a service accepts and ignores is the overclaim spec §10's "never a generic refusal" exists to prevent, one layer up: the caller is told nothing fired.
+- *Fixture that separates mutant from original:* a retriever running in `lexical` while the request asks for `vector`, so the mutant's 200 reports a mode nobody asked for.
+- *Must fail:* `TestAModeInTheRequestBodyIsRefusedRatherThanIgnored`, `TestAValidationFailureIsCountedAsNoAnswerOutcomeAtAll`
+- *Observed:* killed — `search: want 400, got 200: {"repo_id":"repo-1","mode":"lexical",…}` and `{"q":"sampler","mode":"vector"}: want 400, got 200`.
+- *Compiles and vets:* yes.
+
+**M20 — the 400 names a different rule** (`"q must not be empty"` in place of the mode detail).
+- *Why the code exists:* the whole complaint about this field was that it was answered without being read; a 400 that names the wrong rule is the same failure with a different status code.
+- *Fixture that separates mutant from original:* the assertion is on the exact detail, not on the status.
+- *Must fail:* `TestAModeInTheRequestBodyIsRefusedRatherThanIgnored`
+- *Observed:* killed — `search: body {"error":"q must not be empty","rule":"form"} does not name the rule that fired`.
+- *Compiles and vets:* yes. This is the mutant a status-only assertion survives.
+
+**M21 — the guard inverted (`req.Mode == nil`), so every request without a mode is refused.**
+- *Why the code exists:* the other direction — a rejection that fires on the requests it was meant to serve.
+- *Fixture that separates mutant from original:* the same body without the field, asserted as a 200 whose reported mode is the server's.
+- *Must fail:* `TestTheModeAResponseReportsIsTheOneTheServerRetrievedIn` (and most of the read suite)
+- *Observed:* killed — `search: want 200, got 400: {"error":"mode is not a request field: …"}`.
+- *Compiles and vets:* yes.
+
+**M22 — the search response reports a literal `hybrid` instead of `out.Mode`** (added: refusing the request field is only honest if the response's mode is the one that ran).
+- *Why the code exists:* the response's `mode` is the caller's only way to learn what retrieved, and a constant there is what would make the refused request field look arbitrary.
+- *Fixture that separates mutant from original:* a retriever running in `lexical`, so `hybrid` is a wrong answer rather than a coincidence.
+- *Must fail:* `TestTheModeAResponseReportsIsTheOneTheServerRetrievedIn`, `TestARepoWithNoSpansRefusesRatherThanErrors`
+- *Observed:* killed — `search: the response says mode hybrid, want "lexical"`.
+- *Compiles and vets:* yes.
+
 ---
 
 ### Task 8: End to end on a live database, CI, and the README
