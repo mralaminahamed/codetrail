@@ -208,3 +208,151 @@ func TestIDsAreDeterministicAndDistinct(t *testing.T) {
 		t.Fatal("concatenation collides: the field separator is gone")
 	}
 }
+
+// putAt writes a repo and pins indexed_at. The staleness query orders on that
+// column, and now() at insert time is not something a test can space out
+// reliably enough for "later" to mean anything.
+func putAt(t *testing.T, s *Store, id, remote, ref, commit string, at time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	r := models.Repo{ID: id, Remote: remote, Ref: ref, Commit: commit}
+	if err := s.PutRepo(ctx, r, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.pool.Exec(ctx, `UPDATE repos SET indexed_at = $2 WHERE id = $1`, id, at); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The staleness fixture: one repository whose main branch was indexed twice at
+// different commits, and a tag indexed after both. Oldest first, so a query
+// that lost its ordering returns the row that happens to be physically first.
+const (
+	stRemote = "https://github.com/o/staleness"
+	stOld    = "1111111111111111111111111111111111111111"
+	stNew    = "2222222222222222222222222222222222222222"
+	stTag    = "3333333333333333333333333333333333333333"
+)
+
+func stID(commit string) string { return RepoID("github.com/o/staleness", commit) }
+
+// The one positive staleness claim the corpus supports: the same ref indexed
+// later at a different commit is proof the ref moved.
+func TestNewerCommitFindsALaterIndexOfTheSameRefLive(t *testing.T) {
+	ctx := context.Background()
+	s := fresh(t, stID(stOld), stID(stNew))
+	base := time.Now().UTC().Truncate(time.Microsecond)
+	putAt(t, s, stID(stOld), stRemote, "main", stOld, base.AddDate(0, 0, -92))
+	putAt(t, s, stID(stNew), stRemote, "main", stNew, base.AddDate(0, 0, -1))
+
+	commit, at, err := s.NewerCommit(ctx, stID(stOld))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if commit != stNew {
+		t.Fatalf("newer commit %q, want %q", commit, stNew)
+	}
+	if want := base.AddDate(0, 0, -1); !at.Equal(want) {
+		t.Fatalf("newer indexed at %v, want %v", at, want)
+	}
+}
+
+// A citation into v1.0.0 is not stale because main was indexed afterwards: a
+// tag does not move. Without the third row this is invisible.
+func TestNewerCommitIgnoresADifferentRefLive(t *testing.T) {
+	ctx := context.Background()
+	s := fresh(t, stID(stOld), stID(stTag))
+	base := time.Now().UTC().Truncate(time.Microsecond)
+	putAt(t, s, stID(stOld), stRemote, "v1.0.0", stOld, base.AddDate(0, 0, -92))
+	putAt(t, s, stID(stTag), stRemote, "main", stTag, base)
+
+	commit, _, err := s.NewerCommit(ctx, stID(stOld))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if commit != "" {
+		t.Fatalf("a later index of another ref reported %q as newer", commit)
+	}
+}
+
+// repos.remote holds the first submitter's spelling, so one repository indexed
+// at two commits can carry two spellings. Identity folds case; this query has
+// to fold it the same way or a repository's own history looks like two.
+func TestNewerCommitFoldsTheRemotesCaseLive(t *testing.T) {
+	ctx := context.Background()
+	s := fresh(t, stID(stOld), stID(stNew))
+	base := time.Now().UTC().Truncate(time.Microsecond)
+	putAt(t, s, stID(stOld), "https://github.com/O/Staleness", "main", stOld, base.AddDate(0, 0, -92))
+	putAt(t, s, stID(stNew), stRemote, "main", stNew, base.AddDate(0, 0, -1))
+
+	commit, _, err := s.NewerCommit(ctx, stID(stOld))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if commit != stNew {
+		t.Fatalf("newer commit %q across two spellings of one remote, want %q", commit, stNew)
+	}
+}
+
+// The newest index of a ref has nothing newer. Without this the query could
+// return any row for the same ref and every citation would read as superseded.
+func TestTheNewestIndexHasNoNewerCommitLive(t *testing.T) {
+	ctx := context.Background()
+	s := fresh(t, stID(stOld), stID(stNew))
+	base := time.Now().UTC().Truncate(time.Microsecond)
+	putAt(t, s, stID(stOld), stRemote, "main", stOld, base.AddDate(0, 0, -92))
+	putAt(t, s, stID(stNew), stRemote, "main", stNew, base.AddDate(0, 0, -1))
+
+	commit, at, err := s.NewerCommit(ctx, stID(stNew))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if commit != "" || !at.IsZero() {
+		t.Fatalf("the newest index reports %q at %v as newer than itself", commit, at)
+	}
+}
+
+// Why the "different commit" predicate cannot be reached through PutRepo: id
+// is hash(key, commit), so a re-index at the same commit updates one row.
+func TestReIndexingTheSameCommitIsOneRowLive(t *testing.T) {
+	ctx := context.Background()
+	id := stID(stOld)
+	s := fresh(t, id)
+	putAt(t, s, id, stRemote, "main", stOld, time.Now().UTC().AddDate(0, 0, -92))
+	putAt(t, s, id, "https://github.com/O/Staleness", "main", stOld, time.Now().UTC())
+
+	var n int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT count(*) FROM repos WHERE commit_sha = $1`, stOld).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("two indexes of one commit left %d rows", n)
+	}
+}
+
+// A note reading "superseded by dfd11cc" beside a citation at dfd11cc is a
+// staleness claim that contradicts itself, so the query says "different
+// commit" rather than borrowing the guarantee from RepoID's construction three
+// files away. The row is inserted directly because — see the test above —
+// PutRepo cannot produce this state.
+func TestNewerCommitNeverNamesTheCitationsOwnCommitLive(t *testing.T) {
+	ctx := context.Background()
+	const twin = "twin-of-the-same-commit"
+	s := fresh(t, stID(stOld), twin)
+	base := time.Now().UTC().Truncate(time.Microsecond)
+	putAt(t, s, stID(stOld), stRemote, "main", stOld, base.AddDate(0, 0, -92))
+	if _, err := s.pool.Exec(ctx,
+		`INSERT INTO repos (id, remote, ref, commit_sha, indexed_at) VALUES ($1, $2, 'main', $3, $4)`,
+		twin, stRemote, stOld, base); err != nil {
+		t.Fatal(err)
+	}
+
+	commit, _, err := s.NewerCommit(ctx, stID(stOld))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if commit != "" {
+		t.Fatalf("a later index of the same commit reported %q as newer", commit)
+	}
+}

@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="849" height="870" viewBox="0 0 849 870" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="14">
+<rect width="849" height="870" rx="12" fill="#0f1319"/>
+<path d="M0 12 a12 12 0 0 1 12 -12 h825 a12 12 0 0 1 12 12 v28 h-849 z" fill="#1b212b"/>
+<circle cx="24" cy="20" r="6" fill="#ff5f57"/>
+<circle cx="44" cy="20" r="6" fill="#febc2e"/>
+<circle cx="64" cy="20" r="6" fill="#28c840"/>
+<text x="424.5" y="25" fill="#8b949e" font-size="12" text-anchor="middle">codetrail — a question, an answer, and a citation checked byte for byte</text>
+<text x="28.0" y="62" fill="#7ee787" xml:space="preserve">$ </text>
+<text x="44.8" y="62" fill="#c9d1d9" xml:space="preserve">curl -s -XPOST localhost:8080/api/repos/$REPO/ask \</text>
+<text x="28.0" y="88" fill="#c9d1d9" xml:space="preserve">    -H &#x27;content-type: application/json&#x27; \</text>
+<text x="28.0" y="114" fill="#c9d1d9" xml:space="preserve">    -d &#x27;{&quot;q&quot;:&quot;how does the sampler decide to drop an event&quot;}&#x27; &gt; ask.json</text>
+<text x="28.0" y="166" fill="#7ee787" xml:space="preserve">$ </text>
+<text x="44.8" y="166" fill="#c9d1d9" xml:space="preserve">jq -r .answer &lt; ask.json | head -7</text>
+<text x="28.0" y="192" fill="#8b949e" xml:space="preserve">[1] sampler.go:18-23 (Sampler)</text>
+<text x="28.0" y="218" fill="#8b949e" xml:space="preserve">// Sampler defines an interface to a log sampler.</text>
+<text x="28.0" y="244" fill="#8b949e" xml:space="preserve">type Sampler interface {</text>
+<text x="28.0" y="270" fill="#8b949e" xml:space="preserve">    // Sample returns true if the event should be part of the sample, false if</text>
+<text x="28.0" y="296" fill="#8b949e" xml:space="preserve">    // the event should be dropped.</text>
+<text x="28.0" y="322" fill="#8b949e" xml:space="preserve">    Sample(lvl Level) bool</text>
+<text x="28.0" y="348" fill="#8b949e" xml:space="preserve">}</text>
+<text x="28.0" y="400" fill="#7ee787" xml:space="preserve">$ </text>
+<text x="44.8" y="400" fill="#c9d1d9" xml:space="preserve">jq -c &#x27;{answered_by,refused,top_score,floor}&#x27; &lt; ask.json</text>
+<text x="28.0" y="426" fill="#8b949e" xml:space="preserve">{&quot;answered_by&quot;:&quot;extractive&quot;,&quot;refused&quot;:false,&quot;top_score&quot;:</text>
+<text x="498.4" y="426" fill="#e8a33f" xml:space="preserve">0.7165809869766235</text>
+<text x="649.6" y="426" fill="#8b949e" xml:space="preserve">,</text>
+<text x="28.0" y="452" fill="#8b949e" xml:space="preserve"> &quot;floor&quot;:{&quot;value&quot;:</text>
+<text x="179.2" y="452" fill="#e8a33f" xml:space="preserve">-1</text>
+<text x="196.0" y="452" fill="#8b949e" xml:space="preserve">,&quot;calibrated&quot;:</text>
+<text x="313.6" y="452" fill="#e8a33f" xml:space="preserve">false</text>
+<text x="355.6" y="452" fill="#8b949e" xml:space="preserve">,&quot;applicable&quot;:true}}</text>
+<text x="28.0" y="504" fill="#7ee787" xml:space="preserve">$ </text>
+<text x="44.8" y="504" fill="#c9d1d9" xml:space="preserve">git -C zerolog show dfd11cca:sampler.go | sed -n &#x27;18,23p&#x27; \</text>
+<text x="28.0" y="530" fill="#c9d1d9" xml:space="preserve">    | head -c -1 | sha256sum</text>
+<text x="28.0" y="556" fill="#e8a33f" xml:space="preserve">a7a70e1ec9cb1aa09c1f380415bc637a38379d7c686a180ca8d0401f77c29833</text>
+<text x="565.6" y="556" fill="#8b949e" xml:space="preserve">  -</text>
+<text x="28.0" y="608" fill="#7ee787" xml:space="preserve">$ </text>
+<text x="44.8" y="608" fill="#c9d1d9" xml:space="preserve">jq -r .citations[0].citation.digest &lt; ask.json</text>
+<text x="28.0" y="634" fill="#e8a33f" xml:space="preserve">a7a70e1ec9cb1aa09c1f380415bc637a38379d7c686a180ca8d0401f77c29833</text>
+<text x="28.0" y="686" fill="#7ee787" xml:space="preserve">$ </text>
+<text x="44.8" y="686" fill="#c9d1d9" xml:space="preserve">jq -r .citations[0].citation.permalink &lt; ask.json</text>
+<text x="28.0" y="712" fill="#8b949e" xml:space="preserve">https://github.com/rs/zerolog/blob/dfd11cca1143ba03ba0fc0ff14e5dbb4d61f6f0a/sampler.go#L18-L23</text>
+<text x="28.0" y="764" fill="#8b949e" xml:space="preserve"># rs/zerolog at dfd11cca, 1,303 spans. The bytes a reader was shown hash to the</text>
+<text x="28.0" y="790" fill="#8b949e" xml:space="preserve"># digest the API returned, and the range is those lines at that commit. The floor</text>
+<text x="28.0" y="816" fill="#8b949e" xml:space="preserve"># is -1 and uncalibrated: it refuses nothing on score alone. P6 measures it.</text>
+</svg>

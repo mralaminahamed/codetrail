@@ -102,8 +102,9 @@ Every rule below exists because of one of those. Read them before Task 1's mutat
 Retrieval is the easiest subsystem in this project to test vacuously. Five rules, each of which invalidates a test that would otherwise look fine. They apply to **every** retrieval fixture in this phase.
 
 1. **A single-document corpus cannot detect a ranking bug.** Every retrieval fixture holds at least three spans with a known, non-obvious intended order.
-2. **The expected order must disagree with insertion order, path order, and span-id order.** A query that lost its `ORDER BY` returns rows in physical order, which is insertion order; a fixture whose best answer was inserted first passes anyway. Build the fixtures so the correct answer is neither first-inserted nor first-alphabetically.
-3. **Every retrieval fixture holds two repositories.** A missing `WHERE repo_id = $1` is otherwise invisible, and the other repo's spans must be *better* matches than the target repo's, so the filter is load-bearing rather than decorative.
+2. **The expected order must disagree with insertion order, path order, and span-id order.** A fixture whose best answer was inserted first, or sorts first by path, passes under a query that lost its `ORDER BY`. Build the fixtures so the correct answer is none of those — and **assert each disagreement in the test body rather than constructing it and trusting it**.
+   **Corrected against measurement, twice.** The reason first given here was that a query with no `ORDER BY` returns rows in physical order, which is insertion order. That is not what happens. Task 2's M5 came back in **path** order, served from `spans_path_idx`; Task 3's M9 came back in the *same* order whichever order its two spans were inserted in. An unordered result is not an insertion-ordered result, so the insertion-order half of this rule is close to decorative and the path-order half is what has done the killing. Which is why the disagreements are asserted: the property a kill depends on has to fail loudly when it stops holding, not silently turn the kill into a coincidence.
+3. **Every retrieval fixture holds two repositories.** A missing `WHERE repo_id = $1` is otherwise invisible, and the other repo's spans must be **strictly better** matches than every span in the target repo, so the filter is load-bearing rather than decorative. *Strictly* is the correction: Task 2's scope fixture used an exact copy of the query vector, which **ties** the target repo's parallel span at cosine 1.0 instead of beating it, and the tie resolved with the target repo's span first — leaving a test whose message named rank 1 unable to say anything about rank 1. A fixture that ties is a fixture whose result is a coin flip. Drop the tying span from the target set, or make the other repo's match strictly better.
 4. **Unit vectors cannot tell cosine from L2 — and they cannot tell cosine from inner product either.** The vector fixture uses deliberately non-unit vectors chosen so that cosine order, L2 order and inner-product order are three different orders. Task 2 gives the exact vectors.
 5. **A query that lexically matches its own answer cannot tell the vector arm from the lexical one.** And under `embed.Fake` — a hashed bag of words over the same text — *no* end-to-end query can, because both arms are then computing lexical overlap. Therefore: **arm separation and fusion are tested on synthetic ranked lists with no embedder and no database** (Task 1), the arms are tested individually against hand-written rows (Tasks 2 and 3), and the end-to-end tests prove wiring only. Any test that claims to show fusion working end to end is measuring the fake.
 
@@ -170,7 +171,7 @@ Everything in this task is a pure function over synthetic inputs: no database, n
 - **`Decide` refuses on a `NaN` top score.** `NaN < floor` is `false` in Go, so the natural spelling of the check *answers* on a NaN. P2 measured that pgvector returns `NaN` for the cosine distance of a zero vector; a span with a zero embedding is prevented at the chunker, and this is the second line of defence at the place where the failure would otherwise be a confident answer.
 - **`Decide` is inclusive at the floor:** it refuses when `top < floor`, so a score exactly equal to the floor answers. Arbitrary, but it has to be pinned somewhere or the boundary drifts; the tests fix it.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `fuse_test.go`:
 
@@ -372,7 +373,7 @@ func TestFloorValidateRefusesWhatCosineCannotProduce(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Implement**
+- [x] **Step 2: Implement**
 
 `fuse.go`, in outline — the sum, then one sort:
 
@@ -429,11 +430,11 @@ func Decide(f Floor, hits int, top float64, vectorRan bool) (Outcome, Reason) {
 func DefaultFloor() Floor { return Floor{Value: -1, Calibrated: false} }
 ```
 
-- [ ] **Step 3: Run**
+- [x] **Step 3: Run**
 
 `go test ./packages/shared/rag/ -count=1 -v` — expect PASS.
 
-- [ ] **Step 4: Commit, then prove the tests discriminate**
+- [x] **Step 4: Commit, then prove the tests discriminate**
 
 `git status --porcelain` must be empty first.
 
@@ -441,14 +442,14 @@ func DefaultFloor() Floor { return Floor{Value: -1, Calibrated: false} }
 - *Why the code exists:* `k` is the discount that stops a single arm's top rank from dominating the fusion; it is the parameter P6 sweeps.
 - *Fixture that separates mutant from original:* the `(1st, 20th)` versus `(2nd, 2nd)` fixture in `TestKChangesTheOrderWhereItShould`. A fixture where both arms rank the same documents in the same order cannot: `k` then scales every score by the same monotone function and the order is unchanged.
 - *Must fail:* `TestKChangesTheOrderWhereItShould`
-- *Expected (verify and correct):* `k=60 ranked "X" first, want Y`
+- *Observed:* killed. `fuse_test.go:71: k=60 ranked "X" first, want Y` — prediction correct.
 - *Compiles and vets:* yes; it is an arithmetic change with the same types.
 
 **M2 — fuse on the arm's score instead of its rank: `1/float64(k+rank)` → `h.Score`.**
 - *Why the code exists:* the two arms' units are not comparable, so ranks are the only common currency.
 - *Fixture that separates mutant from original:* `hits()` gives descending scores `1, 0.99, 0.98…` in both arms, so summing scores ranks by "how high each arm put it" with a *different* discount curve than RRF. In `TestFuseIsReciprocalRankOverBothArms`: A=1+0.99=1.99, C=0.98+1=1.98, B=0.99, E=0.98, D=0.97 — **which is the same order**. Expected to survive on that test. The kill is `TestFusedScoreCarriesNoQualitySignal`, whose two fixtures have identical rank order and different scores by construction.
 - *Must fail:* `TestFusedScoreCarriesNoQualitySignal`
-- *Expected (verify and correct):* `a good arm fused to 0.99 and a worthless one to 0.01`
+- *Observed:* killed. `fuse_test.go:133: a good arm fused to 0.99 and a worthless one to 0.01` — prediction correct. **The predicted survival held**: `TestFuseIsReciprocalRankOverBothArms` passed under the mutant, exactly as this block says it would. Two incidental kills the block did not predict, both because a hand-built `Hit` literal leaves `Score` at 0 while `hits()` fills it: `fuse_test.go:71: k=60 ranked "X" first, want Y`, and `fuse_test.go:121: got [alpha zulu3 mike4 delta nine], want [nine delta alpha zulu3 mike4]` (every span scores 0, so the whole order falls to the tie-break).
 - *Compiles and vets:* yes.
 - *Note:* this mutation is listed with its predicted **survival** on the first test on purpose. A mutation that survives the test you expected to kill it is the single most useful thing a mutation round produces, and dropping it quietly is how a plan grows a test that proves nothing.
 
@@ -456,52 +457,61 @@ func DefaultFloor() Floor { return Floor{Value: -1, Calibrated: false} }
 - *Why the code exists:* two runs over an unchanged corpus must be diffable; without it the order among equal scores comes from map iteration.
 - *Fixture that separates mutant from original:* `TestTiesBreakOnPathAndLineNotOnWalkOrder`, whose two documents fuse to bit-identical scores. Any fixture with distinct scores cannot detect this at all.
 - *Must fail:* `TestTiesBreakOnPathAndLineNotOnWalkOrder`
-- *Expected (verify and correct):* `got [aaa bbb], want [bbb aaa]` — on *some* iteration of the 50. Go's `sort.Slice` is not stable and map iteration is randomised, so the failure is overwhelmingly likely rather than certain: 50 draws that all happen to come out in the intended order is roughly `2^-50`. **If it passes, do not record a kill** — record what happened and raise the loop count, because the claim being tested is determinism and a flaky kill is not evidence of it.
+- *Observed:* killed on the first run; no loop-count increase needed. `fuse_test.go:87: got [aaa bbb], want [bbb aaa]`. Predicted as: `got [aaa bbb], want [bbb aaa]` — on *some* iteration of the 50. Go's `sort.Slice` is not stable and map iteration is randomised, so the failure is overwhelmingly likely rather than certain: 50 draws that all happen to come out in the intended order is roughly `2^-50`. **If it passes, do not record a kill** — record what happened and raise the loop count, because the claim being tested is determinism and a flaky kill is not evidence of it.
 - *Compiles and vets:* yes.
 
 **M4 — tie-break on `SpanID` only (drop `Path`/`StartLine`).**
 - *Why the code exists:* a human comparing two result sets reads file order, not hash order.
 - *Fixture that separates mutant from original:* the same fixture, built so `aaa` sorts before `bbb` by id but *after* it by `(path, start_line)`. A fixture whose ids happen to agree with its paths cannot tell the two rules apart.
 - *Must fail:* `TestTiesBreakOnPathAndLineNotOnWalkOrder`
-- *Expected (verify and correct):* `got [aaa bbb], want [bbb aaa]`, deterministically this time.
+- *Observed:* killed. `fuse_test.go:87: got [aaa bbb], want [bbb aaa]` — prediction correct, and deterministic as stated.
 - *Compiles and vets:* yes.
 
 **M5 — absent arm scored as `len(list)+1` instead of skipped.**
 - *Why the code exists:* a span one arm never returned must contribute nothing; giving it a synthetic worst rank turns fusion into "vector, damped by a constant".
-- *Fixture that separates mutant from original:* `TestFuseIsReciprocalRankOverBothArms`, where `D` is in the vector arm only and `E` in the lexical arm only, at depths that make the synthetic ranks change their relative order. Expected: with the mutant, D=1/64+1/64 and E=1/63+1/65, so D and E swap.
-- *Must fail:* `TestFuseIsReciprocalRankOverBothArms`
-- *Expected (verify and correct):* `got [A C B D E], want [A C B E D]` — **verify the arithmetic before recording it**; the synthetic-rank values depend on the exact list lengths in the fixture.
-- *Compiles and vets:* yes.
+- *Fixture named in the plan:* `TestFuseIsReciprocalRankOverBothArms`. **It cannot separate them, and the plan's arithmetic was wrong.** D=1/64+1/64=0.0312500 and E=1/63+1/65=0.0312576, so E still outranks D and the order is unchanged — `[A C B E D]` under mutant and original alike. The plan predicted a swap; there is none.
+- *Fixture that actually separates them (added):* `TestAbsentFromAnArmContributesNothing`, whose arms have deliberately different lengths (2 and 4), so the synthetic terms are 1/65 and 1/63 rather than 1/65 and 1/64, and the vector-only `delta` and lexical-only `alpha` sit 0.00026 apart — close enough for the near-constant the mutant adds to swap them.
+- *Must fail:* `TestAbsentFromAnArmContributesNothing`
+- *Observed (score-only mutant, matching the wording "absent arm **scored** as len+1"):* **survived** `TestFuseIsReciprocalRankOverBothArms`. Killed by the added test: `fuse_test.go:121: got [nine alpha delta zulu3 mike4], want [nine delta alpha zulu3 mike4]`. One unpredicted kill: `fuse_test.go:71: k=60 ranked "Z0" first, want Y` — `Z0` is lexical-only against a 2-long vector arm, so it gains 1/63 and passes `Y`.
+- *Observed (M5b — the same mutant also writing the synthetic value into the rank field):* killed by the prescribed test, but on its **rank** assertion rather than its order assertion: `fuse_test.go:51: E has vector rank 5, want 0`. So the prescribed test detects only the variant that corrupts the reported rank; the variant that corrupts only the score is invisible to it.
+- *Compiles and vets:* yes, both variants.
 
 **M6 — `if top < f.Value` → `if top <= f.Value`.**
 - *Why the code exists:* the boundary has to be fixed somewhere or it drifts between the code, the tests and the README.
 - *Fixture that separates mutant from original:* `TestTheFloorIsInclusive`, which hands `Decide` a top score of *exactly* the floor. Only a unit test can: through pgvector, an exact float equality against a configured floor is not reproducible.
 - *Must fail:* `TestTheFloorIsInclusive`
-- *Expected (verify and correct):* `a top score of exactly 0.5 gave refused/below_floor, want answered`
+- *Observed:* killed. `decide_test.go:22: a top score of exactly 0.5 gave refused/below_floor, want answered` — prediction correct. Also killed `TestTheShippedDefaultRefusesNothingOnScoreAlone`: `decide_test.go:58: the worst possible cosine gave refused/below_floor at the default floor`, because `-1 <= -1`. The shipped default sits exactly on the boundary, so the "ships at -1" test doubles as a second inclusivity assertion.
 - *Compiles and vets:* yes.
 
 **M7 — delete the `math.IsNaN` branch.**
 - *Why the code exists:* `NaN < x` is false, so without the branch a score that is not a number is answered on.
 - *Fixture that separates mutant from original:* `TestANaNTopScoreRefuses`. No fixture with a real score can reach this branch.
 - *Must fail:* `TestANaNTopScoreRefuses`
-- *Expected (verify and correct):* `got answered/, want refused/unscored`
-- *Compiles and vets:* yes — `math` is still imported by `Validate`. **If it is not, the mutation breaks the build and is void:** re-apply it as `if math.IsNaN(top) && false`.
+- *Observed:* killed. `decide_test.go:36: got answered/, want refused/unscored` — prediction correct, empty reason included.
+- *Compiles and vets:* yes, confirmed — `Validate` still calls `math.IsNaN`, so the import survives and the `&& false` fallback was not needed. `Validate` must keep that call for its own sake: `NaN < -1` and `NaN > 1` are both false, so a range check alone accepts NaN.
 
 **M8 — `if hits == 0` → `if false`.**
 - *Why the code exists:* an empty result is a refusal, not an answer with no citations, and it is the refusal that stays live while the floor is uncalibrated.
 - *Fixture that separates mutant from original:* `TestNothingRetrievedRefusesEvenAtTheDefaultFloor`, which passes `hits=0` and a NaN top. Note the mutant then falls through to the NaN branch and *also* refuses — with the wrong reason. The test asserts the reason, which is what makes it a kill; asserting only `OutcomeRefused` would pass.
 - *Must fail:* `TestNothingRetrievedRefusesEvenAtTheDefaultFloor`
-- *Expected (verify and correct):* `got refused/unscored, want refused/no_spans`
+- *Observed:* killed. `decide_test.go:14: got refused/unscored, want refused/no_spans` — prediction correct, and the fall-through to the NaN branch happened exactly as described, which is what makes asserting the reason load-bearing.
 - *Compiles and vets:* yes.
 
 **M9 — `DefaultFloor` returns `Floor{Value: 0.35, Calibrated: true}`.**
 - *Why the code exists:* spec:315. The value is P6's, and the flag is what stops a reader mistaking a placeholder for a measurement.
 - *Fixture that separates mutant from original:* `TestTheShippedDefaultRefusesNothingOnScoreAlone`, which asserts both halves — the flag and the behaviour at the bottom of the cosine range.
 - *Must fail:* `TestTheShippedDefaultRefusesNothingOnScoreAlone`
-- *Expected (verify and correct):* `the default floor claims to be calibrated`
+- *Observed:* killed. `decide_test.go:55: the default floor claims to be calibrated` — prediction correct. The test stops at the flag, so its behavioural half is unreached under this mutant; M6's second kill covers that half.
 - *Compiles and vets:* yes.
 
-- [ ] **Step 5: Commit**
+**M10 — `ParseMode` returns `Mode(s), nil` for anything (added: the plan prescribed `ParseMode` with no test).**
+- *Why the code exists:* `RETRIEVAL_MODE` is validated at boot; defaulting an unrecognised value would hide a typo behind a service retrieving differently than it was asked to.
+- *Fixture that separates mutant from original:* `TestParseModeIsAClosedSet`, whose reject list includes `""` — the value a deployment hits by not setting the variable at all — and `"Hybrid"`, so a case-insensitive parse fails too.
+- *Must fail:* `TestParseModeIsAClosedSet`
+- *Observed:* killed. `rag_test.go:19: ParseMode("") accepted, returning ""`
+- *Compiles and vets:* yes.
+
+- [x] **Step 5: Commit**
 
 ```bash
 gofmt -l apps packages && go vet ./... && go test ./... -count=1
@@ -528,7 +538,13 @@ for a tuned threshold. Spec:315 puts the number in P6."
 - A fused score is proven to carry no quality signal, which is what justifies where the floor is read.
 - `Decide` separates refusal reasons into the closed set the metric labels use, refuses on `NaN`, and does not apply a cosine floor to a lexical-only result.
 - The shipped floor is `-1`, uncalibrated, and a test fails if that changes.
-- M1–M9 each recorded with observed output; M2's predicted survival recorded either way.
+- M1–M10 each recorded with observed output; M2's predicted survival held and is recorded; M5 survived the fixture the plan named for it, and the fixture that does kill it was added.
+
+**Deviations from this task as written, and why:**
+- **`type Arm string` / `ArmVector` / `ArmLexical` are not shipped.** Nothing in P3 consumes them: `Fuse` takes named arms by this task's own argument against `map[Arm][]Hit`, Task 6's metric labels are `mode`/`outcome`/`reason`, and Task 7's response fields are `vector_rank`/`lexical_rank`. They are residue of the design this task rejects, and shipping them would be dead exported API.
+- **`ParseMode` gained a test (`TestParseModeIsAClosedSet`) and a mutation (M10).** It was listed under Produces with neither, and it is a fail-closed boot validator — precisely the shape this codebase tests elsewhere (`chunk.Options.Validate`).
+- **`TestAbsentFromAnArmContributesNothing` added.** See M5: the fixture the plan named cannot detect the mutation it was named for.
+- **Left open for Task 6:** `Fuse` does not guard `k`. `k = -1` makes `rrf(k, 1)` a division by zero (`+Inf`), and `k <= -2` yields negative scores that invert the ranking. `Fuse` returns no error and `Fuse(0, …)` is a required call, so the guard belongs where `RETRIEVAL_MODE` is validated: **Task 6 should validate `RETRIEVAL_RRF_K >= 0` at boot**, which it does not currently mention.
 
 ---
 
@@ -550,8 +566,8 @@ pgvector cosine over spans, filtered by repo (spec §8). Plus the guard that sto
 **Decisions, with their reasoning:**
 
 - **The score returned is cosine *similarity*, `1 - (embedding <=> q)`, not the distance.** `<=>` is a distance: smaller is better, and it is the operator the HNSW index is built for, so the `ORDER BY` must use it directly. But the number that leaves this package is compared against a floor and put in a response, and a threshold on a quantity where lower is better is the sort of thing that survives review and inverts a product.
-- **`ORDER BY embedding <=> $2::vector` with a `LIMIT`, not `ORDER BY score DESC`.** Only the first form uses `spans_embedding_idx`. Sorting on the computed similarity is the same ordering and a sequential scan.
-- **`embedding IS NOT NULL` in the `WHERE`.** The column is nullable; `PutSpans` always writes one, so this is for a row written by something else — and the consequence without it is not a bad ranking, it is a scan error, because the similarity of a NULL is NULL and the destination is a `float64`.
+- **`ORDER BY embedding <=> $2::vector` with a `LIMIT`, not `ORDER BY score DESC`.** Only the first form can use `spans_embedding_idx`. Sorting on the computed similarity is the same ordering by a route the ANN index cannot serve — measured, it reaches that index under no planner settings at all, while the shipped form reaches it once the alternatives are priced out. (Corrected: this bullet said "a sequential scan", which is more specific than what was observed; with `enable_seqscan` off the mutant plans a `spans_path_idx` scan plus a `Sort`. The claim that survives measurement is *no ANN path*, not *a seq scan*.) See M8.
+- **`embedding IS NOT NULL` in the `WHERE`.** The column is nullable; `PutSpans` always writes one, so this is for a row written by something else — and the consequence without it is not a bad ranking, it is a scan error, because the similarity of a NULL is NULL and it is scanned into a non-pointer `float64` local. (Corrected: that local is on the way to `models.Cite.Score`, which is a `float32`. The mechanism is the scan, not the field.)
 - **`SpanEmbedder` returns the repo's own `embed_model`/`embed_dim` and refuses a repo carrying two.** `PutSpans` replaces a repo's spans wholesale so a repo is single-model by construction; this reads what is there rather than trusting that, because the failure it prevents is a query and a corpus in different vector spaces, which produces confident nonsense and nothing about the query looks wrong (spec §3 says this about widths; it is equally true of models).
 - **No `kind` filter and no `kind` weighting.** `kind=file` does not say which arm produced a row (P2), so any heuristic over it is a heuristic over a label that means two different things.
 
@@ -574,15 +590,20 @@ With `e0` and `e1` the first two basis vectors of the 768-wide space, query `q =
 
 All three differ, so one fixture kills all three operator mutations. Insert in the order `C, D, B, A` so physical order is the reverse of the answer, and give the spans paths whose alphabetical order is also not the answer.
 
+**Corrected: it is the path disagreement that earns its keep, not the insertion-order one.** With the `ORDER BY` deleted the rows did not come back in insertion order at all — Postgres served them from `spans_path_idx` and returned `[D C B A]`, which is `alpha, beta, mu, zeta`. So "the best answer is inserted last" is not what kills M5; "the expected order is not path order" is. Both properties are asserted in the test rather than assumed, because either one silently ceasing to hold turns a kill into a coincidence.
+
+**Corrected during implementation — the skeleton below said `package store_test`.** Every live suite already in this package is `package store`, and both the NULL-embedding fixture and the two-model fixture reach `s.pool` for direct `INSERT`s that `PutSpans` cannot produce. An external test package cannot compile either of them.
+
 ```go
 //go:build live
 
-package store_test
+package store
 
 // TestVectorSearchRanksByCosineAndNotByDistance seeds the table above, plus a
-// second repo whose span is an exact copy of the query vector — a better match
-// than anything in the target repo, so a missing repo filter shows up as that
-// span appearing rather than as a subtly different order.
+// second repo whose span is an exact copy of the query vector, so a missing
+// repo filter shows up as that span appearing rather than as a subtly
+// different order. Corrected: an exact copy *ties* A at cosine 1.0 rather
+// than outranking it — see M4.
 func TestVectorSearchRanksByCosineAndNotByDistance(t *testing.T) { /* … */ }
 
 // The score in the response is a similarity: 1 for the parallel vector, 0 for
@@ -590,8 +611,16 @@ func TestVectorSearchRanksByCosineAndNotByDistance(t *testing.T) { /* … */ }
 // descending" holds for the distance too.
 func TestVectorSearchScoresAreCosineSimilarity(t *testing.T) { /* … */ }
 
+// Corrected: this one seeds a target set with no A in it. A is parallel to
+// the query too, so the other repo's copy ties it at distance 0 and the tie
+// resolves either way — measured, [A OTHER]. See M4.
 func TestVectorSearchIsScopedToOneRepo(t *testing.T)      { /* … */ }
 func TestVectorSearchRespectsTheLimit(t *testing.T)        { /* … */ }
+
+// Added during implementation. The DoD's "index-using" claim had no test in
+// this list, and no ranking, score, scope or limit test can see it: ORDER BY
+// score DESC returns the same rows in the same order. See M8.
+func TestVectorSearchOrderByCanUseTheAnnIndexLive(t *testing.T) { /* … */ }
 
 // A span with a NULL embedding is skipped rather than scanned into a float64.
 // Written with a direct INSERT: PutSpans cannot produce one, which is exactly
@@ -656,31 +685,39 @@ func (s *Store) VectorSearch(ctx context.Context, repoID string, q []float32, li
 
 **M4 — drop `WHERE repo_id = $1`.**
 - *Why the code exists:* retrieval is per repository; the corpus holds up to `KEEP_REPOS` of them.
-- *Fixture that separates mutant from original:* the second repo's span is an *exact copy of the query vector*, so it outranks everything in the target repo and appears at position 1. A second repo whose spans are poorer matches would leave the target repo's order intact and the test would pass.
+- *Fixture that separates mutant from original:* the second repo's span is an *exact copy of the query vector*, so it beats every target-repo span it does not tie. A second repo whose spans are poorer matches would leave the target repo's order intact and the test would pass.
+- **Corrected — the fixture as prescribed could not deliver that message.** An exact copy of `q` does not outrank `A`: `A` is `10·e0` and the copy is `e0`, so both sit at cosine 1.0 and distance 0, and the tie resolves arbitrarily. Measured, it resolved `[A OTHER]` — the other repo's span at rank 2, in a test whose message names rank 1. Fixed in code by giving the scope test a target set of `C, D, B` with no `A` in it, so the copy is strictly the best row in the table and its rank is not a coin flip. The ranking test keeps the full four-span set, where the tie is harmless.
 - *Must fail:* `TestVectorSearchIsScopedToOneRepo`
-- *Expected (verify and correct):* `span from repo other-repo appeared at rank 1`
+- *Expected (verify and correct):* the shipped assertion is `span %s from repo %s appeared at rank %d; the whole result was %v`, and with the target set corrected the mutant puts `OTHER` at rank 1 unambiguously (1.0 against `B`'s 0.995). Paste the run's own line; the failing rank is what the prediction got wrong before, so it is the part to read.
 - *Compiles and vets:* **check this one.** Dropping the clause leaves `$1` unbound, which is a pgx protocol error, not a ranking change — P1 scored two void kills exactly this way. Apply it as `WHERE repo_id = $1 OR TRUE` instead, which keeps every parameter bound.
 
 **M5 — drop the `ORDER BY` (keep the `LIMIT`).**
 - *Why the code exists:* it is the ranking, and it is the clause that uses the ANN index.
-- *Fixture that separates mutant from original:* the insertion order `C, D, B, A` is the reverse of the expected answer, so rows returned in physical order fail immediately. A fixture inserted best-first would pass under this mutant.
+- *Fixture that separates mutant from original:* **corrected — not the property this block credited.** The prediction was that rows come back in physical order, i.e. insertion order `C, D, B, A`. Observed `[D C B A]`: with no `ORDER BY` the planner served the rows from `spans_path_idx`, so what came back was *path* order — `alpha.go, beta.go, mu.go, zeta.go` — which is `D, C, B, A`. The fixture kills M5 because its expected order disagrees with **path** order; the insertion-order disagreement contributed nothing. A fixture whose expected answer happened to be alphabetical by path would have passed under this mutant however it was inserted.
 - *Must fail:* `TestVectorSearchRanksByCosineAndNotByDistance`
-- *Expected (verify and correct):* `ranked [C D B A], want [A B D C]` — physical order is not guaranteed by Postgres, so record what actually came back; any order other than the expected one is the kill.
+- *Expected (verify and correct):* `ranked [D C B A], want [A B D C] (L2 would give [B C D A], inner product [A D B C], physical order [C D B A])`. Neither order is guaranteed by Postgres, which is the reason both disagreements are asserted in the test body rather than trusted.
 - *Compiles and vets:* yes.
 
 **M6 — drop `AND embedding IS NOT NULL`.**
-- *Why the code exists:* a NULL similarity cannot be scanned into a `float64`.
+- *Why the code exists:* a NULL similarity has no destination in the scan. **Corrected: this block said the destination is a `float64`, which reads as the field the score lands in.** `models.Cite.Score` is a `float32`; the scan goes through a non-pointer `float64` local and is converted. The mechanism is right — a NULL cannot be scanned into either — but the type named was neither the field nor a claim about it.
 - *Fixture that separates mutant from original:* the directly-inserted NULL-embedding row in `TestSpansWithNoEmbeddingAreNotRetrieved`. No corpus written by `PutSpans` contains one.
 - *Must fail:* `TestSpansWithNoEmbeddingAreNotRetrieved`
-- *Expected (verify and correct):* a scan error naming a NULL destination. **If the failure is a `t.Fatal(err)` rather than the test's own assertion, that is an incident, not a kill** (rule 7): rewrite the test to assert `err != nil` *and* that the error is not a bare scan panic, or to assert on the returned ids with the row present. Record which shape you ended up with.
+- *Expected (verify and correct):* a scan error naming a NULL destination. **If the failure is a `t.Fatal(err)` rather than the test's own assertion, that is an incident, not a kill** (rule 7): rewrite the test to assert `err != nil` *and* that the error is not a bare scan panic, or to assert on the returned ids with the row present. Record which shape you ended up with. **Shipped shape:** the test asserts the *positive* claim — the call succeeds with the NULL row present (`a repo holding one NULL embedding made VectorSearch fail: %v`) and returns exactly `[A]` — so under M6 the failure is the test's own assertion about the error it did not expect, not a panic on the way to one.
 - *Compiles and vets:* yes.
 
-**M7 — `SpanEmbedder` returns the first row instead of refusing two.**
+**M7 — `SpanEmbedder` returns a row instead of refusing two** (corrected: "the first row" is not what the natural mutant does).
 - *Why the code exists:* a query and a corpus in different vector spaces rank nonsense confidently.
 - *Fixture that separates mutant from original:* the two-model repo, built with direct INSERTs. `PutSpans` cannot produce one.
 - *Must fail:* `TestSpanEmbedderRefusesARepoWithTwoModels`
-- *Expected (verify and correct):* `got model "a-model", want ErrMixedEmbedders`
+- *Expected (verify and correct):* **corrected — the predicted message was wrong twice over.** The mutation is deleting the `n > 1` guard, and the loop scans every row into the same `model`/`dim` variables, so what survives is the **last** row `DISTINCT` yields, not the first. And there is no `a-model` anywhere: the fixture's two models are `fake-768` (written by `PutSpans`) and `another-model-768` (the direct INSERT). The assertion's shape is `got model %q dim %d err %v, want ErrMixedEmbedders`; paste the run's line, since which of the two names appears is `DISTINCT`'s order and not a property to predict.
 - *Compiles and vets:* yes.
+
+**M8 — `ORDER BY embedding <=> $2::vector` → `ORDER BY score DESC`** (added: the DoD claimed "index-using" and this task prescribed no test for it).
+- *Why the code exists:* only the distance form can use `spans_embedding_idx`. Sorting on the returned similarity is the *same ordering* by a different route.
+- *Fixture that separates mutant from original:* **none of them, and that is the finding.** This mutant returns the same rows in the same order, with the same scores, scoped and limited identically, so every ranking, score, scope and limit test above passes. The only instrument that can see it is `EXPLAIN`.
+- *Must fail:* `TestVectorSearchOrderByCanUseTheAnnIndexLive`
+- *Expected (verify and correct):* observed — the shipped statement reaches `spans_embedding_idx` once `enable_seqscan`, `enable_bitmapscan` and `enable_sort` are priced out; the `ORDER BY score DESC` rewrite reaches it under no settings at all. **With every planner knob left alone, and even with `enable_seqscan=off`, the plan on this five-row per-repo fixture is `spans_path_idx` plus a `Sort` for both forms** — five rows are cheaper to sort than to walk a graph for. So what this test can assert at fixture size is that an index path *exists*, not that it is chosen, and it asserts the counterfactual alongside it so the claim is a comparison rather than a hope. The test `EXPLAIN`s the shipped `vectorSearchSQL` constant, not a transcription of it (`a790956`): a copy is a test of the test.
+- *Compiles and vets:* yes — `score` is a select-list alias and is orderable.
 
 - [ ] **Step 5: Commit**
 
@@ -707,11 +744,12 @@ answer."
 ```
 
 **Definition of Done**
-- Cosine ranking, scoped to one repo, limited, index-using, with a similarity in the response.
-- The fixture distinguishes cosine from both L2 and inner product, and its expected order disagrees with insertion order, path order and id order.
+- Cosine ranking, scoped to one repo, limited, with a similarity in the response.
+- **The `ORDER BY` is a form the ANN index can serve, asserted by `EXPLAIN` against the shipped statement and against the counterfactual** — corrected: the original wording was "index-using", which no test in this task's list could check and which is in any case weaker than it sounds. On a per-repo fixture the planner picks `spans_path_idx` plus a `Sort` whatever the `ORDER BY` says, so "an index path exists" is the honest claim and "the index is used" is not one this suite can make.
+- The fixture distinguishes cosine from both L2 and inner product, and its expected order disagrees with insertion order, path order and id order — **both disagreements asserted, not assumed**, since M5 turned out to be killed by the path one.
 - A NULL embedding cannot reach a scan.
 - A repo carrying two embedders is refused rather than silently half-searched.
-- M1–M7 recorded with observed output; M4's rewrite (to keep every parameter bound) recorded.
+- M1–M8 recorded with observed output; M4's rewrite (to keep every parameter bound) recorded, and M4's fixture correction (the second repo's copy of `q` ties `A` rather than beating it) recorded with it.
 
 ---
 
@@ -730,7 +768,7 @@ Spec §8: "a lexical arm over symbol names and identifiers". Postgres full-text 
 
 **Decisions, with their reasoning:**
 
-- **A `STORED GENERATED` column plus a GIN index, not an on-the-fly `to_tsvector`.** Computing the vector per query is a sequential scan over the repo's spans and re-tokenises text that never changes. The two-argument `to_tsvector(regconfig, text)` is immutable — the one-argument form is only stable, because it reads `default_text_search_config` — so the generated column is legal only with the configuration named explicitly. **Verify that against the pinned image before writing the migration** (step 1); if it is rejected, the fallback is an expression index and the query must then repeat the expression verbatim.
+- **A `STORED GENERATED` column plus a GIN index, not an expression index.** **The reason first given here was false and is corrected rather than deleted, because it is the argument a later reader would otherwise inherit:** the claim was that computing the vector per query means a sequential scan. It does not. Measured over 5,000 rows on the pinned image, an expression index whose expression the query repeats **verbatim** plans as a **Bitmap Index Scan** — an expression index is a working index, not a scan. What it actually costs is **drift**: change one `setweight` letter in the query and the same statement plans as a **Seq Scan**, with no error and no warning, only a slower answer. Every call site has to reproduce a two-`setweight` expression character for character forever, and nothing checks that they do. The second cost is that `ts_rank_cd` then recomputes the vector for every row it ranks. A column named `lex` cannot drift from itself, and `lex @@ q` cannot be spelled wrongly. The two-argument `to_tsvector(regconfig, text)` is immutable — the one-argument form is only stable, because it reads `default_text_search_config` — so a generated column has to name the configuration explicitly in any case. **Verify the column is accepted at all against the pinned image before writing the migration** (step 1).
 - **The `simple` configuration, not `english`.** `english` stems and drops stopwords: `Files` and `filing` collapse together, and `Get`, `New`, `Do` are near-stopwords in Go. Code is not English, and a stemmer is a lossy rename of every identifier in the corpus.
 - **`symbol` at weight A and `text` at weight B.** The spec asks for symbol names *and* identifiers; a span's identifiers are its text's tokens, so indexing the text is how identifiers get indexed at all. It also indexes comment prose, which is deliberate: in production, doc comments are the best signal a span has (spec §5), and in the eval corpus they are blanked, so the arm behaves the same way in both.
 - **Deviation, recorded rather than hidden:** the arm therefore indexes keywords and string literals too, not only identifiers. Narrowing it to identifiers means extracting them from the AST at index time, which is a new column, an indexer change and a full re-index. That is a P7 change, listed in Open Questions.
@@ -754,6 +792,20 @@ CREATE TEMP TABLE t (a text, b text,
 
 The tokeniser in `rag.Terms` must produce terms the index actually contains. Two things this measurement settles and this plan deliberately does not guess: whether `parse_config` is one token or two, and whether `x.y` is one. Write `Terms` against the observed answer, and record it in `terms.go`'s comment.
 
+**Settled, against `pgvector/pgvector:pg17` (PostgreSQL 17.10):**
+
+```
+parseConfig            -> 'parseconfig'          camel case is NOT split
+parse_config           -> 'parse' 'config'       TWO tokens; _ is a blank
+HTTPServer, httpServer -> 'httpserver'
+v2                     -> 'v2'                   numword, not a split
+x.y                    -> 'x.y'                  ONE token; the dot binds (alias file)
+s.pool.Query(ctx)      -> 's.pool.query' 'ctx'   alias host
+Store.Get              -> 'store.get'            ONE token — see the A-weight correction below
+```
+
+Both open questions answered, and the second is the one that mattered: because the dot binds, a term built from letters and digits can never match a dotted token, so `Terms` cannot reach `x.y` or `Store.Get` except through their parts. `Terms` keeps the whole run *and* — with splitting on — its camel-case parts; splitting on the underscore is not a choice, since the index already holds those halves apart.
+
 - [ ] **Step 2: Write the failing tests**
 
 `terms_test.go` is hermetic. The table is written *after* step 1 and reflects what Postgres actually does:
@@ -773,20 +825,36 @@ func TestTermsWithSplittingOffKeepsOnlyWholeIdentifiers(t *testing.T)
 
 | span | symbol | text contains | why it is there |
 | --- | --- | --- | --- |
-| `S` | `parseConfig` | nothing matching | the A-weight case: symbol only |
-| `T` | `` (empty) | `parseConfig` once, in 400 tokens | the B-weight case: body only |
-| `U` | `` (empty) | "parse the config file", no `parseConfig` | only reachable via the split terms |
+| `S` (`c_symbol.go`) | `parseConfig` | nothing matching | the A-weight case: symbol only |
+| `T` (`a_body.go`) | `` (empty) | `parseConfig` **twice**, in ~200 tokens | the B-weight case: body only |
+| `U` (`d_prose.go`) | `` (empty) | "parse the config file", no `parseConfig` | only reachable via the split terms |
+| `M` (`e_method.go`) | `Store.Get` | neither word | added: the dotted symbol, see M8 |
+| `Y` (`y_cover.go`) | `` (empty) | `alpha beta` once each | added: the ranking function, see M6 |
+| `X` (`x_repeat.go`) | `` (empty) | `alpha` six times | added: the ranking function, see M6 |
 | `V` (other repo) | `parseConfig` | `parseConfig` ten times | outranks everything if the repo filter is missing |
+
+**Corrected — `T` at one occurrence cannot discriminate as this fixture claimed.** With the symbol appearing once in a long body, the weighted ranking gives `S` 1.0 against `T`'s 0.4 and the unweighted one gives **0.1 against 0.1** — a tie, which `ORDER BY score DESC, path, start_line, id` then breaks by path. `a_body.go` sorts before `c_symbol.go`, so M2 "fails" the test whether or not the weights do anything: a phantom kill of exactly P1's kind. Measured at each count:
+
+| occurrences of `parseConfig` in `T` | weighted (`S` vs `T`) | unweighted (`S` vs `T`) |
+| --- | --- | --- |
+| 1 | 1.0 vs 0.4 | 0.1 vs 0.1 — **tie, broken by path** |
+| 2 | 1.0 vs 0.8 | 0.1 vs 0.2 — a real flip |
+| 3 | 1.2 vs 1.0 | the body wins **even with the weights on** |
+
+So the count is two, and it is measured rather than chosen: it is the only value at which dropping the weights changes the order *on the score*.
 
 ```go
 func TestLexicalSearchFindsASpanBySymbol(t *testing.T)
 func TestSymbolOutweighsBody(t *testing.T)          // expects S above T
 func TestSplitTermsReachProseThatNamesThePartsSeparately(t *testing.T) // expects U present
+func TestAMethodSymbolIsReachableByItsParts(t *testing.T)              // added: expects M present
 func TestLexicalSearchIsScopedToOneRepo(t *testing.T)                  // expects V absent
+func TestRepetitionOutranksCoverageUnderTheShippedRankingFunction(t *testing.T) // added: X above Y
 func TestNoUsableTermsReturnsNothingRatherThanErroring(t *testing.T)   // terms == nil
+func TestAQuestionWithPunctuationIsNotASyntaxError(t *testing.T)       // added by M1
 ```
 
-`TestSymbolOutweighsBody` is the one that can pass vacuously: assert the returned slice is non-empty *and* that `S` precedes `T` by index, not that `S` is "in" the results.
+`TestSymbolOutweighsBody` is the one that can pass vacuously: assert the returned slice is non-empty *and* that `S` precedes `T` by index, not that `S` is "in" the results. Run it with splitting **off**, so the only term is the whole identifier and the two spans differ in nothing but which column carries it.
 
 - [ ] **Step 3: Implement**
 
@@ -803,13 +871,32 @@ func TestNoUsableTermsReturnsNothingRatherThanErroring(t *testing.T)   // terms 
 -- symbol at weight A, text at weight B. A span's identifiers are its text's
 -- tokens, so indexing the text is how "identifiers" get indexed at all; the
 -- weight is what keeps a definition above a mention.
+--
+-- The dots in a method's symbol become spaces first. Measured: to_tsvector(
+-- 'simple', 'Store.Get') is the single token 'store.get' — the parser calls it
+-- a host — which no query term built from letters and digits can match.
 ALTER TABLE spans ADD COLUMN IF NOT EXISTS lex tsvector
     GENERATED ALWAYS AS (
-        setweight(to_tsvector('simple', symbol), 'A') ||
+        setweight(to_tsvector('simple', replace(symbol, '.', ' ')), 'A') ||
         setweight(to_tsvector('simple', text), 'B')
     ) STORED;
+
+-- Plain, not CONCURRENTLY: migrate() runs the whole ledger inside one
+-- transaction holding pg_advisory_xact_lock, and CREATE INDEX CONCURRENTLY
+-- cannot run in a transaction block.
 CREATE INDEX IF NOT EXISTS spans_lex_idx ON spans USING gin (lex);
 ```
+
+**Corrected — the SQL first prescribed here leaves the A weight dead for every method in the corpus.** `chunk.classify` writes a method's symbol as `Store.Get`, and `to_tsvector('simple', 'Store.Get')` is the single token `'store.get'`, so:
+
+```
+to_tsquery('simple','store | get') @@ to_tsvector('simple','Store.Get')                     -> f
+to_tsquery('simple','store | get') @@ to_tsvector('simple', replace('Store.Get','.',' '))   -> t
+```
+
+`rag.Terms` builds terms from letters and digits only — that is what makes them safe to join with `|` — so no term it can produce ever matches `'store.get'`. The whole A weight, the thing this arm's `setweight` exists for, was unreachable for every method. `replace(symbol, '.', ' ')` is the fix and it is applied only to `symbol`: in `text` the same rule is what holds `3.14` and `http://a.b` together, and breaking those is a cost with no matching benefit.
+
+**No test in this task's own list detects that.** `S`/`c_symbol.go` uses a plain function symbol; the mutation that is *literally the SQL this plan prescribed* survives `TestLexicalSearchFindsASpanBySymbol`, `TestSymbolOutweighsBody` and every other test above. `TestAMethodSymbolIsReachableByItsParts` was added for it, with a fixture span whose symbol is `Store.Get` and whose text contains neither word — see M8.
 
 `lexical.go`:
 
@@ -835,9 +922,9 @@ Go side: `strings.Join(terms, " | ")` — terms come from `rag.Terms`, whose cha
 
 **M2 — drop both `setweight` calls.**
 - *Why the code exists:* a symbol match is a definition; a body match is a mention.
-- *Fixture that separates mutant from original:* `S` (symbol only) versus `T` (one occurrence in a long body). Without weights, `ts_rank_cd` ranks on frequency and length, and `T` is expected to rise. **A fixture whose symbol also appears in its own text — which is every real span — cannot separate these**, because both documents then carry both weights.
+- *Fixture that separates mutant from original:* `S` (symbol only) versus `T` (**two** occurrences in a long body — corrected; at one it is 0.1 against 0.1 unweighted and the "kill" is a path tie-break the weights had nothing to do with, and at three the body wins even weighted). Without weights `ts_rank_cd` ranks on frequency, and at two occurrences `T` rises past `S` on the score itself: 0.1 against 0.2. **A fixture whose symbol also appears in its own text — which is every real span — cannot separate these**, because both documents then carry both weights.
 - *Must fail:* `TestSymbolOutweighsBody`
-- *Expected (verify and correct):* `parseConfig ranked [T S], want S first`
+- *Expected (verify and correct):* `parseConfig ranked [a_body.go c_symbol.go], want c_symbol.go before a_body.go` — splitting is off, so those are the only two spans the term reaches. The assertion compares the two indices; paste the ranked slice the run prints.
 - *Compiles and vets:* yes.
 
 **M3 — drop `WHERE repo_id = $1` (as `OR TRUE`, to keep `$1` bound — see Task 2 M4).**
@@ -862,17 +949,32 @@ Go side: `strings.Join(terms, " | ")` — terms come from `rag.Terms`, whose cha
 - *Compiles and vets:* yes.
 
 **M6 — `ts_rank_cd` → `ts_rank`.**
-- *Why the code exists:* cover density prefers a span where the query's terms appear close together, which for code is a span that is *about* the thing rather than one that mentions it in passing.
-- *Fixture that separates mutant from original:* a two-term query and two spans in which the terms are adjacent versus 300 tokens apart. **The current fixture cannot** — with single-term queries the two functions frequently tie. Either add that fixture and predict a kill, or record this mutation as a **deliberate survivor** and say the choice of ranking function is unpinned by any test. Do not record a kill without the fixture.
-- *Must fail:* `TestCoverDensityPrefersTermsThatAppearTogether`, if written.
-- *Expected (verify and correct):* record the observed outcome either way.
+- *Why the code exists:* **corrected — the stated reason was wrong, and so was the fixture built from it.** The reason given was cover density: that `ts_rank_cd` prefers a span whose query terms appear close together. **Cover density never runs under `OR`, which is the only query shape this arm builds.** Measured: two spans with the same two terms adjacent and 300 tokens apart score **identically** — 0.8 under `ts_rank_cd`, 0.2431708 under `ts_rank`. The prescribed fixture below could not have separated the two functions, and a kill recorded against it would have been a kill against nothing. What actually separates them is **frequency**: `ts_rank_cd` sums a term's weight per occurrence while `ts_rank` saturates and rewards matching *distinct* terms. Measured on `alpha beta`: six mentions of `alpha` alone score 2.4 under `ts_rank_cd` and 0.1813 under `ts_rank`, against 0.8 and 0.2432 for one mention each of the two terms. So the two functions rank that pair in opposite orders, and *that* is the discriminating fixture.
+- *Fixture that separates mutant from original:* ~~a two-term query and two spans in which the terms are adjacent versus 300 tokens apart~~ — that fixture ties under both functions and must not be used. Use `X` (`alpha` six times) against `Y` (`alpha beta` once each), queried with `alpha beta`: `ts_rank_cd` ranks `[X Y]`, `ts_rank` ranks `[Y X]`.
+- *Must fail:* `TestRepetitionOutranksCoverageUnderTheShippedRankingFunction`
+- *Expected (verify and correct):* `alpha beta ranked [y_cover.go x_repeat.go], want [x_repeat.go y_cover.go]`.
 - *Compiles and vets:* yes.
+- *What this pins and what it does not:* which function ships, so swapping it is a visible change rather than a silent one. Not that it is the better one — that is unmeasured against any corpus and is spec:316's experiment. The test is named for the consequence rather than for the function, so a reader meets the tradeoff before they meet the choice. See Open question 15.
 
 **M7 — the generated column drops `symbol` (index `text` only).**
 - *Why the code exists:* spec §8 says the arm is over symbol names.
 - *Fixture that separates mutant from original:* `S`, whose symbol carries the term and whose text does not.
 - *Must fail:* `TestLexicalSearchFindsASpanBySymbol`
-- *Expected (verify and correct):* `S was not retrieved`. **Applying this mutation requires re-running the migration on a fresh database** — the generated column is materialised, so editing the SQL without recreating the table changes nothing. The live suites create their own database per run (`testdb.Scratch`), so this happens automatically; confirm it rather than assuming it, because a mutation that silently tests the old column is a phantom kill of exactly P1's kind.
+- *Expected (verify and correct):* `S was not retrieved`. **Applying this mutation requires re-running the migration on a fresh database** — the generated column is materialised, so editing the SQL without recreating the table changes nothing. The live suites create their own database per run (`testdb.Scratch`), so this happens automatically; confirm it rather than assuming it, because a mutation that silently tests the old column is a phantom kill of exactly P1's kind. **Recorded:** M7 also left the migration re-application test green while that test's own message claimed "the backfilled row does not match its own symbol" — the assertion did not depend on the symbol half of the expression at all. It now asserts `store & get` against a row whose text carries neither word, which only the symbol half can satisfy, and it fails on both runs under M7.
+
+**M8 — the generated column drops `replace(symbol, '.', ' ')`** (added: the mutation that is *literally the SQL this plan prescribed*, see the correction under Step 3).
+- *Why the code exists:* a method's symbol is `Store.Get`, which `to_tsvector` reads as the single token `'store.get'`; no term `rag.Terms` can build ever matches it, so without the `replace` the A weight is dead for every method in the corpus.
+- *Fixture that separates mutant from original:* `M` (`e_method.go`), symbol `Store.Get`, whose text contains neither `store` nor `get`. **`S` cannot** — its symbol is an undotted function name and it matches either way, which is why every test in this task's original list survives this mutant.
+- *Must fail:* `TestAMethodSymbolIsReachableByItsParts`
+- *Expected (verify and correct):* `e_method.go was not retrieved for "Store.Get": got []`.
+- *Compiles and vets:* yes. As with M7, applying it needs a fresh database, since the column is materialised.
+
+**M9 — drop the `ORDER BY score DESC, path, start_line, id`** (added: this task prescribed no mutation of its own ordering).
+- *Why the code exists:* it is the ranking, and the tie-break after it is what makes two runs over an unchanged corpus diffable.
+- *Fixture that separates mutant from original:* **not the one that looks like it.** `TestRepetitionOutranksCoverageUnderTheShippedRankingFunction` does not detect this mutant, and two attempts to make it did not work. Its two spans were first inserted in the order it expects them back — one coincidence, removed by inserting `y_cover.go` first — and that was not enough: measured, with the `ORDER BY` deleted the pair still comes back `[x_repeat, y_cover]` **whichever order they were inserted in**. An unordered result is not an insertion-ordered one, and a fixture built on the assumption that it is proves nothing. Recorded in the fixture as a fact rather than claimed fixed. What kills M9 is `TestSymbolOutweighsBody`, whose `c_symbol.go` goes in last for that reason.
+- *Must fail:* `TestSymbolOutweighsBody`
+- *Expected (verify and correct):* the same `want c_symbol.go before a_body.go` failure as M2, reached by a different route.
+- *Compiles and vets:* yes.
 
 - [ ] **Step 5: Commit**
 
@@ -904,9 +1006,9 @@ Tokeniser measured against pgvector/pgvector:pg17, output below:
 
 **Definition of Done**
 - The migration applies to a fresh database and to one that already holds spans.
-- The arm finds a span by symbol, ranks a symbol match above a body mention, is scoped to one repo, and cannot be made to error by punctuation.
-- The tokeniser's behaviour was measured against the pinned image before it was written, and the measurement is in the commit.
-- M1–M7 recorded, including M6's survivor status if its fixture was not written.
+- The arm finds a span by symbol — **including a method's dotted symbol, which the SQL first prescribed here could not reach** — ranks a symbol match above a body mention, is scoped to one repo, and cannot be made to error by punctuation.
+- The tokeniser's behaviour was measured against the pinned image before it was written, the measurement is in the commit, and both questions Step 1 posed are answered in this document.
+- M1–M9 recorded. M6 is a kill, on a **different fixture and for a different reason** than this plan first gave; the generated column's rationale and the A/B weight fixture were both corrected against measurement rather than argued.
 
 ---
 
@@ -1236,9 +1338,9 @@ hash(key, commit) and only the indexer ever saw the commit."
   - `type Searcher interface { VectorSearch(...); LexicalSearch(...); SpanEmbedder(...) }`
   - `type Retriever struct { Store Searcher; Emb embed.Embedder; Mode Mode; K, Candidates int; Split bool; Floor Floor }`
   - `func (r *Retriever) Search(ctx context.Context, repoID, q string, limit int) (Result, error)`
-  - `type Result struct { Hits []Fused; Spans map[string]models.Cite; TopScore float64; VectorRan bool; Mode Mode }`
+  - `type Result struct { Hits []Fused; Spans map[string]models.Span; TopScore float64; VectorRan bool; Mode Mode }` — **`models.Span`, not `models.Cite`**: a Cite carries whichever arm's score was on the row, and a reader could not tell a cosine similarity from a `ts_rank_cd`. Every score that means something is on the `Fused` hit, which says which arm it came from, and `rag.NewCitation` takes a `models.Span` anyway.
   - `var ErrModelMismatch = errors.New("rag: repo was indexed by another embedder")`
-  - `func embed.FromEnv(ctx context.Context, defaultDim int, timeout time.Duration) (Embedder, error)`
+  - `func embed.FromEnv(ctx context.Context, schemaDim int, checkDim func(int) error, timeout time.Duration) (Embedder, error)` — **four arguments, not three.** With the width read inside `FromEnv` and `store.CheckDim` run by the caller afterwards, a wrong `EMBED_DIM` under `EMBED_PROVIDER=ollama` spends a probe first and the message then blames `EMBED_MODEL` for the answer's width. Passing the check in keeps it before the round trip, keeps `store` (and pgx) out of `embed`, and keeps the indexer's existing kill — `errors.Is(err, store.ErrDimMismatch)` — valid.
   - metrics: `ObserveRetrieval(mode string, d time.Duration)`, `ObserveTopScore(float64)`, `CountAnswer(outcome string)`, `CountRefusal(reason string)`, `SetFloor(value float64, calibrated bool)`
 
 **Decisions, with their reasoning:**
@@ -1246,12 +1348,12 @@ hash(key, commit) and only the indexer ever saw the commit."
 - **The gateway needs an embedder, and that is new.** Retrieval embeds the *query*, so `EMBED_PROVIDER`, `EMBED_MODEL`, `EMBED_DIM` and `OLLAMA_URL` become gateway configuration. `newEmbedder` currently lives in `apps/indexer/cmd`, package `main`, and cannot be imported; it moves to `embed.FromEnv` so both binaries validate the same knobs the same way. `FromEnv` takes the width as an argument rather than importing `store`, so `embed` does not acquire a dependency on pgx; the caller still runs `store.CheckDim`.
 - **The gateway refuses to boot on a bad embedder, exactly as the indexer does.** The cost is real and stated: with `EMBED_PROVIDER=ollama` and Ollama down, submission and job polling go down with retrieval. Parity is chosen over a partial-service state machine because the alternative — booting into a degraded mode — is the "silent downgrade" §8 calls the failure that costs a week, and there are no states in this codebase for it yet. Listed in Open Questions with the alternative.
 - **The model guard is an error, not a refusal.** A repo indexed by another embedder is a *misconfiguration*: the corpus and the query are in different vector spaces, and every score is meaningless rather than low. Refusing would file it under "we had nothing to say", which is exactly the confusion §10 forbids in the other direction.
-- **Candidate depth is per arm and separate from the returned limit.** RRF needs depth to have anything to fuse: fusing two lists of 10 is mostly an intersection test. `RETRIEVAL_CANDIDATES` defaults to **40**, which is also pgvector's default `hnsw.ef_search` — asking the ANN index for more rows than `ef_search` degrades recall silently. **Verify `SHOW hnsw.ef_search` against the pinned image**; if the default differs, either match it or `SET LOCAL hnsw.ef_search` in the same transaction, and record which.
+- **Candidate depth is per arm and separate from the returned limit.** RRF needs depth to have anything to fuse: fusing two lists of 10 is mostly an intersection test. `RETRIEVAL_CANDIDATES` defaults to **40**, which is also pgvector's default `hnsw.ef_search` — asking the ANN index for more rows than `ef_search` degrades recall silently. **Verified against the pinned image** (pgvector 0.8.6 on Postgres 17): `SELECT boot_val FROM pg_settings WHERE name = 'hnsw.ef_search'` is **40**, so the default matches and no `SET LOCAL` is needed. Two notes from the same reading: the GUC is not registered until the extension's module is loaded into the session, so `SHOW hnsw.ef_search` on a fresh connection answers `unrecognized configuration parameter` until something touches a vector; and `hnsw.iterative_scan` is `off` by default, so nothing compensates for asking beyond `ef_search`.
 - **Timing is measured in the retriever, outcome is counted in the handler.** The retriever owns the two arms and is the only thing that knows what "retrieval latency" covers; the handler owns the response and is the only thing that knows whether the request ended as an answer, a refusal or an error. Splitting them is what stops a single call site double-counting.
 - **`codetrail_retrieval_top_score` is a histogram over `[0,1]`, and it is P3's contribution to P6.** It is the production instrument, not the calibration: §9 calibrates the floor from *the eval's* distribution over a generated golden set, where a hit is labelled correct. A Prometheus histogram has no labels for correctness and cannot distinguish a confident wrong answer from a confident right one. Say that in the metric's `Help` string, so nobody calibrates from Grafana.
 - **Every metric label is a closed set** (`metrics` package doc): `mode` ∈ 3, `outcome` ∈ 3, `reason` ∈ 3. No repo id, no path, no question.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `retrieve_test.go` is hermetic, against a fake `Searcher` and `embed.Fake`. The fake searcher is what makes arm behaviour controllable — an end-to-end test cannot separate the arms (rule 5).
 
@@ -1291,7 +1393,7 @@ func TestTheFloorGaugeIsSetFromTheConfiguredValue(t *testing.T)
 func TestTheDefaultRetrieverIsHybridAtTheUncalibratedFloor(t *testing.T)
 ```
 
-- [ ] **Step 2: Implement**
+- [x] **Step 2: Implement**
 
 `Search`: validate `limit`; `SpanEmbedder(repoID)` and compare against `r.Emb.Model()`; embed the query once (skipped entirely in lexical mode — an unnecessary model call on every lexical query is the sort of thing that only shows up in a bill); run the arms; `Fuse(r.K, vec, lex)`; trim to `limit`; record `TopScore` from the vector arm's first hit (`NaN` when it did not run).
 
@@ -1310,59 +1412,162 @@ topScore = promauto.NewHistogram(prometheus.HistogramOpts{
 })
 ```
 
-- [ ] **Step 3: Commit, then prove the tests discriminate**
+- [x] **Step 3: Commit, then prove the tests discriminate**
 
-**M1 — `Mode` ignored: always run both arms.**
+**M1 — `Mode` ignored: always run both arms** (both arm guards replaced by `true`).
 - *Why the code exists:* the mode is the switch that makes spec:316's experiment runnable without a code change.
 - *Fixture that separates mutant from original:* the call-recording fake `Searcher`. **A fixture that asserts on results cannot** — under `embed.Fake` both arms return nearly the same spans, so "the results look right" is true for every mode.
 - *Must fail:* `TestModeVectorDoesNotRunTheLexicalArm`
-- *Expected (verify and correct):* `lexical arm was queried in vector mode`
+- *Observed:* killed. `retrieve_test.go:137: lexical arm was queried in vector mode: [{repoID:repo-1 limit:40 q:[] terms:[parseconfig parse config handler]}]`, and a second kill `retrieve_test.go:155: vector arm was queried in lexical mode`. Predicted as `lexical arm was queried in vector mode` — correct, and the recorded call is printed with it, which is what says *what* was asked for.
+- *Compiles and vets:* yes; `if true` is a condition change, not a build break.
 
-**M2 — embed the query even in lexical mode.**
+**M2 — embed the query even in lexical mode** (`_, _ = r.Emb.Embed(ctx, []string{q})` before the arms).
 - *Why the code exists:* a model call per query that nothing reads.
 - *Fixture that separates mutant from original:* a counting `Embedder` wrapper. The results are identical either way, so nothing else can see it.
 - *Must fail:* `TestModeLexicalDoesNotRunTheVectorArmOrEmbedTheQuery`
-- *Expected (verify and correct):* `embedder called 1 time in lexical mode`
+- *Observed:* killed. `retrieve_test.go:158: embedder called 1 times in lexical mode`, plus an unpredicted second kill `retrieve_test.go:180: the query was embedded 2 times, want once` — the hybrid test counts the call as well as the lexical one, so "embedded once" is pinned from both sides.
+- *Compiles and vets:* yes; a blank assignment is a use.
 
 **M3 — `Candidates` replaced by `limit` in both arm calls.**
 - *Why the code exists:* fusion over two short lists degenerates into an intersection test.
-- *Fixture that separates mutant from original:* the fake records the limit it was asked for; and a second assertion that a span ranked 30th by the vector arm and 1st by the lexical arm survives into a top-10 fused result. With `limit=10` depth, that span is never seen.
+- *Fixture that separates mutant from original:* the fake records the limit it was asked for **and truncates to it, as a real arm does** — without the truncation, asking for the wrong depth changes nothing observable.
 - *Must fail:* `TestArmsAreQueriedAtCandidateDepthAndTrimmedAfterFusion`
-- *Expected (verify and correct):* `vector arm asked for 10 candidates, want 40`
+- *Observed:* killed. `retrieve_test.go:292: vector arm asked for 10 candidates and lexical for 10, want 40`. Predicted as `vector arm asked for 10 candidates, want 40` — corrected: the message names both arms.
+- *Compiles and vets:* yes.
 
-**M4 — the model guard deleted.**
+**M3b — trim each arm to `limit` before fusing instead of after** (added, because M3 dies on the depth assertion and leaves the *consequence* of depth unproven).
+- *Why the code exists:* the span the vector arm ranks 30th and the lexical arm 1st is the case fusion exists for.
+- *Fixture that separates mutant from original:* the same 30-span vector arm; `deep` is 30th there and 1st lexically.
+- *Must fail:* `TestArmsAreQueriedAtCandidateDepthAndTrimmedAfterFusion`
+- *Observed:* killed. `retrieve_test.go:296: first hit is "deep" at vector rank 0, want deep at 30`. **Worth recording:** `deep` is *still first* under the mutant, on its lexical rank alone — a test asserting only "deep comes back first" survives this. The rank assertion is what kills it.
+- *Compiles and vets:* yes.
+
+**M4 — the model guard deleted** (`_, _ = model, dim` in its place, or the two locals are unused and it is a build break).
 - *Why the code exists:* a query and a corpus in different vector spaces produce confident nonsense.
 - *Fixture that separates mutant from original:* the fake `SpanEmbedder` returning `"some-other-model"`. No real corpus in the suite has one.
 - *Must fail:* `TestARepoIndexedByAnotherModelIsAnError`
-- *Expected (verify and correct):* `got 3 hits and nil error, want ErrModelMismatch`
+- *Observed:* killed. `retrieve_test.go:265: got 5 hits and error <nil>, want ErrModelMismatch`. Predicted `got 3 hits and nil error` — the count is 5, the fixture's fused set.
+- *Compiles and vets:* yes, with the blank assignment. Without it the mutation is P1's "only breaks the build" mistake in a new spelling.
 
-**M5 — the model guard returns a refusal instead of an error.**
+**M5 — the model guard returns a refusal instead of an error** (an empty `Result` and a nil error).
 - *Why the code exists:* spec §10's distinction runs in both directions; a misconfiguration filed as "nothing to say" is the same lie as an error rate hiding a refusal.
 - *Fixture that separates mutant from original:* the same fake; the test asserts `errors.Is(err, ErrModelMismatch)` rather than "an unsuccessful outcome".
 - *Must fail:* `TestARepoIndexedByAnotherModelIsAnError`
+- *Observed:* killed. `retrieve_test.go:265: got 0 hits and error <nil>, want ErrModelMismatch` — the zero hit count is the whole difference from M4, which is why the assertion is on the error and not on the emptiness.
+- *Compiles and vets:* yes.
 
 **M6 — `TopScore` taken from the fused score instead of the vector similarity.**
 - *Why the code exists:* Task 1 proved the fused score carries no quality signal.
-- *Fixture that separates mutant from original:* the fake vector arm returns a top similarity of `0.83`; the fused top is `1/61 ≈ 0.0164`, and the test asserts the exact value. A test asserting only "TopScore > 0" survives.
+- *Fixture that separates mutant from original:* the fake vector arm's top similarity is `0.75` — **exactly representable in a float32**, which `models.Cite.Score` is; the plan's `0.83` arrives as `0.8299999833106995` and cannot be asserted exactly. A test asserting only "TopScore > 0" survives.
 - *Must fail:* `TestTopScoreIsTheVectorArmsBestSimilarity`
-- *Expected (verify and correct):* `TopScore 0.0163934, want 0.83`
+- *Observed:* killed. `retrieve_test.go:208: TopScore 0.03252247488101534, want 0.75`, plus two unpredicted kills: `TestLexicalOnlyResultsAreNotScoredForTheFloor` (`a lexical-only run scored 0.01639344262295082`) and `TestAnEmptyVectorArmHasNoTopScore`. **The plan's predicted value was wrong twice over**: the fused top here is `1/61 + 1/62 = 0.0325224`, not `1/61`, because the top span is in both arms. "The top hit always scores `1/(k+1)`" holds for a single arm; in hybrid the fused top is one of a small set of rank-determined values, which is the same point — a function of ranks alone — stated too specifically.
+- *Compiles and vets:* yes.
 
-**M7 — `store.CheckDim` deleted from the gateway's boot path.**
+**M7 — `store.CheckDim` deleted from the gateway's boot path** (replaced by `func(int) error { return nil }`).
 - *Why the code exists:* an embedder of the wrong width means every query is ranked against a column it cannot be compared to; the indexer refuses to boot for this and the gateway must too.
 - *Fixture that separates mutant from original:* `EMBED_DIM=64` in the boot test. Nothing in a default-configured test reaches it.
 - *Must fail:* `TestGatewayRefusesToBootOnAnEmbedderOfTheWrongWidth`
+- *Observed:* killed. `main_test.go:213: want ErrDimMismatch, got <nil>`
+- *Compiles and vets:* yes — `store` is still imported for `EmbeddingDim`, so the import does not go unused.
 
 **M8 — the floor's `Validate` skipped at boot.**
 - *Why the code exists:* fail closed, as `chunk.Options` and `walk.Limits` do.
-- *Fixture that separates mutant from original:* `ANSWER_SCORE_FLOOR=7` in the boot test.
+- *Fixture that separates mutant from original:* `ANSWER_SCORE_FLOOR=7` in the boot test — and `NaN`, which parses as a float and only `Validate` rejects.
 - *Must fail:* `TestGatewayRefusesAFloorOutsideTheCosineRange`
+- *Observed:* killed three times: `main_test.go:263: ANSWER_SCORE_FLOOR=7 was accepted`, `=-1.5`, `=NaN`. The `0,5` and `half` cases still failed the boot, at `ParseFloat` — so the test covers both guards and only the range half moves under this mutant.
+- *Compiles and vets:* yes.
 
 **M9 — `SetFloor` called with `calibrated: true`.**
 - *Why the code exists:* it is the gauge that shows an operator a guess as a guess.
-- *Fixture that separates mutant from original:* `TestTheFloorGaugeIsSetFromTheConfiguredValue`, reading the registry.
+- *Fixture that separates mutant from original:* `TestTheFloorGaugeIsSetFromTheConfiguredValue`, which scrapes `/metrics` through the router the binary serves rather than reading a variable.
 - *Must fail:* `TestTheFloorGaugeIsSetFromTheConfiguredValue`
+- *Observed:* killed. `main_test.go:311: /metrics does not carry "codetrail_score_floor_calibrated 0"`. The retriever's own `Floor.Calibrated` is untouched by this mutant, so the gauge assertion is the only thing that can see it — which is the point of scraping.
+- *Compiles and vets:* yes.
 
-- [ ] **Step 4: Commit**
+**M10 — the `RETRIEVAL_RRF_K >= 0` guard deleted at boot** (added: Task 1 deferred this guard here and the task as written did not mention it).
+- *Why the code exists:* `Fuse` divides by `k + rank` and guards nothing. `k = -1` makes the top hit's contribution `+Inf`; `k <= -2` inverts the ranking. `config.GetInt` parses `-1` happily.
+- *Fixture that separates mutant from original:* `RETRIEVAL_RRF_K=-1` and `-2` in the boot test, with `0` asserted to still boot — `k=0` is reciprocal rank with no discount and is a required call.
+- *Must fail:* `TestGatewayRefusesAFusionConstantFuseCannotSurvive`
+- *Observed:* killed. `main_test.go:277: RETRIEVAL_RRF_K=-1 was accepted`
+- *Compiles and vets:* yes.
+
+**M11 — the retriever's own `K < 0` guard deleted** (added: the eval builds a `Retriever` in code, spec §9, and never passes through the gateway's boot).
+- *Fixture that separates mutant from original:* `TestSearchRefusesAConfigurationFuseCannotSurvive`, which constructs the retriever directly.
+- *Observed:* killed. `retrieve_test.go:363: accepted` (subtest `negative_k`).
+- *Compiles and vets:* yes.
+
+**M12 — `Spans` carries every candidate instead of the returned hits** (added).
+- *Why the code exists:* the arms return `Candidates` rows each and the caller renders at most `limit` citations; the rest are spans no hit references.
+- *Fixture that separates mutant from original:* the 32-span fixture with a limit of 10. A fixture whose corpus is smaller than the limit cannot see this.
+- *Observed:* killed. `retrieve_test.go:305: carried 32 spans for 10 hits`
+- *Compiles and vets:* yes.
+
+**M13 — `Split` ignored: `Terms(q, true)`** (added).
+- *Why the code exists:* `LEXICAL_SPLIT_IDENTIFIERS` is what P6 sweeps to find out whether query-side splitting helps; a knob that does not reach the arm is not a knob.
+- *Fixture that separates mutant from original:* the split-off case, whose expected terms are strictly fewer. The split-on case passes under the mutant.
+- *Observed:* killed. `retrieve_test.go:329: split=false: terms ["parseconfig" "parse" "config" "handler"], want ["parseconfig" "handler"]`
+- *Compiles and vets:* yes.
+
+**M14 — the `NaN` guard removed from `metrics.ObserveTopScore`** (added; the import went with it, or it is a build break).
+- *Why the code exists:* one `NaN` observation makes a Prometheus histogram's `_sum` `NaN` for the life of the process — silently — and P6 calibrates the floor from exactly this histogram.
+- *Fixture that separates mutant from original:* a lexical-only run, which is where the `NaN` comes from, followed by a scrape of the real exposition. No assertion on a return value can see this.
+- *Must fail:* `TestALexicalOnlyRunIsTimedAndDoesNotPoisonTheTopScoreHistogram`
+- *Observed:* killed. `retrieve_test.go:402: the top-score histogram is poisoned: codetrail_retrieval_top_score_sum NaN`
+- *Compiles and vets:* yes, once `math` goes too.
+
+**M15 — retrieval is never timed** (`ObserveRetrieval` and its `start` deleted, and `time` with them).
+- *Why the code exists:* spec §11 asks for retrieval latency, and the retriever is the only thing that knows what it covers.
+- *Fixture that separates mutant from original:* the scrape, and the fact that `metrics`' `init` pre-creates the series at 0 — an absent series would make "not timed" and "never scraped" the same string.
+- *Observed:* killed. `retrieve_test.go:407: retrieval was not timed under its own mode: codetrail_retrieval_seconds_count{mode="lexical"} 0`
+- *Compiles and vets:* yes, with the import removed. Left in, it is a build break and a void mutation.
+
+**M16 — the floor gauge set from a literal rather than the configured value** (added).
+- *Observed:* killed. `main_test.go:311: /metrics does not carry "codetrail_score_floor 0.25"` — so both halves of that test's assertion are proven able to fail (M9 is the other).
+- *Compiles and vets:* yes.
+
+**M17 — the boot log claims the floor is calibrated** (added).
+- *Why the code exists:* the boot log is one of the four places the floor has to say it is a placeholder.
+- *Observed:* killed. `main_test.go:339: the boot log does not carry the floor and its calibration: {"level":"info","mode":"hybrid",…,"score_floor":-1,"floor_calibrated":true,…}`
+- *Compiles and vets:* yes.
+
+**M18 — the default `RETRIEVAL_MODE` flipped to `vector`** (added; Task 8 mutates the same default end to end).
+- *Observed:* killed. `main_test.go:327: mode=vector k=60 candidates=40 split=true`
+- *Compiles and vets:* yes.
+
+**M19 — the floor ships at `0.35`, calibrated** (added; the failure this whole design exists to prevent).
+- *Observed:* killed three times, in two tests: `main_test.go:330: floor {Value:0.35 Calibrated:true}, want -1 uncalibrated`, the boot-log assertion, and `main_test.go:302: retriever floor {Value:0.25 Calibrated:true}, want 0.25 uncalibrated` — the last one because the mutant also flips `Calibrated` for an operator-set value.
+- *Compiles and vets:* yes.
+
+**M20 — the width dropped from the model guard** (`model != r.Emb.Model()` only) (added).
+- *Why the code exists:* `embed.Fake` calls itself `fake-hashed-bow` at every width, so the name alone admits a corpus in a different space under the same label.
+- *Fixture that separates mutant from original:* the `same model at another width` subtest. The `another model` subtest passes under the mutant.
+- *Observed:* killed. `retrieve_test.go:265: got 5 hits and error <nil>, want ErrModelMismatch` (subtest `the_same_model_at_another_width` only).
+- *Compiles and vets:* yes.
+
+**M21 — `VectorRan` always true** (added).
+- *Why the code exists:* it is what tells `Decide` not to compare a cosine floor against a `ts_rank_cd`.
+- *Observed:* killed twice. `retrieve_test.go:169: a lexical-only result claims the vector arm ran` and `retrieve_test.go:229: a lexical-only result was refused by a cosine floor: refused/unscored` — the second is the consequence, and it is the one that matters.
+- *Compiles and vets:* yes.
+
+**M22 — the "one vector for one query" check deleted from `embedQuery`** (added). **Predicted survivor, and it survived.**
+- *Why the code exists:* an embedder that answers zero vectors would otherwise be an index-out-of-range panic, recovered by echo into a `500` with no cause in it.
+- *Observed:* **survived** the whole suite (`go test ./... -count=1` green). No fixture has an embedder that answers the wrong number of vectors, and writing one would test the guard and nothing else. Recorded rather than papered over: the guard stays, and what it converts is a panic into an error, not a wrong answer into a right one.
+- *Compiles and vets:* yes.
+
+**M23 — `OLLAMA_URL` no longer parsed for scheme and host** (added, against the moved code: the move has to keep P2's kills, not merely compile).
+- *Observed:* killed three times. `fromenv_test.go:143: the error does not name is not an http:// or https:// address: … Post "not%20a%20url%20at%20all/api/embed": unsupported protocol scheme ""`, and the same for `localhost:11435` and `http://`. The moved test discriminates exactly as it did in `apps/indexer/cmd`.
+- *Compiles and vets:* yes, with `net/url` removed.
+
+**M24 — an unknown `EMBED_PROVIDER` falls back to the fake.**
+- *Observed:* killed. `fromenv_test.go:98: a misspelt provider was accepted`
+- *Compiles and vets:* yes, with `_ = provider`.
+
+**M25 — the indexer boots without the schema's width check** (its wrapper passes a no-op).
+- *Why the code exists:* the wrapper is the only place the indexer's call to `embed.FromEnv` is pinned, now that the body has moved.
+- *Observed:* killed. `main_test.go:1363: want ErrDimMismatch, got <nil>`
+- *Compiles and vets:* yes.
+
+- [x] **Step 4: Commit**
 
 ```bash
 git commit -m "feat(rag): the retriever, and the gateway's own embedder
@@ -1385,20 +1590,39 @@ label for whether a hit was correct."
 
 **Definition of Done**
 - Three modes, each provably running only its own arms, switched by configuration.
-- Candidate depth separate from the returned limit, verified against `hnsw.ef_search`.
-- Model mismatch is an error and says so.
+- Candidate depth separate from the returned limit, verified against `hnsw.ef_search` (measured: `boot_val` is 40 on the pinned pgvector 0.8.6).
+- Model mismatch is an error and says so — on the model *and* on the width, because the fake names itself the same at every width.
 - Both binaries validate the embedder through one function.
 - Metrics exist with closed label sets, and the floor's gauges say uncalibrated.
-- M1–M9 recorded.
+- M1–M25 recorded, M22 recorded as a survivor with what it revealed.
+
+**Deviations from this task as written, and why:**
+- **`embed.FromEnv` takes four arguments, not three.** See Interfaces above: with the caller running `store.CheckDim` *after* `FromEnv`, a wrong `EMBED_DIM` under `EMBED_PROVIDER=ollama` spends a probe and the message blames `EMBED_MODEL`. `TestTheWidthIsCheckedBeforeTheProbe` pins the ordering with a server that fails the test if it is reached.
+- **`newEmbedder` is not deleted from the indexer; its body is.** What remains is a one-line wrapper around `embed.FromEnv(ctx, store.EmbeddingDim, store.CheckDim, timeout)`. Two reasons: the job fixtures build their embedder the way `main` does, and inlining the call at each site would leave the indexer's *own* arguments — the schema width and the check — pinned by nothing (M25 is the mutation that shows this).
+- **`Result.Spans` is `map[string]models.Span`, not `map[string]models.Cite`.** See Interfaces.
+- **`Search` validates its own configuration** (mode, `K >= 0`, `Candidates >= 1`, `limit >= 1`). The boot validators are the first line; this is the second, for the `Retriever` spec §9's eval constructs in code without passing through either binary's boot.
+- **The model guard is skipped in lexical mode**, along with the embed call. There is no vector to be in the wrong space, so reading the corpus's embedder would be a round trip that can only produce a refusal nothing asked for.
+- **The embedder is built in every mode, including `lexical`**, where nothing calls it. Parity is the stated decision (Open question 6) and one boot contract is easier to reason about than three; the cost is that `RETRIEVAL_MODE=lexical` still needs a reachable Ollama to start.
+- **`ANSWER_SCORE_FLOOR` is parsed with `strconv.ParseFloat` rather than through `config`.** `config.GetInt` answers its default for anything it cannot parse, and a floor that silently reverts to `-1` on a typo is a filter an operator believes is running. `Calibrated` stays false whatever the value: the flag says *codetrail* measured this number.
+- **`LEXICAL_SPLIT_IDENTIFIERS` is read here** (Task 3 named the knob and nothing read it).
+- **Nothing serves from the retriever yet.** `main` constructs it and discards it, so boot depends on the embedder now and the read endpoints wire it in Task 7. `storeHandle` grew `rag.Searcher` for that.
+- **Added tests:** `TestGatewayRefusesToBootWhenTheEmbedderIsUnreachable` (the boot-parity claim, which nothing else asserts), `TestGatewayRefusesAFusionConstantFuseCannotSurvive` (M10), `TestSplittingIdentifiersIsAKnobThatFailsClosed`, `TestAnEmptyVectorArmHasNoTopScore`, `TestTheLexicalArmIsAskedForTheQuerysTerms`, `TestAnArmErrorIsAnErrorAndNotAnEmptyResult`, `TestALexicalOnlyRunIsTimedAndDoesNotPoisonTheTopScoreHistogram` (M14, M15), `TestTheWidthIsCheckedBeforeTheProbe` and `TestAProbeThatAnswersTheWrongWidthRefusesToBoot`.
+- **Defect found in the task's own prediction:** M6's expected `TopScore 0.0163934` is wrong for a hybrid fixture — measured `0.0325224`, because the top span is in both arms. The claim it rests on ("a fused score is a function of ranks alone") is unaffected; the arithmetic behind it was stated too specifically. Corrected in the test comment as well, where it had been copied.
 
 ---
 
 ### Task 7: The read endpoints — search, span, repo, ask, refusal
 
 **Files:**
-- Create: `apps/gateway/internal/handler/read.go`, `packages/shared/rag/answer.go`
-- Modify: `apps/gateway/internal/handler/handler.go` (Mount), `apps/gateway/cmd/main.go` (wire the reader)
-- Test: `apps/gateway/internal/handler/read_test.go`, `packages/shared/rag/answer_test.go`
+
+- Create: `apps/gateway/internal/handler/read.go`, `packages/shared/rag/answer.go`, **`packages/shared/store/read.go`**
+- Modify: `apps/gateway/internal/handler/handler.go` (Mount, and `jobView`), `apps/gateway/cmd/main.go` (wire the reader), `apps/gateway/cmd/store.go`, `packages/shared/rag/cite.go` (`NewStaleness`), `packages/shared/store/evict.go` + `repos.go` (the two comments this task makes false)
+- Test: `apps/gateway/internal/handler/read_test.go`, `packages/shared/rag/answer_test.go`, **`packages/shared/store/read_live_test.go`**
+
+**Corrected against what the routes need.** The file list above originally held four files and no store change, and the five routes cannot be served from the store as Tasks 1–6 left it: there is no listing, no per-repo counts and no way to read one span. Three queries were added — `ListRepos`, `RepoStats`, `GetSpan` — with live tests, because a hermetic handler test above untested SQL proves the handler, not the query. Two more corrections in the same direction:
+
+- **`jobs.repo_id` never reached the API.** Task 5 added the column for the submit-then-poll flow and Open question 13 calls that flow covered; no task wired it to a response, and `jobView` is a whitelist, so `GET /api/jobs/:id` withheld it. Every read endpoint here is keyed on a repo id and `hash(key, commit)` is computable only by the indexer, so without this the corpus listing was a caller's only route to one. Added as `repo_id,omitempty` — empty until the job is done — and the P1 disclosure test still passes, because a pending job has none.
+- **`rag.NewStaleness`.** The repo view claims staleness with no span to cite, and `staleness` was unexported. Exported as a wrapper rather than duplicated, so the repo view and a citation cannot word the same evidence differently.
 
 **Routes:**
 
@@ -1421,7 +1645,7 @@ label for whether a hit was correct."
 - **The response always names what answered it** — `"answered_by": "extractive"` — even though there is only one answerer until P7. §8 calls a silent downgrade the failure that costs a week; the field has to exist *before* there is something to downgrade from, or the console and every client will be written without it.
 - **`top_score` is a `*float64`.** `json.Marshal` fails outright on `NaN` — the response would be a `500` with an empty body — and a lexical-only or empty result has no score. `null` is the honest encoding.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `answer_test.go`, hermetic:
 
@@ -1429,9 +1653,14 @@ label for whether a hit was correct."
 // Over budget, whole spans are dropped. Truncating one would put a digest on
 // text that is not the text the digest was taken of.
 func TestAssembleDropsWholeSpansAndNeverTruncatesOne(t *testing.T) {
-	// Fixture: three spans of 4,000 characters each with a budget of 9,000.
+	// Fixture: three spans with a budget of 9,000.
 	// A budget larger than the corpus cannot detect a truncating assembler,
 	// and equal-length spans cannot detect a wrong drop order.
+	//
+	// Corrected: the prescription (three spans of 4,000 characters *each*)
+	// contradicted its own second sentence. The shipped fixture is 4,000 /
+	// 3,500 / 3,000, and the assertions name which spans survived rather
+	// than how many, which is what a wrong drop order actually changes.
 }
 func TestAssembleNumbersCitationsInRankOrder(t *testing.T)
 func TestAssembleReportsWhatItDropped(t *testing.T)
@@ -1465,12 +1694,12 @@ func TestANaNTopScoreSerialisesAsNull(t *testing.T)
 
 `TestARetrievalErrorIsFiveHundredAndIsNotCountedAsARefusal` and its mirror are the two that carry spec §10. Both read the Prometheus counters before and after and assert the *delta on both counters*, not just the one they expect to move — a test that only checks its own counter passes under a mutant that increments both.
 
-- [ ] **Step 2: Implement**
+- [x] **Step 2: Implement**
 
 Sketch of the ask handler's shape:
 
 ```go
-out, err := h.Rag.Search(ctx, repoID, req.Q, h.AnswerSpans)
+out, err := h.Rag.Search(ctx, repoID, q, limit)   // limit defaults to h.Budget.MaxSpans
 if err != nil {
 	metrics.CountAnswer("error")
 	return h.fail(c, err, "ask")
@@ -1484,65 +1713,145 @@ if outcome == rag.OutcomeRefused {
 metrics.CountAnswer("answered")
 ```
 
-- [ ] **Step 3: Commit, then prove the tests discriminate**
+- [x] **Step 3: Commit, then prove the tests discriminate**
+
+**Shipped shapes.** `GET /api/repos` → `{repos:[{id,remote,ref,commit,indexed_at,last_used_at}],count}`. `GET /api/repos/:repo` → `{id,remote,ref,commit,indexed_at,files,spans,files_with_spans,staleness}`. `GET /api/repos/:repo/spans/:span` → `{span:{id,path,kind,symbol,start_line,end_line,text},citation}` — `file_id` and `repo_id` are join keys and stay off the wire, as `jobView` does it. `POST …/search` → `{repo_id,mode,top_score,count,hits:[{span_id,path,kind,symbol,start_line,end_line,text,score,vector_score,vector_rank,lexical_rank,citation}]}`. `POST …/ask` → `{repo_id,refused:false,answered_by,answer,citations,dropped,mode,top_score,floor:{value,calibrated,applicable}}` or `{repo_id,refused:true,reason,detail,mode,top_score,floor}`.
+
+Three decisions the plan did not make, made here and recorded rather than discovered:
+
+- **`search` carries no `floor`.** The floor is the answer's decision; reporting one on a route that never applied it implies a filter that did not run. M13 pins it.
+- **`hits[].vector_score` is `null` when `vector_rank` is 0.** `Fused.VectorScore` is the zero value for a span the vector arm never returned, and 0 is a real cosine similarity — an orthogonal span. M15 pins it.
+- **The top-ranked span is kept whole however long it is**, so a budget smaller than the first span still answers. The no-truncation rule outranks the budget, because the alternative is an empty answer beside a non-zero hit count. `TestASpanLargerThanTheWholeBudgetIsStillCitedWhole` pins it.
+
+**Eighteen mutations, eighteen kills, no survivors.** M1–M10 are the plan's; M11–M18 were added where the shipped code made a claim the plan's ten did not reach.
 
 **M1 — a refusal answered as `422` (or `404`).**
 - *Why the code exists:* an HTTP error code puts a refusal in every error-rate panel, which is §10's failure with a different spelling.
-- *Fixture that separates mutant from original:* the below-floor retriever. The no-hits one works too; keep both, since they take different branches.
+- *Fixture that separates mutant from original:* the below-floor retriever. The no-hits one works too; both are kept, since they take different branches.
 - *Must fail:* `TestAskRefusesUnderTheFloorWithTwoHundredAndAReason`
-- *Expected (verify and correct):* `want 200 with refused=true, got 422`
+- *Observed:* killed, both branches. `read_test.go:425: want 200 with refused=true, got 422: {"repo_id":"repo-1","refused":true,"reason":"below_floor",…}` and `read_test.go:452: want 200, got 422: {…"reason":"no_spans"…}`. Predicted output was correct.
+- *Compiles and vets:* yes; a different constant of the same type.
 
 **M2 — `metrics.CountAnswer("error")` in the refusal branch.**
 - *Why the code exists:* spec §10, the sentence this whole phase is built around.
-- *Fixture that separates mutant from original:* the counter delta assertion on **both** counters. A test asserting only that the refusal counter moved passes under this mutant, because the mutant still counts the refusal reason.
+- *Fixture that separates mutant from original:* the counter delta assertion on **both** counters. A test asserting only that the refusal counter moved passes here, because the mutant still counts the refusal reason.
 - *Must fail:* `TestARefusalIsNotCountedAsAnError`
-- *Expected (verify and correct):* `answer_total{outcome="error"} moved by 1 on a refusal`
+- *Observed:* killed. `counters moved map[codetrail_answer_total{outcome="error"}:1 codetrail_refusal_total{reason="below_floor"}:1], want map[codetrail_answer_total{outcome="refused"}:1 codetrail_refusal_total{reason="below_floor"}:1]`. The message is the evidence for the fixture claim: the refusal counter *did* move under the mutant. Predicted as `answer_total{outcome="error"} moved by 1 on a refusal` — right in substance; the assertion compares the whole set of series that moved, so a mutant incrementing both is also a failure.
+- *Compiles and vets:* yes; a different string literal to the same call.
 
 **M3 — `metrics.CountAnswer("refused")` in the error branch.**
 - *Why the code exists:* the same sentence, read the other way.
 - *Fixture that separates mutant from original:* the erroring fake retriever.
 - *Must fail:* `TestARetrievalErrorIsFiveHundredAndIsNotCountedAsARefusal`
+- *Observed:* killed. `counters moved map[codetrail_answer_total{outcome="refused"}:1], want map[codetrail_answer_total{outcome="error"}:1]`.
+- *Compiles and vets:* yes.
 
 **M4 — the assembler truncates the last span to fit the budget.**
 - *Why the code exists:* a digest over text that was then cut is a citation that lies.
-- *Fixture that separates mutant from original:* three 4,000-character spans against a 9,000-character budget, so the third span *must* be dealt with. A budget bigger than the corpus never reaches the branch. The assertion is `strings.Contains(answer, span.Text)` for every cited span — under the mutant the truncated span's full text is absent while its citation is present.
+- *Fixture that separates mutant from original:* three spans of 4,000 / 3,500 / 3,000 characters against a 9,000-character budget, so the third *must* be dealt with. A budget bigger than the corpus never reaches the branch.
 - *Must fail:* `TestAssembleDropsWholeSpansAndNeverTruncatesOne`
-- *Expected (verify and correct):* `citation 3 names a digest whose text is not in the answer`
+- *Observed:* killed twice over, and the second run is the one that matters. As shipped the test dies first on the count — `kept 3 citations and dropped 0, want 2 and 1: 9000 characters` — which would leave the no-truncation claim itself unproven. Re-run with the count assertion deliberately weakened, the content assertions fire on their own: `citation 3 names digest eb8b4d8da039, whose text is not in the answer` and `the dropped span's text is in the answer`. That is the plan's predicted message, and it is now known to be load-bearing rather than shadowed by the count.
+- *Compiles and vets:* yes; a slice expression in place of a `break`.
 
 **M5 — `TouchRepo` removed from the read path.**
 - *Why the code exists:* it is the LRU clock; without a reader winding it, "least recently *queried*" means "least recently indexed" and a popular repository is evicted while it is being used.
 - *Fixture that separates mutant from original:* a fake store recording touches. Nothing about the response changes, so no assertion on the body can see it.
 - *Must fail:* `TestASuccessfulReadWindsTheLRUClock`
-- *Expected (verify and correct):* `TouchRepo was not called`
+- *Observed:* killed on all four repo routes plus the refusal. `read_test.go:665: /api/repos/repo-1: TouchRepo was not called (touched [])`, and three more, and `a refusal did not wind the clock: touched []`. Predicted as `TouchRepo was not called` — correct.
+- *Compiles and vets:* yes; `if err := error(nil); err != nil` keeps both parameters used.
 
 **M6 — a `TouchRepo` failure returned to the caller.**
 - *Why the code exists:* the touch is a hint for a future eviction, not part of the answer; failing a correct answer on it trades a good response for a bookkeeping error.
-- *Fixture that separates mutant from original:* a fake store whose `TouchRepo` errors while everything else succeeds.
-- *Must fail:* `TestASuccessfulReadWindsTheLRUClock` (extend it with the erroring case) — **verify this predicts a kill**; if the test only asserts the call happened, the mutation survives and the test needs the second case.
+- *Fixture that separates mutant from original:* a fake store whose `TouchRepo` errors while everything else succeeds. The plan asked to **verify this predicts a kill** rather than assuming it: it does, but only because the test was written with the second case. An assertion that the call happened survives this mutation untouched.
+- *Must fail:* `TestASuccessfulReadWindsTheLRUClock`
+- *Observed:* killed — `a failed touch cost the caller the answer: 500 {"error":"internal error","request_id":"dJSTxJWHhIpSHZZTfDsMdxNSdlxcDFki"}`.
+- *Void form, recorded:* the first mutant spelled "returned to the caller" as a `panic`, and the panic escaped into the test binary instead of becoming an assertion failure — an incident, not a kill (rule 7). Two things were wrong and both were fixed: the harness mounted no `middleware.Recover()`, which production's `server.New` does, and the mutation was not the behaviour the comment claims. The recorded kill is the non-panicking form.
 
 **M7 — the evicted branch answers `404`.**
 - *Why the code exists:* spec §10 — it existed, and that is a different fact.
 - *Fixture that separates mutant from original:* the tombstoned id. An unknown id is `404` under both.
 - *Must fail:* `TestAnEvictedRepoIsFourTenNotFourOhFour`
+- *Observed:* killed on all four routes. `GET /api/repos/evicted-1: want 410, got 404: {"error":"this repository was indexed and has since been evicted"}`. `TestAnUnknownRepoIsFourOhFour` passes under the mutant, which is the point of keeping both.
+- *Compiles and vets:* yes.
 
 **M8 — query validation removed.**
 - *Why the code exists:* `"???"` otherwise reaches the embedder, which refuses a text with no tokens, and the user sees a `500`.
-- *Fixture that separates mutant from original:* the `"???"` case with a **real `embed.Fake`** behind the retriever, not a stub that returns hits regardless. A stubbed retriever swallows the mutation and the test passes.
+- *Fixture that separates mutant from original:* the `"???"` case with a **real `embed.Fake`** behind a real `rag.Retriever`, not a stub that returns hits regardless. A stubbed retriever swallows the mutation.
 - *Must fail:* `TestAnEmptyOrTokenlessQuestionIsFourHundredNamingTheRule`
-- *Expected (verify and correct):* `want 400 with a rule, got 500`
+- *Observed:* killed on all four cases, on both routes. Empty, whitespace and punctuation-only give `search: want 400 with a rule, got 500: {"error":"internal error","request_id":…}` — the plan's predicted `want 400 with a rule, got 500`, exactly. The over-length case gives `got 200`, because that rule is a bound rather than a crash-preventer, and the body it served is a full ranked result for a 1,001-character question.
+- *Compiles and vets:* yes; deleting the `switch` leaves `q` used by the return.
 
 **M9 — `top_score` marshalled as a plain `float64`.**
-- *Why the code exists:* `json.Marshal` errors on `NaN`, and echo turns that into an empty `500`.
-- *Fixture that separates mutant from original:* the lexical-only or empty-result case, whose top score is `NaN`. Every scored fixture passes.
+- *Why the code exists:* `json.Marshal` errors on `NaN`, and echo turns that into a `500`.
+- *Fixture that separates mutant from original:* the lexical-only and the empty-result cases, whose top score is `NaN`. Every scored fixture passes.
 - *Must fail:* `TestANaNTopScoreSerialisesAsNull`
-- *Expected (verify and correct):* `json: unsupported value: NaN`
+- *Observed:* killed, and with it `TestAskRefusesWhenNothingWasRetrieved`. `search: want 200, got 500: {"message":"Internal Server Error"}`. **The prediction was wrong in a way worth recording:** `json: unsupported value: NaN` is the underlying error and never reaches the caller — echo's default error handler answers its own body, so the response carries neither the handler's `{"error":"internal error"}` nor a request id. A `NaN` would therefore produce the one 500 in this service that a caller cannot quote back.
+- *Compiles and vets:* yes, once all three response structs change together — the first attempt changed two and broke the build, which is the compiler test rule 2 forbids counting.
 
 **M10 — the question logged at info level.**
 - *Why the code exists:* a public endpoint's user input must not reach an operator's log aggregator.
-- *Fixture that separates mutant from original:* a distinctive question string and a captured zerolog writer. A test that checks the response body cannot see a log line.
+- *Fixture that separates mutant from original:* a distinctive question string and a captured zerolog writer at production's `InfoLevel`. A test that checks the response body cannot see a log line.
 - *Must fail:* `TestTheQuestionIsNeverLogged`
+- *Observed:* killed on three of the six sub-cases. `the question reached the log: {"level":"info","request_id":"afDfbdbIlPgpWJQKWgEpjvDzMaRaMetg","q":"zqxjkv-sampler-question","message":"ask"}`. The test also asserts that something *was* logged for a 500, or every sub-case would pass on a dead writer.
+- *Compiles and vets:* yes.
 
-- [ ] **Step 4: Commit**
+**M11 — `RepoGone` asked before `repos` is read.**
+- *Why the code exists:* a repo id is `hash(key, commit)`, so a repository re-indexed at the same commit re-uses the id its tombstone was written under. Reading `repos` first is what stops a live corpus answering `410`.
+- *Fixture that separates mutant from original:* a live repo **and** a tombstone under the same id, against a fake `RepoGone` that answers the tombstone table alone. The real `RepoGone` carries a `NOT EXISTS` guard; a fake that copied it would cover for the handler and the order would be untested.
+- *Must fail:* `TestALiveRepoIsNeverGoneEvenWithATombstone`
+- *Observed:* killed on all four routes. `GET /api/repos/repo-1: want 200 for a live repo with a stale tombstone, got 410`. `TestAnEvictedRepoIsFourTenNotFourOhFour` and `TestAnUnknownRepoIsFourOhFour` both pass under the mutant, which is why neither can stand in for this fixture.
+- *Compiles and vets:* yes; the two reads swap places.
+
+**M12 — citation markers numbered from the hit index rather than from what was kept.**
+- *Why the code exists:* the marker in the text is what a reader follows; a number that counts skipped hits points at nothing.
+- *Fixture that separates mutant from original:* a hit whose span did not travel with it. With every span present the two numberings agree.
+- *Must fail:* `TestAHitWithNoSpanIsDroppedRatherThanCited`
+- *Observed:* killed. `marker 2 after a skipped hit, want 1: the numbering must follow what is shown`.
+- *Compiles and vets:* yes.
+
+**M13 — `search` applies the floor and refuses.**
+- *Why the code exists:* search ranks, ask answers. A floor on a ranking is a filter nobody asked for, and a `floor` field on a route that never applied one implies a filter that did not run.
+- *Fixture that separates mutant from original:* a top score of 0.2 against a floor of 0.9 — the same numbers the ask refusal uses, driven at the other route.
+- *Must fail:* `TestSearchDoesNotRefuse`
+- *Observed:* killed three ways. `search answered a refusal: {…"reason":"below_floor"…}`, `search reports a floor it never applied`, and `hits <nil>`.
+- *Compiles and vets:* yes.
+
+**M14 — `floor.calibrated` hard-wired to `true` and `applicable` to `true`.**
+- *Why the code exists:* spec:315 puts the number in P6, and `calibrated` is the field that stops a `-1` floor reading as a tuned threshold. `applicable` is false in lexical-only mode, where there is no cosine similarity to compare against.
+- *Fixture that separates mutant from original:* the answered case for `calibrated`, and the lexical-only case for `applicable`. Neither sees the other's half.
+- *Must fail:* `TestAskAnswersWithCitationsAndAPermalink`
+- *Observed:* killed three times. `floor {Value:-1 Calibrated:true Applicable:true}, want {-1 false true}`, `floor map[applicable:true calibrated:true value:0.5]` on the refusal, and `the floor claims to apply in lexical mode: map[applicable:true calibrated:true value:-1]`.
+- *Compiles and vets:* yes.
+
+**M15 — `vector_score` served for a span the vector arm never returned.**
+- *Why the code exists:* `Fused.VectorScore` is the zero value at `VectorRank` 0, and 0 is a real cosine similarity — an orthogonal span. Serving it turns "this arm did not have it" into "this arm scored it at zero".
+- *Fixture that separates mutant from original:* the lexical-only hit, `span-b`. Every hit both arms returned passes.
+- *Must fail:* `TestSearchReturnsPerArmRanksSoFusionCanBeMeasured`
+- *Observed:* killed — `span-b: vector_score 0 with vector_rank 0`. The message first printed the pointer address, which named the defect without naming the value; the assertion now formats the number, and the kill was re-run against it.
+- *Compiles and vets:* yes.
+
+**M16 — `ListRepos` orders `last_queried_at ASC`.**
+- *Why the code exists:* the listing is the corpus in the order eviction reads it, so its tail is what goes next.
+- *Fixture that separates mutant from original:* three repos whose `last_queried_at` is wound backwards, so the expected order disagrees with insertion order; the test also asserts that it disagrees with id order, since an unordered result is not an insertion-ordered one (Open question 16).
+- *Must fail:* `TestListReposIsMostRecentlyUsedFirstLive`
+- *Observed:* killed. `position 0 is 5af9f240076271432b6c90f6a215ceb4, want de516f866b6ea1543285b719c5c1dc62 (order [5af9f240… 05229dea… de516f86…])`.
+- *Compiles and vets:* yes; the statement stays valid SQL and returns the same rows in a different order, which rule 2 requires of a SQL mutation.
+
+**M17 — `RepoStats` counts spans across the whole table.**
+- *Why the code exists:* three numbers about *this* repository; a missing filter reads as a bigger corpus rather than as an error.
+- *Fixture that separates mutant from original:* a second repository holding strictly more spans than the target. A single-repository fixture cannot see it.
+- *Must fail:* `TestRepoStatsCountsThisRepositoryOnlyLive`
+- *Observed:* killed. `stats {Files:3 Spans:13 FilesWithSpans:2}, want {Files:3 Spans:4 FilesWithSpans:2}`.
+- *Compiles and vets:* yes; `count(*) FROM spans` is valid SQL with `$1` still bound by the other two subqueries.
+
+**M18 — `GetSpan`'s repo scope defeated (`repo_id = $1 OR true`).**
+- *Why the code exists:* a span id is a primary key, so an unscoped read serves another repository's code to a caller who named this one.
+- *Fixture that separates mutant from original:* two repositories, and the same span id read under the other one.
+- *Must fail:* `TestGetSpanIsScopedToItsRepositoryLive`
+- *Observed:* killed. `a span of 450ef7df52ceb623922dc23882f4a749 was served under e8db6409713bfa871d12bb3e49cac7da: <nil>`.
+- *Compiles and vets:* yes. `OR true` rather than deleting the predicate, because dropping it unbinds `$1` and pgx answers a protocol error — a void mutation, not a behaviour change (rule 2).
+
+- [x] **Step 4: Commit**
 
 ```bash
 git commit -m "feat(gateway): search, read, and an extractive answer that can be refused
@@ -1566,22 +1875,58 @@ accident."
 ```
 
 **Definition of Done**
-- Five routes, with `400` naming a rule, `404` for unknown, `410` for evicted, `500` withholding internals.
-- A refusal is a `200` with a reason and is never counted as an error; an error is never counted as a refusal; both directions asserted on both counters.
-- No question in any log line.
-- No citation whose digest does not match the text shown.
-- M1–M10 recorded.
+- [x] Five routes, with `400` naming a rule, `404` for unknown, `410` for evicted, `500` withholding internals.
+- [x] A refusal is a `200` with a reason and is never counted as an error; an error is never counted as a refusal; both directions asserted on both counters — as the whole set of series that moved, so a mutant incrementing both fails too.
+- [x] No question in any log line, on any of the six paths a question can take, with the log writer proved live.
+- [x] No citation whose digest does not match the text shown.
+- [x] M1–M10 recorded, plus M11–M18 for the claims the shipped code makes and the plan's ten did not reach. Eighteen kills, no survivors, one void form corrected before it was counted (M6).
+
+**One residual risk, recorded rather than fixed.** "No question in a log line" holds for every line this handler writes, and the 500 path logs the underlying error, which nothing in this phase builds from the question: `embed.Fake` names an index, `ErrModelMismatch` names models. The one path that could carry question-derived text is a pgx error naming a `tsquery` — `rag.Terms` restricts terms to letters and digits precisely so `to_tsquery` cannot fail on them, so it is unreachable through this code, and it is the thing to check first if a lower layer ever starts interpolating.
+
+**Found after the phase, and fixed on this branch: the API accepted a `mode` it could not honour.** Measured against a running gateway — `{"q":"…","mode":"vector"}` was answered `200` with `"mode":"hybrid"`, and so was `"bogus"`. The mechanism was not a field that went unread: `searchRequest` never declared one, echo's binder drops a key no struct field claims, and the response reports the process's own mode — which is what made the drop look like an echo. **Refused rather than honoured**, because `Retriever.Search` takes no mode argument and spec:316's two-arm comparison runs through `evalrunner` against separate databases rather than through this API, so honouring it would add a switch with no consumer. Every mode is refused, the configured one included: which mode a process runs is not something a caller can know, and accepting a value on the chance it agrees is the same silence in a smaller form. An explicit `null` is absence. Verified live on both routes with the pre-fix and post-fix binaries side by side, and the three rejected asks moved no outcome counter — `codetrail_answer_total{outcome="refused"} 2` for the two that reached the answerer, `error` 0.
+
+**M19 — the mode check deleted** (the field stays declared, so this is a behaviour change and not a build break).
+- *Why the code exists:* a field a service accepts and ignores is the overclaim spec §10's "never a generic refusal" exists to prevent, one layer up: the caller is told nothing fired.
+- *Fixture that separates mutant from original:* a retriever running in `lexical` while the request asks for `vector`, so the mutant's 200 reports a mode nobody asked for.
+- *Must fail:* `TestAModeInTheRequestBodyIsRefusedRatherThanIgnored`, `TestAValidationFailureIsCountedAsNoAnswerOutcomeAtAll`
+- *Observed:* killed — `search: want 400, got 200: {"repo_id":"repo-1","mode":"lexical",…}` and `{"q":"sampler","mode":"vector"}: want 400, got 200`.
+- *Compiles and vets:* yes.
+
+**M20 — the 400 names a different rule** (`"q must not be empty"` in place of the mode detail).
+- *Why the code exists:* the whole complaint about this field was that it was answered without being read; a 400 that names the wrong rule is the same failure with a different status code.
+- *Fixture that separates mutant from original:* the assertion is on the exact detail, not on the status.
+- *Must fail:* `TestAModeInTheRequestBodyIsRefusedRatherThanIgnored`
+- *Observed:* killed — `search: body {"error":"q must not be empty","rule":"form"} does not name the rule that fired`.
+- *Compiles and vets:* yes. This is the mutant a status-only assertion survives.
+
+**M21 — the guard inverted (`req.Mode == nil`), so every request without a mode is refused.**
+- *Why the code exists:* the other direction — a rejection that fires on the requests it was meant to serve.
+- *Fixture that separates mutant from original:* the same body without the field, asserted as a 200 whose reported mode is the server's.
+- *Must fail:* `TestTheModeAResponseReportsIsTheOneTheServerRetrievedIn` (and most of the read suite)
+- *Observed:* killed — `search: want 200, got 400: {"error":"mode is not a request field: …"}`.
+- *Compiles and vets:* yes.
+
+**M22 — the search response reports a literal `hybrid` instead of `out.Mode`** (added: refusing the request field is only honest if the response's mode is the one that ran).
+- *Why the code exists:* the response's `mode` is the caller's only way to learn what retrieved, and a constant there is what would make the refused request field look arbitrary.
+- *Fixture that separates mutant from original:* a retriever running in `lexical`, so `hybrid` is a wrong answer rather than a coincidence.
+- *Must fail:* `TestTheModeAResponseReportsIsTheOneTheServerRetrievedIn`, `TestARepoWithNoSpansRefusesRatherThanErrors`
+- *Observed:* killed — `search: the response says mode hybrid, want "lexical"`.
+- *Compiles and vets:* yes.
 
 ---
 
 ### Task 8: End to end on a live database, CI, and the README
 
 **Files:**
-- Create: `apps/gateway/internal/handler/read_live_test.go`, `assets/screenshots/ask.png`
-- Modify: `.github/workflows/ci.yml`, `README.md`, `Makefile`, `infra/docker-compose.yml` (gateway's embedder env)
+- Create: `apps/gateway/internal/handler/read_live_test.go`, `assets/screenshots/ask.png` (+ `ask.svg`, as P1's and P2's captures are kept)
+- Modify: `.github/workflows/ci.yml`, `README.md`
 - Test: as above
 
-- [ ] **Step 1: Write the end-to-end live tests**
+**Two entries in that list had no work behind them, corrected against the tree.** `infra/docker-compose.yml` has **no gateway service** — it runs Postgres and, behind the `ai` profile, Ollama, and the binaries are run from `bin/` — so there is no "gateway's embedder env" there to set. The `Makefile` needed nothing either: `make build`, `make up` and `make test` already cover what the new README section tells a reader to run, and adding a target that wraps two `./bin/` invocations would be a third place for the DSN to drift. Both are recorded rather than satisfied with a cosmetic edit.
+
+**A third correction, to Step 1's method.** "Index a fixture repository through the real indexer path" is not available to this package: `walk` and `clone` live under `apps/indexer/internal`, which Go's internal rule forbids the gateway from importing — and that confinement *is* P1's deployment boundary, so importing them would be the defect, not the fix. The live suite therefore indexes the indexer's own committed fixture tree through the packages that decide a span's identity — `chunk`, `embed.FromEnv`, `store.PutRepo`/`PutSpans` — and asserts the corpus it produced (which paths bear spans, per strategy) rather than assuming it. The walk itself stays covered by `apps/indexer/cmd/index_live_test.go`, which is where it can be.
+
+- [x] **Step 1: Write the end-to-end live tests**
 
 Index a fixture repository through the real indexer path (as `apps/indexer/cmd/index_live_test.go` already does), then drive the handler over the result on the fake embedder:
 
@@ -1599,11 +1944,17 @@ func TestPackageDocProseIsUnretrievableUnderTheASTStrategy(t *testing.T)
 
 `TestAHighFloorRefusesTheSameQueryTheDefaultAnswers` is the test that proves the floor is a live mechanism without asserting anything about its value: the same query, the same corpus, two floors, two outcomes.
 
-- [ ] **Step 2: Extend CI**
+**Shipped, plus three the plan's four did not reach.** `TestARefusalAnErrorAndAValidationFailureAreThreeOutcomesLive` drives spec §10's three outcomes against a real database — a real `ErrModelMismatch` (a 768-component corpus queried by a 16-component embedder) for the error, and the whole set of counter series that moved for each. `TestEveryRetrievalModeRetrievesFromALiveCorpus` runs all three modes over one corpus and asserts which arm ranked what, and that lexical mode reports a `null` top score. And `TestPackageDocProseIsUnretrievableUnderTheASTStrategy` came back **corrected against measurement**: the plan predicted a refusal under the production strategy, and there is none. The vector arm returns its top candidates whatever they score, so a hybrid ask over the AST corpus answers *from other files*; the refusal is real only in lexical mode, where a term no span holds retrieves nothing. Both halves are asserted, because "answers from the wrong file" is what an operator actually gets and is the worse of the two to leave undocumented.
+
+- [x] **Step 2: Extend CI**
 
 The `live datastore tests` step already sets `EMBED_PROVIDER: fake`. Add the gateway's retrieval knobs to the same step so the composition under test is the one CI describes, and add a comment saying **CI cannot measure fusion** — the fake is a hashed bag of words over the same text the lexical arm indexes, so the two arms are near-duplicates there. A green build is a mechanics check (spec §9's banner), and this is where a reader of the build log will look.
 
-- [ ] **Step 3: Verify against a real repository, and record the numbers**
+**The knobs were deliberately not added, and the instruction is a plan defect.** `newRetriever` reads the *ambient* environment, and `apps/gateway/cmd`'s tests run in both the `test` and the `live datastore tests` steps. Measured: `RETRIEVAL_MODE=lexical go test ./apps/gateway/cmd/` fails `TestTheDefaultRetrieverIsHybridAtTheUncalibratedFloor` with `mode=lexical k=60 candidates=40 split=true`, and `ANSWER_SCORE_FLOOR=0.35` fails it with `floor {Value:0.35 Calibrated:false}`. So exporting the *shipped defaults* in CI would leave that test green while it asserted the workflow file instead of the code — and M1 below, which flips the default in `main.go`, then **survives**: measured, `RETRIEVAL_MODE=hybrid go test ./apps/gateway/cmd/` under the mutant prints `ok`. A step that disarms a mutation is worse than a step that says nothing, so the comment says what CI proves, what it cannot (fusion), and why the knobs are absent.
+
+**What CI gained instead: `go vet -tags=ollama ./...`.** The `ollama` suite needs a model so CI never runs it — and until this step nothing *compiled* it either, since `go vet ./...` skips a tagged file. An API change in `packages/shared/embed` could have broken the one check a fake cannot make and stayed green for as long as nobody ran it by hand. The step costs no model and no server. The skip guards themselves are unchanged and now cover the new suite too: every live `TestMain` exits 1 rather than skipping when `DATABASE_URL` is unset under `CI`, and `baseURL` in the `ollama` suite fails rather than skipping, tag or no tag.
+
+- [x] **Step 3: Verify against a real repository, and record the numbers**
 
 Not optional, and not a formality — P2 found four cross-task defects here that no per-task review caught.
 
@@ -1621,7 +1972,17 @@ Record, in the README and in the commit message:
 4. retrieval latency for each mode, so the cost of the second arm is a number rather than an impression;
 5. the same query with `RETRIEVAL_MODE=vector` and `=hybrid`, **reported as two result sets and not as a winner**.
 
-- [ ] **Step 4: Update the README**
+**Measured. `rs/zerolog` at `dfd11cca1143ba03ba0fc0ff14e5dbb4d61f6f0a`** — the same commit P2 recorded, still `master` — indexed through the real gateway and indexer against Ollama with `nomic-embed-text`: 99 files, 1,303 spans, `repo_id` `bee14320c329c3c67b2786f124cbd74b`, 87 files with spans. Every figure agrees with P2's table, which is itself the check that P3 changed nothing about indexing.
+
+1. **Top cosine similarity over seven real questions: 0.664 to 0.744.** A range, not a recommendation; P6 turns it into a floor by measuring it against a labelled golden set, and a histogram of the same quantity has no label for "was this hit correct".
+2. **The citation checks byte for byte.** `git show dfd11cca:sampler.go | sed -n '18,23p' | head -c -1 | sha256sum` → `a7a70e1ec9cb1aa09c1f380415bc637a38379d7c686a180ca8d0401f77c29833`, which is the `digest` the API returned, and the same hash the *answer's own rendered text* produces. **`head -c -1` is load-bearing and P2's recipe did not have it**: a span's text ends at the last byte of its last line, not at the newline after it, so `sed | sha256sum` alone gives `27763f89…` and no match. P2's screenshot showed the `sed` output and never piped it to `sha256sum`, so this went unnoticed for a phase.
+3. **The permalink was opened in a browser** — `https://github.com/rs/zerolog/blob/dfd11cca…/sampler.go#L18-L23` — and lands on lines 18–23, highlighted, with the same bytes.
+4. **Retrieval latency, mean over 21 asks per mode** (`codetrail_retrieval_seconds`, which is what an operator reads): `lexical` 5.3 ms, `vector` 24.0 ms, `hybrid` 33.7 ms. One `nomic-embed-text` embed on CPU measures ~16 ms alone, so the pgvector query is ~8 ms and the second arm costs ~10 ms at 1,303 spans. A cost, not a benefit.
+5. **Two result sets, no winner.** For "how does the sampler decide to drop an event", `vector` returns five `sampler.go` spans (0.7166 down to 0.5958); `hybrid` keeps `sampler.go:18-23` at rank 1 and then returns `event.go:202-210`, `event.go:191-200`, `event_test.go:279-318`, `event_test.go:159-198`. The mechanism is Open question 15, now confirmed on a real corpus: `simple` has no stopword list, so `event` is a live term, and `ts_rank_cd` rewards the test file that repeats it. **Which column serves a reader better is spec:316's experiment and is not answered here.**
+
+**A sixth thing, not asked for and worth recording: the plan's own `curl` in this step is a `400`.** Run verbatim — no `-H 'content-type: application/json'` — echo binds the body as a form, finds no `q` field, and the edge answers `{"error":"q must not be empty","rule":"form"}`. The README's version carries the header and says why.
+
+- [x] **Step 4: Update the README**
 
 Four edits are mandatory; the rest is new material.
 
@@ -1639,21 +2000,69 @@ Four edits are mandatory; the rest is new material.
 
 New material: a **Retrieval** section carrying the two arms, the fusion constant, the modes, the sentence that **nothing here claims fusion retrieves better** (spec:316), the per-arm ranks in the response, the knob list, the `410`/`404` distinction, the job retention window and the flood it does not bound, and the `doc.go` asymmetry as a *retrieval* limitation rather than only a chunking one.
 
-- [ ] **Step 5: Commit and prove the tests discriminate**
+- [x] **Step 5: Commit and prove the tests discriminate**
+
+**Eight mutations, eight kills, no survivors.** M1–M3 are the plan's; M4–M8 were added because the plan's three reach none of the code this task's live suite is built over. One defect was found by the round rather than by review, and is recorded under M5.
 
 **M1 — `RETRIEVAL_MODE` default flipped to `vector`.**
 - *Why the code exists:* §8 defines retrieval as hybrid; the default is spec conformance, not a quality claim.
+- *Fixture that separates mutant from original:* `boot()` with only `EMBED_PROVIDER` set, so the default is what is read. Any test that exports the knob cannot see this.
 - *Must fail:* `TestTheDefaultRetrieverIsHybridAtTheUncalibratedFloor` (Task 6)
+- *Observed:* killed — `main_test.go:385: mode=vector k=60 candidates=40 split=true`.
+- *And the finding this task exists to catch:* re-run as `RETRIEVAL_MODE=hybrid go test ./apps/gateway/cmd/`, the same mutant **survives** and prints `ok`. That is the measurement behind refusing Step 2's instruction to export the retrieval knobs in CI.
+- *Compiles and vets:* yes; a different constant of the same type.
 
-**M2 — `ANSWER_SCORE_FLOOR` default set to `0.35`.**
-- *Why the code exists:* spec:315.
-- *Fixture that separates mutant from original:* the live pair in `TestAHighFloorRefusesTheSameQueryTheDefaultAnswers`, plus Task 1's `TestTheShippedDefaultRefusesNothingOnScoreAlone`. **Expected to kill in Task 1 and to be visible here as a refusal on a query the default answers** — record whether the live test actually changes outcome, because it depends on the fake's scores, and if it does not, say so rather than claiming a kill.
+**M2 — `ANSWER_SCORE_FLOOR` default set to `0.35` (`DefaultFloor`).**
+- *Why the code exists:* spec:315 — a plausible default is a guess a reader cannot tell from a measurement.
+- *Fixture that separates mutant from original:* Task 1's `Decide` case at the worst possible cosine, and the live pair's payload assertion.
+- *Observed:* killed twice. `decide_test.go:58: the worst possible cosine gave refused/below_floor at the default floor`, and `read_live_test.go:494: floor {Value:0.35 Calibrated:false Applicable:true} on the wire, want -1 uncalibrated`.
+- *And the honesty the plan asked for:* **the live test does not change outcome, and this is not a kill on the outcome.** Probed by weakening the payload assertion to a `t.Logf`: under the mutant the same query is still answered, because the fake's top score on this fixture is **0.5477**, which is above 0.35. The live kill is the payload's alone. A floor of `1` is what the shipped test uses for the outcome pair, and it asserts the observed top score is `< 1` first so the pair cannot be a coincidence.
+- *Compiles and vets:* yes.
 
-**M3 — the end-to-end digest assertion weakened to "the digest is non-empty".**
+**M3 — the end-to-end digest assertion weakened, against a truncating assembler.**
 - *Why the code exists:* this test is the one that proves a citation is checkable, which is the project's second differentiating claim.
-- *Fixture that separates mutant from original:* the mutation is to the *test*, which is legitimate here: the question is whether the assertion is load-bearing. Apply a truncation to the assembler and confirm the weakened test passes while the real one fails.
+- *Fixture that separates mutant from original:* the mutation is to the *test*, which is legitimate here — the question is whether the assertion is load-bearing rather than shadowed by its neighbour. `render` was mutated to cut every span to 40 characters under its own digest.
+- *Observed, in all four combinations, which is what makes this evidence:*
+  - **Neither weakened:** killed on both halves, for every citation. `citation 1 (calc/calc.go:14-17): the answer's text hashes to 8cb473c4…, the citation claims 4789a75d…` and `citation 1: lines 14-17 of calc/calc.go are not the bytes the answer shows`.
+  - **Digest weakened to "non-empty":** still fails, through `bracketsExactly`. So the range check is load-bearing.
+  - **`bracketsExactly` weakened to "the file is non-empty":** still fails, through the digest. So the digest check is load-bearing.
+  - **Both weakened:** `ok`. So nothing else in the test catches a truncated span, and the two assertions together are the whole guard.
+- *Compiles and vets:* yes.
 
-- [ ] **Step 6: Commit**
+**M4 — the cited line range shifted by one in both arms' SQL (`start_line + 1`).**
+- *Why the code exists:* the range is the citation. A digest proves the text was not altered; only the range says *where* that text lives, and an off-by-one is a citation pointing at the wrong code (models.Span says so).
+- *Fixture that separates mutant from original:* the committed fixture file, read from disk — the one input the pipeline did not produce. Both arms are mutated together on purpose: `spansOf` merges them and the lexical row would otherwise overwrite the shifted one, and shifting both keeps the answer's own header agreeing with the citation, so the *only* assertion left to fail is the range one.
+- *Must fail:* `TestAskOverARealIndexReturnsACitationWhoseDigestMatchesTheSpan`
+- *Observed:* killed, with the digest assertion passing — `read_live_test.go:390: citation 1: lines 15-17 of calc/calc.go are not the bytes the answer shows`. That is M3's isolation repeated against a mutation of the *code* rather than of the test.
+- *Compiles and vets:* yes; valid SQL returning the same rows in the same order with a different value, which is what rule 2 requires of a SQL mutation.
+
+**M5 — the repo filter defeated in both arms (`repo_id = $1 OR true`).**
+- *Why the code exists:* retrieval is scoped to one repository; a missing filter serves another repository's code to a caller who named this one.
+- *Fixture that separates mutant from original:* two repositories over the same tree — the AST corpus and the window corpus — where the window one holds a *strictly better* match for the doc-prose query, since `doc.go` produces no AST spans at all.
+- *Observed, and this is the defect the round found:* the first run killed only `TestPackageDocProseIsUnretrievableUnderTheASTStrategy` (`the AST corpus cited doc.go at 1-5; it has no spans there`, and the lexical case answered instead of refusing). **`TestAskOverARealIndex…` stayed green, and its scope assertion was vacuous**: it compared `citation.repo_id`, which `NewCitation` fills from the repository the *route* named — so a leaked span arrives carrying the right repo id. Fixed in its own commit before re-running: the test now reads each cited span back through the repo-scoped `GetSpan` and compares the served digest against the stored row. Re-run under the same mutant: killed — `citation 1 cites span 045c897b…, which is not in 9025dc7f…: store: not found`.
+- *Compiles and vets:* yes. `OR true` rather than deleting the predicate, because dropping it unbinds `$1` and pgx answers a protocol error, which is void.
+
+**M6 — `VectorRan` hard-wired to `true`.**
+- *Why the code exists:* it selects the arms *and* decides whether the floor applies. In lexical mode there is no cosine similarity, so a floor over `ts_rank_cd` would be a category error that typechecks.
+- *Fixture that separates mutant from original:* the lexical-mode runs. Every hybrid and vector case passes under the mutant, since `VectorRan` is already true there.
+- *Observed:* killed twice. `lexical over the AST corpus: want refused no_spans, got {…Refused:false…Answer:[1] big.go:3-42…}`, and `lexical mode: 4/10 ranked by the lexical arm, 10 by the vector one` plus `lexical mode reported a top score of 0.64549720287323`.
+- *Compiles and vets:* yes.
+
+**M7 — eviction leaves no tombstone (`… FROM gone WHERE false`).**
+- *Why the code exists:* spec §10 wants `410` for a repository that was here, and the cascade leaves nothing else to tell it from one that never was.
+- *Fixture that separates mutant from original:* a repository indexed and then evicted, driven on all four repo-keyed routes. An unknown id is `404` under both.
+- *Must fail:* `TestAnEvictedRepoAnswersGoneOnEveryReadRoute`
+- *Observed:* killed on all four routes — `an evicted repository answered 404, which forgets it was ever here`, and `want 410 after eviction, got 404: {"error":"no such repository"}`.
+- *Compiles and vets:* yes, and the `DELETE` still runs: a data-modifying CTE executes whether or not the outer query reads its rows, so this is a lost tombstone rather than a skipped eviction.
+
+**M8 — a rejected question counted as an answer error.**
+- *Why the code exists:* a request that never reached the answerer is not one of spec §10's three outcomes, and filing a caller's malformed question as an error inflates exactly the rate §10 wants readable.
+- *Fixture that separates mutant from original:* the `{"q":"   "}` case with the *whole set* of counter series read before and after. An assertion naming one series cannot see a mutant that moves a different one.
+- *Must fail:* `TestARefusalAnErrorAndAValidationFailureAreThreeOutcomesLive`
+- *Observed:* killed — `a validation failure moved map[codetrail_answer_total{outcome="error"}:1]; it must move no outcome counter at all`.
+- *Compiles and vets:* yes.
+
+- [x] **Step 6: Commit**
 
 ```bash
 git commit -m "feat(gateway): P3 end to end, and a README that does not claim a calibrated floor
@@ -1674,25 +2083,27 @@ is spec:316's experiment."
 ```
 
 **Definition of Done**
-- The whole path runs on a live database on the fake embedder in CI.
-- A citation returned by the API was checked byte-for-byte against `git show`, and the permalink was opened.
-- The README's floor and staleness claims are true, and a skim of either cannot produce "the floor is calibrated".
-- The `doc.go` asymmetry is pinned by a test and named in the README as a retrieval limitation.
+- [x] The whole path runs on a live database on the fake embedder in CI — six new live tests over a fixture corpus indexed through `chunk`, `embed.FromEnv` and `store`, with the CI step's comment saying what a green build proves and what it cannot.
+- [x] A citation returned by the API was checked byte-for-byte against `git show`, and the permalink was opened. `sampler.go:18-23` of `rs/zerolog` at `dfd11cca`, digest `a7a70e1e…`, hashed from the answer's own rendered text and from `git show … | sed … | head -c -1`; the permalink lands on L18–L23.
+- [x] The README's floor and staleness claims are true, and a skim of either cannot produce "the floor is calibrated" — "ships uncalibrated" and "measured in P6" are in the same paragraph, and the phase table's P3 row says the value is P6's.
+- [x] The `doc.go` asymmetry is pinned by a test and named in the README as a retrieval limitation — with the plan's prediction of a refusal corrected: under `hybrid` it answers from other files instead, and only `lexical` refuses.
 
 ---
 
 ## Definition of done for P3
 
-- [ ] Hybrid retrieval: pgvector cosine filtered by repo, fused by reciprocal rank with a lexical arm over symbol names and identifiers, switchable and measurable per arm.
-- [ ] Citations carry `(repo, commit, path, startLine, endLine, digest)`, render an immutable permalink for each supported forge and none for a forge whose format is unknown, and state exactly what is known about staleness and what is not.
-- [ ] An extractive answer assembles ranked spans with citation markers, never truncating a span under its own digest, with no model call and no API key.
-- [ ] A refusal happens when nothing is retrieved, when the top score falls under the floor, and when the top score is not a number — and it is a `200` with a reason.
-- [ ] Refusal and error are distinct in the metrics, asserted in both directions on both counters.
-- [ ] The floor is a knob, ships at `-1`, is labelled uncalibrated in the payload, the gauges, the boot log and the README, and P6 is named as where the number comes from.
-- [ ] The top-score histogram exists and its `Help` string says it is an instrument, not a calibration.
-- [ ] An evicted repo answers `410`; an unknown one `404`; job history is bounded by a stated age window that never deletes a running job.
-- [ ] A completed job names the repository it produced.
-- [ ] Every mutation is recorded with its observed output, and every survivor is recorded as a survivor with what it revealed.
+- [x] Hybrid retrieval: pgvector cosine filtered by repo, fused by reciprocal rank with a lexical arm over symbol names and identifiers, switchable and measurable per arm. Live: `TestEveryRetrievalModeRetrievesFromALiveCorpus` drives all three modes over one corpus and asserts which arm ranked what.
+- [x] Citations carry `(repo, commit, path, startLine, endLine, digest)`, render an immutable permalink for each supported forge and none for a forge whose format is unknown, and state exactly what is known about staleness and what is not.
+- [x] An extractive answer assembles ranked spans with citation markers, never truncating a span under its own digest, and needs no API key. **The "no model call" half of this line was false and is corrected here as it was in the README**: the *assembly* makes no model call, and the query is embedded on every search and every ask. What is true is no API key, no vendor cost, and offline.
+- [x] A refusal happens when nothing is retrieved, when the top score falls under the floor, and when the top score is not a number — and it is a `200` with a reason.
+- [x] Refusal and error are distinct in the metrics, asserted in both directions on both counters — hermetically in Task 7 and, on a live database with a real `ErrModelMismatch`, in Task 8, both as the whole set of series that moved.
+- [x] The floor is a knob, ships at `-1`, is labelled uncalibrated in the payload, the gauges, the boot log and the README, and P6 is named as where the number comes from. All four verified live: the running gateway serves `codetrail_score_floor -1` and `codetrail_score_floor_calibrated 0`.
+- [x] The top-score histogram exists and its `Help` string says it is an instrument, not a calibration.
+- [x] An evicted repo answers `410`; an unknown one `404`; job history is bounded by a stated age window that never deletes a running job (`status IN ('done','failed')` is the safety property, not a filter).
+- [x] A completed job names the repository it produced — verified live: `{"id":"0a7fca4c…","status":"done","repo_id":"bee14320c329c3c67b2786f124cbd74b"}`.
+- [x] Every mutation is recorded with its observed output, and every survivor is recorded as a survivor with what it revealed. **99 mutations across eight tasks, no void kills standing, and no survivor of the shipped configuration.** M1 here is the one mutant that survives under a *named environment* rather than under the code, and that survival is the finding that changed the CI step.
+
+**One residual risk this phase closes with, recorded rather than fixed.** Four knobs are read through `config.GetInt`, which answers its default for anything it cannot parse: `RETRIEVAL_RRF_K=abc`, `RETRIEVAL_CANDIDATES=oops`, `ANSWER_MAX_SPANS=five` and `ANSWER_MAX_CHARS=lots` each boot silently on the shipped value. Measured by running the binary with each: the first three logged `rrf_k=60 candidates=40` and `answer_max_spans=5` and started, while `ANSWER_SCORE_FLOOR=abc` and `RETRIEVAL_MODE=nope` refused. Their *ranges* are all validated — a negative `k`, a zero depth, a zero budget and a floor outside `[-1,1]` are each a refusal naming the setting — so "validated at boot" is true of the values and not of the parse. The floor is hand-parsed for exactly this reason, and the same hardening is owed to the other four and to P1's integer caps; it is written in the README rather than rounded up, because "all knobs validated at boot" is the sentence P2's review already found false once.
 
 **Not in P3, deliberately:** no symbol graph and no `definition_of`/`callers_of` (P4) — the spec lists them as tools for the LLM loop, which is P7. No LLM answering: the response already names `answered_by` so the field exists before there is anything to downgrade from. No console (P5). No eval harness, golden set or calibration (P6) — P3's contribution to it is the instrument and the switchable arms. No incremental re-index (P7). No rate limit on submission, which is the control the job-retention window explicitly does not replace. No `/metrics` on the indexer, so its eviction and job-outcome counters have nowhere to live yet.
 
@@ -1736,12 +2147,20 @@ Nothing here is blocking. Each is something the spec does not settle, with the t
     *Recommendation:* as above. Past it, an evicted repo goes back to `404`, which is honest — we no longer remember. A time-based bound would be equally defensible; count is chosen because the table's purpose is "recently evicted" and its growth is bounded by eviction, which is itself bounded.
 
 12. **Generated column versus expression index for the lexical arm.**
-    *Recommendation:* the generated column. It costs a table rewrite on migration and roughly a third more storage on `spans`, and it buys a query that reads `lex @@ q` instead of repeating a two-`setweight` expression that has to match the index's definition character for character. Revisit if the corpus grows two orders of magnitude.
+    *Recommendation:* the generated column — **on the measured reason, not the one first written down**. The plan originally argued that an expression index means a sequential scan; over 5,000 rows on the pinned image, the expression repeated verbatim plans as a Bitmap Index Scan, so that argument is false. It costs a table rewrite on migration and roughly a third more storage on `spans`, and it buys a query that reads `lex @@ q` instead of repeating a two-`setweight` expression that has to match the index's definition character for character — where one changed letter turns the same plan into a Seq Scan with no error — plus not recomputing the vector in `ts_rank_cd` for every row it ranks. Revisit if the corpus grows two orders of magnitude.
 
 13. **How a caller finds a repo id.** `jobs.repo_id` covers the submit-then-poll flow, and `GET /api/repos` lists the corpus.
     *Recommendation:* both, as specified. What is deliberately *not* added is `GET /api/repos?remote=…&ref=…`: it is the right endpoint for the console, and P5 is where the console's needs are known. After the job history window, a caller's only route to an id is the listing — which is correct, since the corpus is itself LRU-evicted and a link to a repo that is gone should not resolve.
 
 14. **Where the eval's two arms live** (carried forward from P2, unchanged and still open). `RepoID` and `SpanID` have no room for a strategy, so the arms want a database each. P3 does not foreclose it: the retriever takes a store, the store takes a DSN, and nothing in this phase joins across arms or infers a strategy from a row. P6 decides.
+
+15. **The lexical arm's ranking function makes repetition outrank coverage, and `simple` has no stopword list.** Both are consequences of Task 3's shipped choices, both were found by measurement, and neither is a defect to fix now.
+    Under `ts_rank_cd` a span mentioning one query term six times outranks a span mentioning each of two terms once (2.4 against 0.8); under `ts_rank` the order reverses (0.1813 against 0.2432). Cover density does not enter into it — it never runs under `OR`, which is the only shape this arm builds — so the choice between the functions is a choice between *frequency* and *distinct-term coverage*, made without a corpus to measure against. Separately, the `simple` configuration drops nothing, so "where is X defined" ORs in `where`, `is` and `defined`, and every span containing the word "defined" is a candidate. The two compound: a span that says "where" six times is a hit.
+    *Recommendation:* leave both as they ship, and keep them visible rather than papering over them. Task 3's test is named `TestRepetitionOutranksCoverageUnderTheShippedRankingFunction` precisely so the consequence is in the test list and not only in a comment, and M6 records that the function is pinned but not justified. **This is a P6 question** — spec:316 makes the whole arm's value an experiment, and both a ranking-function sweep and a code-appropriate stopword list are things to decide with a golden set in front of you. Adding either now would be a guess wearing a measurement's clothes, which is the same mistake the `-1` floor exists to avoid.
+    **Confirmed on a real corpus in Task 8, and now in the README.** Both numbers re-measured against the pinned pg17 (`ts_rank_cd` 2.4 against 0.8; `ts_rank` 0.18133 against 0.24317), and the consequence is visible in the shipped product rather than only in a fixture: asking `rs/zerolog` "how does the sampler decide to drop an event" in `hybrid` returns `event_test.go` at ranks 4 and 5, because `event` is a live term and the test file repeats it. That is reported as one of two result sets, never as evidence that either mode is better.
+
+16. **Nothing in the lexical suite detects a missing `ORDER BY` on the ranking pair, and the obvious fix does not work.** Task 3's M9 dropped the arm's `ORDER BY` and survived `TestRepetitionOutranksCoverageUnderTheShippedRankingFunction` twice: once because the two spans had been inserted in the order the test expects them back, and again after that was corrected, because with no `ORDER BY` the pair comes back `[x_repeat, y_cover]` **whichever order it was inserted in**. An unordered result is not an insertion-ordered result, and "Fixtures" rule 2 — build the fixture so the answer disagrees with insertion order — is therefore necessary but not sufficient; Task 2's M5 found the same thing from the other side, where the rows came back in *path* order.
+    *Recommendation:* nothing to change now. M9 is killed by `TestSymbolOutweighsBody`, so the arm's ordering is pinned; what is recorded here is that the fixture rule the plan leaned on does not do the work it was assumed to do. A phase that writes a new retrieval fixture should assert the disagreement it depends on rather than construct it, as Task 2's ranking test now does.
 
 ---
 

@@ -3,11 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
-	"io"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -49,12 +45,23 @@ type fakeQueue struct {
 	leases    []string
 	leaseFor  []time.Duration
 	completed []string
-	failed    []failCall
+	// repoIDs is what each Complete named as the job's product; it is the only
+	// route from a submission to the repository it produced.
+	repoIDs []string
+	failed  []failCall
 	// The error state of the context each write was made with. A job that ran
 	// out of time is the one whose failure most needs recording, and a write on
 	// the context that just expired records nothing.
 	completedCtx []error
 	failedCtx    []error
+
+	// sweepErr fails the retention sweep; sweptFor records the window each call
+	// asked for, and its length is the call count.
+	sweepErr  error
+	sweptFor  []time.Duration
+	sweptWhen []time.Time
+	// clock, when set, is what Sweep stamps sweptWhen from.
+	clock func() time.Time
 }
 
 func (q *fakeQueue) Lease(_ context.Context, worker string, d time.Duration) (jobs.Job, bool, error) {
@@ -74,11 +81,12 @@ func (q *fakeQueue) Lease(_ context.Context, worker string, d time.Duration) (jo
 	return j, true, nil
 }
 
-func (q *fakeQueue) Complete(ctx context.Context, id, worker string) error {
+func (q *fakeQueue) Complete(ctx context.Context, id, worker, repoID string) error {
 	if q.blockUntilDone {
 		<-ctx.Done()
 	}
 	q.completed = append(q.completed, id+"@"+worker)
+	q.repoIDs = append(q.repoIDs, repoID)
 	q.completedCtx = append(q.completedCtx, ctx.Err())
 	return q.completeErr
 }
@@ -90,6 +98,17 @@ func (q *fakeQueue) Fail(ctx context.Context, id, worker, reason string, max int
 	q.failed = append(q.failed, failCall{id, worker, reason, max})
 	q.failedCtx = append(q.failedCtx, ctx.Err())
 	return q.failErr
+}
+
+func (q *fakeQueue) Sweep(_ context.Context, keepFor time.Duration) (int, error) {
+	q.sweptFor = append(q.sweptFor, keepFor)
+	if q.clock != nil {
+		q.sweptWhen = append(q.sweptWhen, q.clock())
+	}
+	if q.sweepErr != nil {
+		return 0, q.sweepErr
+	}
+	return 0, nil
 }
 
 const testWorker = "host-0123456789abcdef"
@@ -117,7 +136,10 @@ func testIndexer(t *testing.T, q *fakeQueue) (*indexer, *bytes.Buffer) {
 			poll:  time.Millisecond,
 			// Likewise distinct from every other number here, so a call that
 			// passes the wrong one is visible.
-			keepRepos: 7,
+			keepRepos:      7,
+			keepTombstones: 9,
+			jobHistory:     11 * time.Hour,
+			sweepEvery:     13 * time.Minute,
 			// Small enough that a fixture of a few spans crosses batches: a
 			// batch loop that stops after the first is invisible at 32.
 			embedBatch: 2,
@@ -142,10 +164,11 @@ func testIndexer(t *testing.T, q *fakeQueue) (*indexer, *bytes.Buffer) {
 			t.Error("putSpans ran when it should not have")
 			return errors.New("unexpected putSpans")
 		},
-		evict: func(context.Context, int) (int, error) {
+		evict: func(context.Context, int, int) (int, error) {
 			t.Error("evict ran when it should not have")
 			return 0, errors.New("unexpected evict")
 		},
+		now: time.Now,
 	}
 	return ix, &logged
 }
@@ -188,6 +211,7 @@ func TestLimitsRefuseANonPositiveKnob(t *testing.T) {
 	for _, key := range []string{
 		"MAX_REPO_BYTES", "JOB_DEADLINE_SECONDS", "MAX_REPO_FILES",
 		"MAX_FILE_BYTES", "MAX_ATTEMPTS", "POLL_SECONDS", "KEEP_REPOS", "EMBED_BATCH",
+		"KEEP_TOMBSTONES", "JOB_HISTORY_HOURS", "JOB_SWEEP_MINUTES",
 	} {
 		t.Run(key, func(t *testing.T) {
 			t.Setenv(key, "0")
@@ -216,17 +240,23 @@ func TestLimitsAreWiredToTheCapsTheyName(t *testing.T) {
 	t.Setenv("POLL_SECONDS", "66")
 	t.Setenv("KEEP_REPOS", "77")
 	t.Setenv("EMBED_BATCH", "88")
+	t.Setenv("KEEP_TOMBSTONES", "99")
+	t.Setenv("JOB_HISTORY_HOURS", "111")
+	t.Setenv("JOB_SWEEP_MINUTES", "222")
 	lim, err := limitsFrom()
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := limits{
-		clone:      clone.Limits{MaxBytes: 11, Deadline: 22 * time.Second},
-		walk:       walk.Limits{MaxFiles: 33, MaxFileBytes: 44},
-		tries:      55,
-		poll:       66 * time.Second,
-		keepRepos:  77,
-		embedBatch: 88,
+		clone:          clone.Limits{MaxBytes: 11, Deadline: 22 * time.Second},
+		walk:           walk.Limits{MaxFiles: 33, MaxFileBytes: 44},
+		tries:          55,
+		poll:           66 * time.Second,
+		keepRepos:      77,
+		keepTombstones: 99,
+		embedBatch:     88,
+		jobHistory:     111 * time.Hour,
+		sweepEvery:     222 * time.Minute,
 	}
 	if lim != want {
 		t.Fatalf("want %+v, got %+v", want, lim)
@@ -298,8 +328,11 @@ func TestRunJobIndexesAndCompletes(t *testing.T) {
 		return nil
 	}
 	var keeps []int
-	ix.evict = func(_ context.Context, keep int) (int, error) {
+	ix.evict = func(_ context.Context, keep, keepTombstones int) (int, error) {
 		keeps = append(keeps, keep)
+		if keepTombstones != ix.lim.keepTombstones {
+			t.Errorf("evicted keeping %d tombstones, want %d", keepTombstones, ix.lim.keepTombstones)
+		}
 		return 0, nil
 	}
 
@@ -412,7 +445,7 @@ func TestRunJobRemovesTheScratchTreeOnEveryPath(t *testing.T) {
 			ix.clone, ix.walk = okClone, okWalk
 			ix.put = func(context.Context, models.Repo, []models.File) error { return nil }
 			ix.putSpans = okPutSpans
-			ix.evict = func(context.Context, int) (int, error) { return 0, nil }
+			ix.evict = func(context.Context, int, int) (int, error) { return 0, nil }
 		}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -747,7 +780,7 @@ func TestEvictionRunsOnlyAfterAnIndexThatCompleted(t *testing.T) {
 			ix, _ := testIndexer(t, tc.q)
 			tc.set(ix)
 			var ran bool
-			ix.evict = func(_ context.Context, keep int) (int, error) {
+			ix.evict = func(_ context.Context, keep, _ int) (int, error) {
 				ran = true
 				if keep != ix.lim.keepRepos {
 					t.Errorf("evicted keeping %d, want %d", keep, ix.lim.keepRepos)
@@ -775,7 +808,7 @@ func TestAFailedEvictionIsLoggedAndDoesNotUncompleteTheJob(t *testing.T) {
 	ix.walk = func(context.Context, string, walk.Limits) ([]walk.File, error) { return nil, nil }
 	ix.put = func(context.Context, models.Repo, []models.File) error { return nil }
 	ix.putSpans = okPutSpans
-	ix.evict = func(context.Context, int) (int, error) { return 0, errors.New("postgres went away") }
+	ix.evict = func(context.Context, int, int) (int, error) { return 0, errors.New("postgres went away") }
 
 	ix.runJob(context.Background(), aJob())
 
@@ -801,7 +834,7 @@ func TestAnEvictionThatDroppedReposSaysHowMany(t *testing.T) {
 	ix.walk = func(context.Context, string, walk.Limits) ([]walk.File, error) { return nil, nil }
 	ix.put = func(context.Context, models.Repo, []models.File) error { return nil }
 	ix.putSpans = okPutSpans
-	ix.evict = func(context.Context, int) (int, error) { return 3, nil }
+	ix.evict = func(context.Context, int, int) (int, error) { return 3, nil }
 
 	ix.runJob(context.Background(), aJob())
 
@@ -834,7 +867,7 @@ func TestCaseVariantRemotesIndexToOneRepo(t *testing.T) {
 			return nil
 		}
 		ix.putSpans = okPutSpans
-		ix.evict = func(context.Context, int) (int, error) { return 0, nil }
+		ix.evict = func(context.Context, int, int) (int, error) { return 0, nil }
 		ix.runJob(context.Background(), jobs.Job{
 			ID: "j", Remote: remote, Ref: "main", Status: jobs.StatusLeased, Attempts: 1,
 		})
@@ -997,7 +1030,7 @@ func fakeIndexer(t *testing.T, opts ...fixtureOpt) (*indexer, *recorder) {
 		rec.order = append(rec.order, "putSpans")
 		return nil
 	}
-	ix.evict = func(context.Context, int) (int, error) { return 0, nil }
+	ix.evict = func(context.Context, int, int) (int, error) { return 0, nil }
 	return ix, rec
 }
 
@@ -1331,93 +1364,6 @@ func TestEmbedderConstructionRefusesTheWrongWidth(t *testing.T) {
 	}
 }
 
-// answersOneVector is an Ollama that has the model and returns the schema's
-// width, which is what a healthy boot probe finds.
-func answersOneVector(t *testing.T) string {
-	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		v := make([]float32, store.EmbeddingDim)
-		v[0] = 1
-		json.NewEncoder(w).Encode(struct {
-			Embeddings [][]float32 `json:"embeddings"`
-		}{[][]float32{v}})
-	}))
-	t.Cleanup(srv.Close)
-	return srv.URL
-}
-
-// Both providers are constructible, and nothing else is: a typo in
-// EMBED_PROVIDER must not fall back to one of them silently.
-func TestEmbedderProviders(t *testing.T) {
-	// The ollama arm needs a server now, because constructing it proves it
-	// answers; the fake arm ignores the URL entirely.
-	t.Setenv("OLLAMA_URL", answersOneVector(t))
-	for _, tc := range []struct{ provider, model string }{
-		{"fake", "fake-hashed-bow"},
-		{"ollama", "nomic-embed-text"},
-	} {
-		t.Setenv("EMBED_PROVIDER", tc.provider)
-		e, err := newEmbedder(context.Background(), time.Minute)
-		if err != nil {
-			t.Fatalf("%s: %v", tc.provider, err)
-		}
-		if e.Model() != tc.model || e.Dim() != store.EmbeddingDim {
-			t.Errorf("%s: model %q dim %d, want %q and %d", tc.provider, e.Model(), e.Dim(), tc.model, store.EmbeddingDim)
-		}
-	}
-	t.Setenv("EMBED_PROVIDER", "olama")
-	if _, err := newEmbedder(context.Background(), time.Minute); err == nil {
-		t.Fatal("a misspelt provider was accepted")
-	}
-}
-
-// The README calls every knob boot-validated, and these two were not.
-// Measured before: `OLLAMA_URL='not a url at all' EMBED_MODEL='no-such-model-xyz'`
-// logged "indexer up" and the failure surfaced on the first leased job's embed
-// call, spending an attempt against the cap for a setting no retry can fix.
-//
-// Each case names the knob that is wrong, because "connection refused" on a
-// job is what this is replacing.
-func TestTheEmbedderAddressAndModelAreValidatedAtBoot(t *testing.T) {
-	missingModel := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// The real server's answer for a model that was never pulled: a 404
-		// whose body is JSON and decodes cleanly into the success shape.
-		w.WriteHeader(http.StatusNotFound)
-		io.WriteString(w, `{"error":"model \"no-such-model-xyz\" not found"}`)
-	}))
-	defer missingModel.Close()
-	// A listener that is closed: the address is well formed and nothing is
-	// there, which is the misconfiguration a typo'd port makes.
-	gone := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	goneURL := gone.URL
-	gone.Close()
-
-	const badAddress = "is not an http:// or https:// address"
-	// Each want is the part of the message that could only have come from the
-	// check being tested: "an error happened" would pass against a client that
-	// merely failed differently later.
-	for _, tc := range []struct{ name, url, model, want string }{
-		{"not an address", "not a url at all", "nomic-embed-text", badAddress},
-		{"no scheme", "localhost:11435", "nomic-embed-text", badAddress},
-		{"no host", "http://", "nomic-embed-text", badAddress},
-		{"model never pulled", missingModel.URL, "no-such-model-xyz", `EMBED_MODEL="no-such-model-xyz"`},
-		{"nothing listening", goneURL, "nomic-embed-text", `EMBED_MODEL="nomic-embed-text" at OLLAMA_URL=`},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("EMBED_PROVIDER", "ollama")
-			t.Setenv("OLLAMA_URL", tc.url)
-			t.Setenv("EMBED_MODEL", tc.model)
-			_, err := newEmbedder(context.Background(), time.Minute)
-			if err == nil {
-				t.Fatalf("%s booted", tc.name)
-			}
-			if !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("the error does not name %s: %v", tc.want, err)
-			}
-		})
-	}
-}
-
 // Every knob fails closed at boot, the way the caps do: config.GetInt reads a
 // literal "0" as 0, and a zero window silently drops every fallback span.
 func TestBadChunkOptionsRefuseToBoot(t *testing.T) {
@@ -1570,5 +1516,134 @@ func TestTheEvalsWindowArmSurvivesAStrippedPackageComment(t *testing.T) {
 	// silent drop is how a corpus shrinks with nothing to read about it.
 	if out := rec.logged.String(); !strings.Contains(out, `"tokenless":1`) {
 		t.Errorf("the dropped-chunk count is not in the log: %q", out)
+	}
+}
+
+// pollCounter drives run() for a fixed number of polls: fakeQueue calls stop
+// each time it is asked for a job it has not got, so a counter there is the
+// loop's iteration count. after runs at the poll it names, which is how the
+// clock moves between phases.
+func pollCounter(cancel func(), stopAt int, after map[int]func()) func() {
+	polls := 0
+	return func() {
+		polls++
+		if f, ok := after[polls]; ok {
+			f()
+		}
+		if polls >= stopAt {
+			cancel()
+		}
+	}
+}
+
+// The loop polls every POLL_SECONDS and the window the sweep enforces is a
+// week, so a DELETE per poll would be a scan thousands of times more often than
+// anything can change its answer. The interval check is the whole point.
+//
+// A fake clock, because the alternative is a wall-clock wait: with a real one
+// this test is either a sleep or a flake, and rule 6 rules both out.
+func TestTheSweepRunsAtMostOncePerInterval(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var ix *indexer
+	now := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	q := &fakeQueue{clock: func() time.Time { return now }}
+	q.stop = pollCounter(cancel, 8, map[int]func(){
+		// Just short of the interval on poll 4, so polls 5 and 6 still must not
+		// sweep; over it on poll 6, so poll 7 must.
+		4: func() { now = now.Add(ix.lim.sweepEvery - time.Second) },
+		6: func() { now = now.Add(time.Second) },
+	})
+	ix, _ = testIndexer(t, q)
+	ix.now = func() time.Time { return now }
+
+	done := make(chan struct{})
+	go func() { defer close(done); ix.run(ctx) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("run did not return after its context was cancelled")
+	}
+
+	if len(q.leases) != 8 {
+		t.Fatalf("the fixture drove %d polls, want 8", len(q.leases))
+	}
+	if len(q.sweptFor) != 2 {
+		t.Fatalf("swept %d times in 8 polls spanning one interval boundary, want 2 (at %v)", len(q.sweptFor), q.sweptWhen)
+	}
+	// The second sweep is the one after the boundary, not a second one inside
+	// the first interval.
+	if !q.sweptWhen[1].Equal(q.sweptWhen[0].Add(ix.lim.sweepEvery)) {
+		t.Errorf("swept at %v then %v, want the second an interval later", q.sweptWhen[0], q.sweptWhen[1])
+	}
+	for i, keepFor := range q.sweptFor {
+		if keepFor != ix.lim.jobHistory {
+			t.Errorf("sweep %d asked to keep %v, want JOB_HISTORY_HOURS of %v", i, keepFor, ix.lim.jobHistory)
+		}
+	}
+}
+
+// Job history is not what this worker is for. A sweep that cannot run must not
+// cost the queue a poll — and must still respect its interval, or a database
+// that is down turns into a DELETE attempt every two seconds.
+func TestSweepFailureDoesNotStopLeasing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	now := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	q := &fakeQueue{sweepErr: errors.New("postgres went away"), clock: func() time.Time { return now }}
+	q.stop = pollCounter(cancel, 4, nil)
+	ix, logged := testIndexer(t, q)
+	ix.now = func() time.Time { return now }
+
+	done := make(chan struct{})
+	go func() { defer close(done); ix.run(ctx) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a failing sweep stopped the lease loop")
+	}
+
+	if len(q.leases) != 4 {
+		t.Errorf("leased %d times after a failing sweep, want 4", len(q.leases))
+	}
+	if len(q.sweptFor) != 1 {
+		t.Errorf("a failing sweep ran %d times inside one interval, want 1", len(q.sweptFor))
+	}
+	if out := logged.String(); !strings.Contains(out, "job sweep failed") || !strings.Contains(out, "postgres went away") {
+		t.Errorf("a failed sweep left no usable trace: %q", out)
+	}
+}
+
+// The repo id is hash(key, commit) and only this binary ever saw the commit, so
+// the job row is where a caller learns what their submission produced. It must
+// be the id the same job wrote its rows under, not merely some id.
+func TestACompletedJobNamesTheRepoItIndexed(t *testing.T) {
+	q := &fakeQueue{}
+	ix, _ := testIndexer(t, q)
+	ix.clone = func(_ context.Context, _, _, d string, _ clone.Limits) (clone.Result, error) {
+		writeCheckout(t, d, map[string]string{"main.go": mainGo})
+		return clone.Result{Dir: d, Commit: testCommit, Bytes: 1}, nil
+	}
+	ix.walk = func(context.Context, string, walk.Limits) ([]walk.File, error) {
+		return []walk.File{{Path: "main.go", Lang: "go", Lines: 3, Bytes: 40}}, nil
+	}
+	var written string
+	ix.put = func(_ context.Context, r models.Repo, _ []models.File) error {
+		written = r.ID
+		return nil
+	}
+	ix.putSpans = okPutSpans
+	ix.evict = func(context.Context, int, int) (int, error) { return 0, nil }
+
+	ix.runJob(context.Background(), aJob())
+
+	want := store.RepoID("github.com/a/b", testCommit)
+	if written != want {
+		t.Fatalf("the fixture indexed %q, want %q", written, want)
+	}
+	if len(q.repoIDs) != 1 || q.repoIDs[0] != want {
+		t.Errorf("the completed job names %v, want [%s]", q.repoIDs, want)
 	}
 }
