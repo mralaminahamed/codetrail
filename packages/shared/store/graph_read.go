@@ -79,11 +79,19 @@ func scanSymbol(sc scanner, sy *models.Symbol, rest ...any) error {
 //	*path*, which is exponential in the fan-in. Measured at depth 5 over the
 //	live fixture's eight definitions: 19 rows guarded, 46 unguarded.
 //
-// The guard cannot change this query's rows, and that is not a reason to drop
-// it: min(depth) is the BFS distance and a walk that revisits a node is never
-// shorter than the path that does not, so the guard changes the cost and never
-// the answer. TestTheCycleGuardBoundsTheTraversalItselfLive is what reads it
-// back, because nothing in the result set can.
+// The guard changes the cost and, on a cycle, one row of the answer. For every
+// symbol other than the queried one it changes nothing: min(depth) is the BFS
+// distance and a walk that revisits a node is never shorter than the path that
+// does not. The exception is the queried symbol itself, because the anchor
+// seeds path with it — so a symbol that indirectly calls itself is absent from
+// its own caller list while a *direct* self-call, which the anchor produces, is
+// present at depth 1. Measured on rs/zerolog's mutually recursive CBOR decoder
+// in P4's Task 7; the plan's earlier claim that the guard is answer-neutral is
+// true only of a fixture whose target is off the cycle.
+//
+// So "who calls this" reads as "who else calls this" once a cycle is involved.
+// Nothing in a fixture's result set reads the guard back, which is why
+// TestTheCycleGuardBoundsTheTraversalItselfLive asserts the work instead.
 //
 // depth < 1 is not refused here: the anchor is unconditional, so depth 0 still
 // returns the direct callers. The bound is the caller's and the endpoint is

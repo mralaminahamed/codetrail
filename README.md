@@ -19,9 +19,12 @@
 > [P1](docs/superpowers/plans/2026-08-31-p1-ingestion.md) — ingestion —
 > [P2](docs/superpowers/plans/2026-09-01-p2-chunking.md) — chunking, embeddings and spans — and
 > [P3](docs/superpowers/plans/2026-09-01-p3-retrieval.md) — retrieval, citations and the extractive
-> ask — are merged and green in CI. A repository goes in, citable spans come out, and a question
-> now gets an answer whose citations check byte for byte against the file at that commit. **The
-> score floor ships uncalibrated and the chunking experiment has not been run** — both are P6.
+> ask — and [P4](docs/superpowers/plans/2026-09-02-p4-symbol-graph.md) — the symbol graph, per-edge
+> provenance and the graph endpoints — are merged and green in CI. A repository goes in, citable
+> spans come out, a question gets an answer whose citations check byte for byte against the file at
+> that commit, and its call graph can be walked with every edge saying how much it knows about its
+> target. **The score floor ships uncalibrated and the chunking experiment has not been run** —
+> both are P6, and nothing here yet says which chunking retrieves better.
 > This README says plainly which parts exist. See [Status](#status).
 
 ## What it is
@@ -180,7 +183,7 @@ does **not** bound is a flood inside the window; the control for that is a rate 
 
 ### What it does today
 
-All four captures below are real terminal output from the merged phases, not mockups. There is
+All five captures below are real terminal output from the merged phases, not mockups. There is
 no console yet — that is P5 — so there is no UI to screenshot, and inventing one would break the
 rule at the bottom of this file.
 
@@ -206,6 +209,14 @@ And a question over that index gets an extractive answer whose top citation hash
 newline after it, so `sed -n '18,23p' | sha256sum` alone hashes one byte more than the digest
 covers. The check is only a check if it fails when it should.
 
+And the graph over that same index answers "who calls this" — with a `file:line` per hop, a
+checkable citation per caller, and the name-matched guesses kept in a list of their own:
+
+<img src="assets/screenshots/graph.png" alt="Event.Msg's three resolved callers with their call sites, its three name-matched approximate callers, and the cited line and digest checked against git show" width="880">
+
+The same check again, one layer up: the cited line holds the call, and the caller's digest is what
+`git show` prints for exactly those bytes. See [The symbol graph](#the-symbol-graph-and-its-honesty)
+for what the two lists mean and why they are two.
 
 ## Chunking, and the two corpora
 
@@ -412,14 +423,153 @@ golden set yet, so nothing below says retrieval is good.
 A precise Go call graph needs type information, which needs the repository to actually compile —
 right Go version, dependencies downloadable. Plenty of public repositories will not, in a sandbox.
 
-So codetrail tries `go/packages` with full type information and falls back to syntactic, name-based
-edges when that fails — and **labels every edge with which one it got**. A `resolved` edge means
-*this exact symbol*. A `syntactic` edge means *something named `Close`*, and its target is recorded
-as null rather than as a guess.
+So codetrail takes **every** call site from the AST first, then lets `go/packages` upgrade the rows
+it can name — and **labels every edge with which one it got**. A `resolved` edge means *this exact
+symbol*, and points at its row. A `syntactic` edge means *something named `Close`*, and its target
+is recorded as **null rather than as a guess**. Nothing binds it afterwards: "who calls this"
+traverses `to_symbol_id` and never a name, and name-matched callers come back in a separate,
+labelled, depth-1 set with its own count — so a client that flattens the two does it knowingly.
 
-The label is **per-edge, not per-repository**: a repository where three packages type-check and two
-do not gets precise edges for the three and honest approximations for the two, rather than being
-downgraded wholesale.
+The label is **per-edge, not per-repository**. The edge *set* comes from the AST and type
+information only ever upgrades individual rows, so the same repository indexed with and without the
+type-checker produces **the same edge ids** and differs only in `provenance` and `to_symbol_id`; a
+live test asserts exactly that. A repository where nine packages type-check and four do not gets
+precise edges for the nine and honest approximations for the four, rather than being downgraded
+wholesale.
+
+**P4 writes `calls` edges only.** `imports` and `references` are in the schema's `kind` enum and
+nothing writes them. `imports` cannot be written under this schema at all — `from_symbol_id` is
+`NOT NULL` and an import belongs to a *file*, not to a definition — and `references` is roughly
+every identifier use in a corpus, which is a volume decision to make with a measured row count
+rather than before one.
+
+### What one real repository looks like
+
+`rs/zerolog` at `dfd11cca`, on the default policy. These are what indexing **cost and produced**.
+No golden set exists yet, so nothing here says the graph is good.
+
+| | |
+| --- | --- |
+| symbols (definitions) | 1,234 |
+| edges (call sites) | 7,895 |
+| `resolved` | 945 |
+| `syntactic` | 6,950 |
+| resolved to something outside the repository, counted `external` | 498 |
+| callees that are neither an identifier nor a selector, counted `unnameable` | 435 |
+| packages attempted / loaded / failed | 13 / 9 / 4 |
+| the job's type-check `reason` | `load_error`, and the job still finished `done` |
+
+**Just under one edge in eight resolves** — 945 of 7,895. That is the phase's result rather than a
+disappointment: it is what an honest label looks like on a repository the sandbox will not build.
+Two independent causes, both measurable:
+
+- **Four of the thirteen packages do not load**, because imports they need are in modules that are
+  not in the job's cache and `GOPROXY=off`. Named, with what each one could not import:
+  `zerolog` (`github.com/mattn/go-colorable`), `hlog` (`github.com/rs/xid`), `journald`
+  (`github.com/coreos/go-systemd/v22/journal`) and `pkgerrors` (`github.com/pkg/errors`).
+- **External test packages are never loaded at all** — the loader runs with `Tests: false` — so
+  every call written in `zerolog_test`, `log_test`, `diode_test` and `hlog_test` is syntactic. That
+  is 997 of the 6,950 on its own.
+
+Per package clause, which is where the per-edge claim stops being an argument and becomes data:
+
+| package clause | resolved | syntactic |
+| --- | --- | --- |
+| `zerolog` | 613 | 2,823 |
+| `cbor` | 172 | 1,427 |
+| `json` | 39 | 1,018 |
+| `zerolog_test` | 0 | 785 |
+| `hlog` | 54 | 335 |
+| `log` | 26 | 1 |
+| the other ten | 41 | 561 |
+
+The first row is the one worth reading twice: `zerolog` is one of the four packages that **failed to
+load**, and it still carries 613 resolved edges. A stage that had stamped the package's outcome on
+its rows would have written 3,436 syntactic edges there and looked entirely healthy.
+
+### Checking a hop
+
+The fifth capture in [What it does today](#what-it-does-today) is one, in full. `Event.Msg` has
+three resolved callers; the second is `Logger.Print`, and the answer says the call is at
+`log.go:457`. At that commit, line 457 is
+`e.CallerSkipFrame(1).Msg(fmt.Sprint(v...))` — the call is where the graph says it is.
+`Logger.Print`'s own citation covers `log.go:453-459`, and its digest is what `git show` piped
+through `sed` and `sha256sum` produces for exactly those bytes. `head -c -1` is load-bearing again:
+a span's text ends at the last byte of its last line, not at the newline after it.
+
+The three approximate callers are in `benchmark_test.go`, inside the external test package the
+loader never opened. They call *something named* `Msg`. No column says which one, and that is the
+entire difference between the two lists.
+
+### What the type-checker is allowed to do
+
+Nothing by default except read the checkout. `go` is forked inside a stranger's source tree and it
+is a program whose purpose is to fetch things and compile them, so its environment is an
+**allowlist built from nothing** rather than the parent's with a few overrides: `GOPROXY=off`,
+`GOVCS=*:off`, `GOTOOLCHAIN=local`, `GOWORK=off`, `GOENV=off`, `GOPACKAGESDRIVER=off`,
+`CGO_ENABLED=0`, and scratch-local `GOMODCACHE`, `GOCACHE`, `GOPATH` and `GOTMPDIR` that go with
+the job. Everything else — `GOFLAGS`, `GOPRIVATE`, `GOROOT`, `GOEXPERIMENT`, `GODEBUG`,
+`LD_PRELOAD`, `HTTPS_PROXY` — is closed **by omission**, which is a stronger claim than setting it
+to a safe value: omission survives a mutation that appends to `os.Environ`, and a safe value does
+not.
+
+**A recording proxy receives zero requests**, with a control run beside it — the same fixture, the
+same proxy, the child allowed to fetch — that reaches it. The zero is evidence rather than an
+absence.
+
+**The residual risk, stated rather than implied.** `go/packages` runs `exec.Command("go", …)`,
+which resolves that name against the **parent's** `PATH`; nothing in the child environment above
+chooses which binary runs. What the code does about it is refuse to run when the two disagree:
+`Validate` requires the configured `GoBin` to be exactly what the parent's `PATH` resolves `go` to,
+so a substitution is a refusal rather than a silent swap. What it cannot do is help a worker whose
+`PATH` was hostile at boot — whoever controls the indexer's environment chooses its compiler. The
+same has been true of `git` since P1.
+
+**An operator can turn module fetching on** with `TYPECHECK_GOPROXY`. It buys resolution for
+packages with third-party imports. It costs outbound requests to hosts chosen by a stranger's
+`go.mod` — the SSRF the admission allowlist exists to refuse, reached by a road that allowlist
+cannot see. `direct`, and any `,direct` fallback, is **refused at boot**, because that is the
+setting that turns a `require` line into an outbound `git` to a host of someone else's choosing.
+Measured with the entry removed from the allowlist entirely: the go command falls back to
+`https://proxy.golang.org,direct` and a fixture requiring `golang.org/x/mod` type-checks. That is
+the SSRF, executed.
+
+**The indexer needs a `go` binary on `PATH`.** Without one it still indexes — every edge is
+syntactic, a `no_toolchain` reason is counted, and one line at boot says so — because an indexer
+that cannot type-check is a better product than one that will not start. There is no container
+image yet; when P8 builds one it **must include a Go toolchain**, or production is all-syntactic
+while CI is not, which is the silent downgrade that costs a week.
+
+### Four limits this phase measured
+
+- **A call into the standard library resolves and is still recorded as `syntactic`.**
+  `fmt.Sprintf` names a real object and has no row in this repository to point at, and the
+  invariant that a null target is what makes the label mean anything is the one that cannot bend.
+  The fact is not lost — those 498 calls are counted `external`, separately from the ones nothing
+  could name at all. A third enum value would be more informative; the schema has two.
+- **The cycle guard is not answer-neutral, and this repository's own comment said it was.** "Who
+  calls this" is a recursive CTE whose guard stops a walk re-entering a node it has already passed,
+  and the walk starts at the queried symbol — so on a real cycle the guard also stops that symbol
+  appearing in its own caller list. `rs/zerolog`'s CBOR decoder is genuinely mutually recursive
+  (`cbor2JsonOneObject` → `array2Json` → `cbor2JsonOneObject`), and at depth 5 the guarded
+  traversal explores 7 rows against the unguarded one's 43 — the cost the guard exists for — but
+  the unguarded *answer* additionally contains `cbor2JsonOneObject` at depth 2. A **direct**
+  self-call is unaffected and does appear, at depth 1: `MarshalStack`, `pkgerrors/stacktrace.go:65`.
+  So "who calls this" reads as "who **else** calls this" once a cycle is involved, and the
+  asymmetry between direct and indirect self-calls is real. Found by the branch-wide mutation
+  sweep, against a comment claiming the opposite.
+- **The indexer has no `/metrics` endpoint, and this phase gave it three instruments anyway** —
+  edges by provenance, type-checks by reason, type-check duration. They are the *only* Prometheus
+  instruments on the indexer side, they are written on every job, and the indexer runs no HTTP
+  server, so nothing can scrape them. Giving it a probe server is its own task and is not smuggled
+  in here; the per-job log line is what an operator actually has today, which is why every number
+  above is on it.
+- **The go command's caches are outside every cap.** `MAX_REPO_BYTES` is measured on the clone;
+  `GOCACHE` and `GOMODCACHE` are written afterwards, beside the checkout, and removed with the job.
+  Measured at ~0.7MB per job on the default policy, because `NeedDeps` keeps `go list` from
+  compiling anything. With a proxy configured the module cache is written read-only and
+  `os.RemoveAll` over it fails with `permission denied` — leaking not the cache but the whole job
+  tree — so the scratch remover restores directory permissions and retries.
 
 ## Status
 
@@ -429,7 +579,7 @@ downgraded wholesale.
 | **P1** | Ingestion: admission, sandbox, job queue, caps, LRU eviction | done |
 | **P2** | AST chunking, embeddings, spans, window fallback | done |
 | **P3** | Retrieval, citations, extractive ask, the floor as a mechanism | done; the floor's *value* is P6 |
-| **P4** | Symbol graph, per-edge provenance, graph endpoints | not started |
+| **P4** | Symbol graph, per-edge provenance, graph endpoints | done; the eval that would say whether it helps is P6 |
 | **P5** | React console | not started |
 | **P6** | Eval harness: generated golden set, AST versus window | not started |
 | **P7** | LLM tool loop, hybrid retrieval fusion, incremental re-index | not started |
@@ -437,11 +587,13 @@ downgraded wholesale.
 
 Nothing above is deployed. There is no live instance, no cloud account behind this repository, and
 no benchmark result to quote yet — when there is one, it will come with the numbers that produced
-it. The figures in [Chunking](#chunking-and-the-two-corpora) and [Retrieval](#retrieval) are what
-indexing and querying one repository **cost**. Nothing yet says which chunking retrieves better,
-nothing says whether fusing the two arms beats either alone, and the score floor is a knob at `-1`
-rather than a measured threshold. All three are P6, and all three are questions this repository is
-built to answer with evidence rather than to assert.
+it. The figures in [Chunking](#chunking-and-the-two-corpora), [Retrieval](#retrieval) and
+[The symbol graph](#the-symbol-graph-and-its-honesty) are what indexing and querying one repository
+**cost and produced**. Nothing yet says which chunking retrieves better, nothing says whether
+fusing the two arms beats either alone, the score floor is a knob at `-1` rather than a measured
+threshold, and just under one edge in eight resolving is a measurement rather than a target. All of
+them are P6, and all of them are questions this repository is built to answer with evidence rather
+than to assert.
 
 ## Running what exists
 
@@ -481,7 +633,21 @@ curl -s -XPOST localhost:8080/api/repos -H 'content-type: application/json' \
 
 curl -s -XPOST localhost:8080/api/repos/$REPO/ask -H 'content-type: application/json' \
   -d '{"q":"how does the sampler decide to drop an event"}' | jq .
+
+# The graph is three GETs, not POSTs: a symbol name is an identifier, not prose,
+# and it is already in the URL of every permalink this product renders. The
+# indexer needs `go` on PATH for any of these to say `resolved`; without one it
+# still indexes and says so once at boot.
+curl -s "localhost:8080/api/repos/$REPO/symbols?name=Event.Msg" | jq .
+SYM=$(curl -s "localhost:8080/api/repos/$REPO/symbols?name=Event.Msg" | jq -r .symbols[0].id)
+curl -s "localhost:8080/api/repos/$REPO/symbols/$SYM" | jq .
+curl -s "localhost:8080/api/repos/$REPO/symbols/$SYM/callers?depth=2&limit=10" | jq .
 ```
+
+`depth` defaults to 1 and is refused outside 1..5 with a `400` naming the bound, rather than
+clamped — a caller asking for 40 has misunderstood the endpoint, and quietly serving 5 hides that.
+`?suffix=true` on the first route opts in to matching a method by its last segment, and the
+response says `"matched":"exact"` or `"matched":"suffix"` so a widening is never silent.
 
 The `content-type` header is not optional: without it the body is bound as a form, `q` is empty,
 and the answer is a `400` naming that rule rather than the question you meant to ask.

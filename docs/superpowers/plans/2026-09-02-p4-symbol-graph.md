@@ -1427,7 +1427,7 @@ Eight more, none in the plan. The first five are the decisions this task had to 
 - Modify: `README.md`, `.github/workflows/ci.yml` (if the fixture modules need a step), `apps/indexer/cmd/testdata/repo/…`
 - Test: `apps/gateway/internal/handler/graph_live_test.go`, additions to `apps/indexer/cmd/index_live_test.go`
 
-- [ ] **Step 1: Index a real repository and record what the graph actually looks like**
+- [x] **Step 1: Index a real repository and record what the graph actually looks like**
 
 Index `rs/zerolog` exactly as P2 and P3's READMEs record it, then run the three endpoints and **paste the numbers into the README and into this plan**:
 
@@ -1436,11 +1436,63 @@ symbols, edges, resolved, syntactic, external, unnameable
 packages attempted, packages loaded, packages failed, reason
 ```
 
-**Do not predict these numbers.** `rs/zerolog` requires third-party modules, so under `GOPROXY=off` some of its packages will not load and some will — which is the per-edge claim demonstrated on a real repository rather than a fixture, whatever the split turns out to be. If it turns out that *no* package loads, that is the honest headline and the README says it: the default policy buys precision only for standard-library-only packages, and an operator who wants more turns the proxy on and accepts the egress. If it turns out that *every* package loads, check why before believing it.
+**Measured, 2026-09-02**, `rs/zerolog` at `dfd11cca1143ba03ba0fc0ff14e5dbb4d61f6f0a` — the same
+commit P2 and P3 recorded, still `master` — on the pinned Ollama and `nomic-embed-text`, into a
+database of its own. 99 files, 1,303 spans, and:
+
+```
+symbols 1234  edges 7895  resolved 945  syntactic 6950  external 498  unnameable 435
+packages 13   loaded 9    failed 4      reason load_error   job status: done
+```
+
+The plan asked for `packages attempted / loaded / failed` and the job log did not carry them —
+`reason` is one word for "none of them loaded" and for "four of thirteen did not". Three ints were
+added to the graph log line in this task and are read back by
+`TestTheJobLogNamesWhatTheGraphStageProducedAndWhyItStopped` and by the live coexistence test, whose
+fixture reports 2/1/1 so a swapped pair is visible.
+
+Which four failed, and what each could not import (from `packages.Load` under the shipped policy,
+reproduced outside the indexer): `zerolog` (`github.com/mattn/go-colorable`), `hlog`
+(`github.com/rs/xid`), `journald` (`github.com/coreos/go-systemd/v22/journal`), `pkgerrors`
+(`github.com/pkg/errors`) — all four `module lookup disabled by GOPROXY=off`.
+
+**The per-edge claim, on a real repository rather than a fixture:** `zerolog` is one of the four
+packages that *failed*, and it carries **613 resolved edges** out of its 3,436. A stage that stamped
+the package's outcome onto its rows would have written 3,436 syntactic edges there and looked
+healthy. The other direction is in the same table: `zerolog_test`, `log_test`, `diode_test` and
+`hlog_test` carry 997 edges and **zero** resolved, because the loader runs with `Tests: false` and
+never opened them.
+
+**The citation check.** `Event.Msg` (`event.go:111-120`), depth 1: three resolved callers, and the
+second is `Logger.Print` citing `log.go:457`.
+
+```
+$ git show dfd11cca:log.go | sed -n '457p'
+		e.CallerSkipFrame(1).Msg(fmt.Sprint(v...))
+$ git show dfd11cca:log.go | sed -n '453,459p' | head -c -1 | sha256sum
+4ecbf7eac36a26f16522d9d5ee604e64315b6f8ed83eee9b40921f1af21edd3d  -
+$ jq -r '.callers[1].citation.digest' callers.json
+4ecbf7eac36a26f16522d9d5ee604e64315b6f8ed83eee9b40921f1af21edd3d
+```
+
+The same request's approximate set is three rows in `benchmark_test.go`, `to_name=Msg`, target null.
+
+**A cycle in real code, and a finding.** `rs/zerolog` holds three direct self-calls and a genuine
+mutual recursion (`cbor2JsonOneObject` ↔ `array2Json`, `↔ map2Json`). At depth 5 the traversal
+returns, and `EXPLAIN (ANALYZE)` on the Recursive Union gives **7 rows guarded against 43
+unguarded** — the cost the guard exists for. But the answer sets are **not** equal: the unguarded
+one additionally contains `cbor2JsonOneObject` itself at depth 2. The guard seeds its path array
+with the queried symbol, so on a cycle it also removes that symbol from its own caller list — while
+a *direct* self-call is unaffected and does appear at depth 1 (`MarshalStack`,
+`pkgerrors/stacktrace.go:65`). Task 5's comment in `graph_read.go` said "the guard cannot change
+this query's rows"; that is true of its fixture and false on a cyclic real graph. Corrected in this
+task, recorded in the README's limits, and listed under plan defects below.
+
+**Original instruction, kept for the record:** Do not predict these numbers. `rs/zerolog` requires third-party modules, so under `GOPROXY=off` some of its packages will not load and some will — which is the per-edge claim demonstrated on a real repository rather than a fixture, whatever the split turns out to be. If it turns out that *no* package loads, that is the honest headline and the README says it: the default policy buys precision only for standard-library-only packages, and an operator who wants more turns the proxy on and accepts the egress. If it turns out that *every* package loads, check why before believing it.
 
 Then verify a citation the graph returned, the way P2 verified 1,303 spans: take a caller's `call.path` and `call.line`, `git show <sha>:<path>`, and confirm the line holds the call. A graph that cites a line nothing calls from is worse than no graph.
 
-- [ ] **Step 2: The end-to-end live tests**
+- [x] **Step 2: The end-to-end live tests**
 
 ```go
 func TestTheGraphAndTheSpansAgreeOnEverySymbolNameLive(t *testing.T)
@@ -1455,7 +1507,7 @@ func TestAnEvictedRepoTakesItsGraphAndAnswersFourTenLive(t *testing.T)
 
 `TestTheEdgeCountIsTheSameWithAndWithoutTypecheckingLive` indexes the same fixture twice, once with `TYPECHECK=false`, and asserts the two runs produce **the same edge ids** and differ only in `provenance` and `to_symbol_id`. That is the per-edge architecture stated as a property.
 
-- [ ] **Step 3: The two ledgers**
+- [x] **Step 3: The two ledgers**
 
 P3's per-task rounds each reported no survivors and the whole-branch sweep found about twenty, nearly all of one of two shapes. Fill both tables before running the sweep; a row with no test named against it is the sweep's first finding.
 
@@ -1469,7 +1521,7 @@ P3's per-task rounds each reported no survivors and the whole-branch sweep found
 | the provenance label per row | `TestOnlyTheCallSitesTheResolverNamedAreResolved`, `TestAResolvedEdgeAndASyntacticEdgeCoexistInOneRepoLive` |
 | `codetrail_graph_edges_total{provenance}` | `TestTheGraphCountersMoveExactlyOnce` |
 | `codetrail_typecheck_total{reason}` | `TestTheGraphCountersMoveExactlyOnce`, the no-toolchain subtest |
-| `codetrail_typecheck_seconds` | **name a test or delete the histogram** |
+| `codetrail_typecheck_seconds` | `TestTheGraphCountersMoveExactlyOnce`, which asserts `codetrail_typecheck_seconds_count` in the whole delta vector. Confirmed by S11b. |
 | the per-job graph log line | `TestTheJobLogNamesWhatTheGraphStageProducedAndWhyItStopped` |
 | the boot line when no `go` binary is found | `TestTheJobLogNamesWhatTheGraphStageProducedAndWhyItStopped`'s no-toolchain subtest |
 | `unnameable` count | same |
@@ -1477,7 +1529,7 @@ P3's per-task rounds each reported no survivors and the whole-branch sweep found
 | `last_queried_at` wound by a graph read | `TestAGraphReadWindsTheLRUClock` |
 | `repos` view's graph counts | `TestRepoStatsSplitsEdgesByProvenance` |
 | the go child's environment | `TestTheLoaderNeverReachesTheModuleProxy`, `TestTheOperatorsGoflagsCannotBreakTheLoad` |
-| files written under `GOCACHE`/`GOMODCACHE` | **nothing reads this back — see Open question 10** |
+| files written under `GOCACHE`/`GOMODCACHE` | still nothing, and accepted: Open question 10, a README line and the `TYPECHECK=false` kill switch. The *removal* of a read-only cache is read back, by `TestAScratchTreeTheGoCommandLeftReadOnlyIsStillRemoved` (S23). |
 
 **Fakes, and what sets each one's error:**
 
@@ -1485,34 +1537,106 @@ P3's per-task rounds each reported no survivors and the whole-branch sweep found
 | --- | --- |
 | the substituted resolver (indexer) | `TestAResolverFailureLeavesEveryEdgeSyntacticAndTheJobIntact` |
 | the substituted resolver, panicking | `TestAResolverFailureLeavesEveryEdgeSyntacticAndTheJobIntact`'s disabled subtest |
-| `putGraph` on the worker | **name a test that makes it fail, or M-sweep-3 will find it** |
+| `putGraph` on the worker | `TestAGraphWriteThatFailsFailsTheJob`, through `withGraphWriteError`. S3 confirms it is the only thing standing between a swallowed write error and a `done` job with no graph. |
 | fake `Reader.Definitions` | `TestAStoreErrorIsFiveHundredWithARequestIdAndNoDetail` |
 | fake `Reader.Symbol` | `TestAnUnknownSymbolIsFourOhFour` (ErrNotFound) and the generic-error test |
 | fake `Reader.CallersOf` | the generic-error test |
-| fake `Reader.ApproximateCallersOf` | **name a test — an error here must not fail a request whose precise half succeeded, or must, and the plan has not decided which** |
+| fake `Reader.ApproximateCallersOf` | `TestAFailedApproximateQueryDoesNotCostThePreciseAnswer`, setting `approxErr`. Decided in Task 6 as recommended: the precise answer stands and the block reports `failed`. |
 | fake `Reader.TouchRepo` | `TestATouchFailureIsLoggedAndNotReturned` |
-| fake `Reader.RepoGone` | P3's existing test; verify it still runs on the graph routes |
+| fake `Reader.RepoGone` | `TestAStoreErrorIsFiveHundredWithARequestIdAndNoDetail`'s `goneErr` case. Verified: the three graph routes are in `repoRoutes()` and `repoRoutesFor()`, so P3's 404/410 tests drive them, and `TestAnEvictedRepoTakesItsGraphAndAnswersFourTenLive` reads the rows as well as the status. |
 
 The one open decision the ledger surfaces: **what a failure of the approximate query alone should do.** Recommendation — return the precise answer with `"approximate": {"error": true, "count": 0}`, because the precise half is the part the caller asked about and the approximate half is a courtesy. Decide it in Task 6 and put the test in the ledger.
 
-- [ ] **Step 4: The whole-branch mutation sweep**
+- [x] **Step 4: The whole-branch mutation sweep**
 
-Run **after every task is merged**, against the branch as a whole, with `git status --porcelain` empty. P3's evidence says this round finds what per-task rounds cannot; budget for it rather than treating it as a formality.
+Run after every task was merged, against the branch as a whole, `git status --porcelain` empty
+before each mutation and `git checkout --` after it. Each mutant was built, `go vet`-ed under both
+build tags, and then run through the **whole** suite twice — `go test ./... -count=1` and
+`go test -tags=live -count=1 ./...` — so a kill records which layers noticed, not merely that one
+did.
 
-Ten to start with, all cross-task:
+**31 mutations. 25 killed, 4 survivors, 2 void and re-spelled.** All four survivors are the shapes
+P3's sweep predicted: three are a side effect nothing reads back, and the fourth is a comment
+claiming a statement does something the schema already did.
 
-1. `chunk.Decl`'s receiver dropped — must fail tests in **both** `chunk` and `symbols` (Task 1's M1 and M8 together: this is the sweep that proves the refactor bought something).
-2. The provenance label taken from `Stats.Reason` in the indexer — must fail Task 4's hermetic test **and** the end-to-end coexistence test.
-3. `putGraph` errors swallowed in the indexer — the job completes with no graph and nothing says so.
-4. `GOPROXY=off` dropped — must fail Task 3's recorder test; check whether any live test also changes.
-5. The type-check given a fresh context — must fail the live deadline test.
-6. `CallersOf`'s cycle guard dropped — must fail the cycle tests; check the end-to-end test is unaffected (it should be, on a real corpus with cycles it may not be, and that is worth knowing).
-7. The approximate set merged into the callers list — must fail the handler test **and** should be visible end to end.
-8. `PutGraph`'s repo scope defeated in both deletes — must fail the two-repo test; check what the end-to-end test shows.
-9. `symbols.span_id` linked by exact range — must fail the long-declaration test.
-10. `EdgeID` keyed by line — must fail Task 1's, Task 2's and Task 3's offset tests, which is three layers of the same trap and the check that all three fixtures actually exist.
+The plan's ten, in its own order:
 
-- [ ] **Step 5: The README**
+**S1 — `chunk.Decl` drops the receiver qualification.**
+- *Why the code exists:* one function spells a declaration's name for `chunk` and for `symbols`, so a symbol is spelled the same way in a span, in the lexical index and in the graph.
+- *Must fail:* tests in **both** packages — this is the sweep that proves the refactor bought something.
+- *Observed:* **Killed** in `chunk` (`TestAMethodIsNamedByItsReceiverBase`, `TestASTChunksOneSpanPerDeclaration`, three more) and in `symbols`, plus five live tests including `TestIndexProducesTheExpectedSpansLive` and `TestAResolvedEdgeAndASyntacticEdgeCoexistInOneRepoLive`. Both halves, from one edit.
+
+**S2 — provenance branches on the job's `Stats.Reason` (`… ; ok && g.stats.Reason == ReasonOK`).**
+- *Why the code exists:* spec:190 makes the label a per-row property; a branch on whether the load succeeded is exactly how it stops being one.
+- *Observed:* **Killed** by `TestOnlyTheCallSitesTheResolverNamedAreResolved/a_package_failed_to_load` **and** end to end by `TestAResolvedEdgeAndASyntacticEdgeCoexistInOneRepoLive`, `TestIndexingWritesAGraphForTheFixtureRepoLive` and `TestTheEdgeCountIsTheSameWithAndWithoutTypecheckingLive`. The prediction held exactly.
+
+**S3 — `putGraph`'s error swallowed (`_ = ix.putGraph(…); return nil`).**
+- *Observed:* **Killed** by `TestAGraphWriteThatFailsFailsTheJob`, the ledger row the plan said this mutation would find missing. It was not missing.
+
+**S4 — `GOPROXY` dropped from the child's environment.**
+- *Observed:* **Killed** by `TestTheLoaderNeverReachesTheModuleProxy` *and its control subtest*, by `TestARequiredThirdPartyModuleDoesNotTypeCheck`, and by the closed-allowlist test. No live test changed: the fixture repository imports only the standard library, so the leak this opens is invisible end to end — which is why the recorder fixture exists.
+
+**S5 — the type-check given a fresh `context.WithTimeout(context.Background(), time.Minute)`.**
+- *Observed:* **Killed** by `TestEveryStageSharesTheOneJobDeadline` and, live, by `TestTheGraphStageSharesTheJobDeadlineLive`. Spec:194's failure is a real one and both layers see it.
+
+**S6 — `CallersOf`'s cycle guard dropped.**
+- *Observed:* **Killed** by `TestTheCycleGuardBoundsTheTraversalItselfLive` and by nothing else. The plan asked whether the end-to-end tests would notice: **they do not**, because the fixture repository has no cycle. On a real corpus the guard also changes the answer — see the finding recorded in Step 1 — so the plan's parenthetical ("on a real corpus with cycles it may not be, and that is worth knowing") was right for a reason it did not have.
+
+**S7 — the approximate set appended to the precise `callers` list.**
+- *Observed:* **Killed** by four handler tests and by `TestTheGraphEndpointsAnswerFromALiveCorpus`. Visible end to end, as the plan expected.
+
+**S8 — `PutGraph`'s repo scope defeated in both deletes (`WHERE repo_id = $1 OR TRUE`).**
+- *Observed:* **Killed** by nine live store tests. The plan asked what the end-to-end test shows: **nothing**. Both end-to-end suites hold several repositories at once — the indexer's runs ~15 jobs into one scratch database with `keepRepos` above that — so the mutant does destroy earlier repositories' graphs there. No assertion looks: every live test reads its own repo's rows immediately after writing them, and nobody goes back. The two-repo rule (fixture rule 5) is the whole of the coverage, and this is the sharpest example of why it exists.
+
+**S9 — `symbols.span_id` linked by exact range instead of containment.**
+- *Observed:* **Killed** by `TestASymbolLinksToTheSpanThatContainsIt`, `TestASymbolLinksToTheMostSpecificOfTwoOverlappingWindows` and `TestIndexingWritesAGraphForTheFixtureRepoLive`, whose `Table` is the sub-windowed declaration that has no span of its own.
+
+**S10 — `EdgeID` forgets the offset (`hash(repo, from, path, to_name)`).**
+- *Observed:* **Killed** at three layers, as predicted: `TestEveryCallIsAnEdgeBeforeAnythingIsResolved` (indexer), `TestTwoCallsOnOneLineAreTwoRowsLive` (store), and four more live reads. All three fixtures exist.
+
+The sweep's own, aimed at the two shapes P3's whole-branch round found:
+
+**S11b — `metrics.ObserveTypecheck` never called.**
+- *Why the code exists:* the histogram is the only record of what a type-check cost.
+- *Observed:* **Killed** by `TestTheGraphCountersMoveExactlyOnce`, which asserts the whole delta vector including `codetrail_typecheck_seconds_count`. The ledger row that said "name a test or delete the histogram" is answered. **The first spelling was void:** deleting the call leaves `start` unused and the build breaks; `_ = start` is the behaviour change.
+
+**S12 — the graph log line drops `failed`.**
+- *Observed:* **Killed** by `TestTheJobLogNamesWhatTheGraphStageProducedAndWhyItStopped` and by two live tests. The field was added in this task; without the assertion it would have been a survivor on the day it was written.
+
+**S13 — a graph read stops calling `h.touch`.**
+- *Observed:* **Killed** by `TestAGraphReadWindsTheLRUClock` and two others. The LRU clock is a side effect and it is read back.
+
+**S14 — the approximate failure's log line drops `repo_id`. SURVIVOR.**
+- *Why the code exists:* Task 6 decided (Open question 14) that a failed approximate query is reported in the block and logged rather than turned into a 500. The request is a 200, so that log line is the *only* record that anything degraded.
+- *What it revealed:* shape (a). `TestAFailedApproximateQueryDoesNotCostThePreciseAnswer` asserted the message and not the corpus it names. Closed by asserting `"repo_id":"repo-1"` in that test; re-run **observed** `the failure names no repository: {"level":"error","error":"relation \"edges\" does not exist","op":"approximate callers","message":"the approximate caller set failed; the precise answer stands"}`.
+
+**S15 — the citation memo is never read. SURVIVOR.**
+- *Why the code exists:* a caller list is up to twice the limit in rows and two definitions in one long declaration share a span, so each span behind a citation is read once per id rather than once per row.
+- *What it revealed:* shape (c), Task 5's cycle guard again — a guard whose only effect is cost. The response is byte-identical with and without it, so nothing in any payload could ever read it back. Closed the way Task 5 closed the cycle guard: by asserting the **work**. `fakeStore` now counts `GetSpan` calls, and `TestTwoCallerRowsSharingOneSpanReadItOnce` pins 2 reads for 3 caller rows over 2 distinct spans; re-run **observed** `the handler read 3 spans for 3 caller rows over 2 distinct spans, want 2`.
+
+**S18 — `mostSpecific` loses its id tie-break. SURVIVOR.**
+- *Why the code exists:* two containers with the *same* range must resolve the same way whichever order they arrive in, or a symbol's span depends on the order rows came back in.
+- *What it revealed:* a determinism guard with no fixture. `TestASymbolLinksToTheMostSpecificOfTwoOverlappingWindows` reaches the *start-line* branch; nothing reached this one. It is unreachable for spans — two spans of one file cannot share a range — and reachable for definitions, because `type A int; type B int` on one line is two declarations both starting and ending on line 1. Closed by `TestTwoDefinitionsOnOneLineResolveTheSameWayInEitherOrder`, a unit test over `mostSpecific` in both orders; re-run **observed** `the same two containers resolved to "aaa" one way and "bbb" the other`.
+
+**S20 — `PutGraph` drops `DELETE FROM edges` and leans on the symbols cascade. SURVIVOR — and the comment was wrong.**
+- *Why the code claimed to exist:* "the edge delete is not redundant with symbols' cascade … a re-index that produces *fewer* edges from the same definitions cannot leave the extras behind."
+- *What it revealed:* that claim is false. `edges.from_symbol_id REFERENCES symbols(id) ON DELETE CASCADE`, `PutGraph` deletes **every** symbol of the repo, and every edge's tail is a symbol of the same repo — so the cascade already removes every edge, including the extras the comment was written about. The whole suite passed with the statement gone. Rule 9: the counterfactual passed, so the claim was false. **Not closed by a test — closed by correcting the comment**, which now says the statement is redundant under this writer and is kept as a statement of order. Adding a test to pin a redundant statement would be pinning the wrong thing.
+
+**S16, S17, S19, S21, S22, S23b, S24, S25, S26, S27, S28, S29 — the rest, all killed.**
+- `unnameable` not counted → `TestTheJobLogNamesWhatTheGraphStageProducedAndWhyItStopped`.
+- `Stats.External` not counted → `TestACallIntoTheStandardLibraryIsExternalNotResolved` and two more.
+- `GOPACKAGESDRIVER` dropped → `TestAnExternalPackagesDriverOnThePathIsNotRun` and the closed-allowlist test.
+- the approximate query stops excluding resolved edges → `TestApproximateCallersExcludeResolvedEdgesLive` and `TestTheGraphEndpointsAnswerFromALiveCorpus`.
+- `st.Packages == 0` dropped from the `load_error` condition → `TestACgoPackageDoesNotLoad`.
+- the read-only scratch retry chmods nothing → `TestAScratchTreeTheGoCommandLeftReadOnlyIsStillRemoved`. **First spelling void:** deleting the walk leaves `fs` and `filepath` unused.
+- the `pkg` narrowing predicate defeated → `TestDefinitionsCanBeNarrowedToOnePackageLive`.
+- the graph counter counts only resolved edges → `TestTheGraphCountersMoveExactlyOnce`.
+- the boot line for a missing toolchain dropped → `TestTheBootLineSaysWhetherThisWorkerCanTypeCheck`.
+- `Definitions` widens to suffix matching by default → `TestDefinitionsMatchesExactlyUnlessSuffixIsAskedLive`.
+- the caller list loses its `ORDER BY` tie-breaks → the ordering tests.
+- `approxName` returns the whole symbol name → `TestTheApproximateSetIsMatchedOnTheCalleesLastIdentifier`.
+
+- [x] **Step 5: The README**
 
 New section, in the register the existing README uses. It must say, in these terms:
 
@@ -1524,30 +1648,38 @@ New section, in the register the existing README uses. It must say, in these ter
 - **A call into the standard library resolves and is still recorded as syntactic**, because there is no symbol row to point at. This is the one place the spec's two-value label loses information, and the counter keeps it.
 - The numbers a run prints are **not quality** — the same banner the eval carries.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 **Definition of Done**
-- A real repository indexed, its provenance split measured and recorded, and one of its call-site citations verified against `git show`.
-- Span symbols and graph symbols agree on every name in a live corpus.
-- Re-indexing the same commit converges; indexing with and without type-checking produces the same edge ids.
-- Both ledgers complete, with no row lacking a named test.
-- The branch-wide sweep run and every finding recorded — including the ones that survive.
-- The README says what is measured, what is off by default, and what a syntactic edge is.
+- [x] A real repository indexed, its provenance split measured and recorded, and one of its call-site citations verified against `git show`. *(`rs/zerolog` at `dfd11cca`: 1,234 symbols, 7,895 edges, 945 resolved, 13 packages of which 9 loaded. `Logger.Print` → `Event.Msg` at `log.go:457`, digest `4ecbf7ea…` matching `sed -n '453,459p' | head -c -1 | sha256sum`.)*
+- [x] Span symbols and graph symbols agree on every name in a live corpus. *(`TestTheGraphAndTheSpansAgreeOnEverySymbolNameLive`, which also refuses a corpus where no span carries a symbol and one where every definition has one — the second because `Table` is the sub-windowed case the containment link exists for.)*
+- [x] Re-indexing the same commit converges; indexing with and without type-checking produces the same edge ids. *(`TestReindexingTheSameCommitConvergesLive` on ids and on call sites; `TestTheEdgeCountIsTheSameWithAndWithoutTypecheckingLive`, which also asserts at least one row actually changed label, or the equality would hold on a build that never type-checked.)*
+- [x] Both ledgers complete, with no row lacking a named test. *(Four rows were open when this task started; all four are filled above, and the one that stays honest-empty — files under `GOCACHE`/`GOMODCACHE` — is Open question 10 with a README line rather than a test.)*
+- [x] The branch-wide sweep run and every finding recorded — including the ones that survive. *(31 mutations, 25 killed, **4 survivors**: S14, S15, S18 closed with tests; S20 closed by deleting a false comment. 2 void, both re-spelled and then killed.)*
+- [x] The README says what is measured, what is off by default, and what a syntactic edge is. *(And what it does not say: the eval has not been run, no claim that AST chunking wins, and just under one edge in eight resolving is recorded as a measurement rather than as a target.)*
+
+**Plan defects found in Task 7:**
+
+1. **Step 1 asked for numbers the product could not print.** "packages attempted, packages loaded, packages failed" are in `symbols.Stats` and were nowhere in the job log, so the README would have had to quote a figure only a throwaway harness could produce. Three ints added to the graph log line, read back by two tests, and S12 confirms they are not free.
+2. **Task 5's comment on the cycle guard is false on a cyclic real graph**, and the P4 DoD line repeats it ("the cycle guard turned out to be unobservable in the answer"). It is unobservable in Task 5's fixture, where the queried symbol is not on a cycle. On `rs/zerolog`'s mutually recursive CBOR decoder the guard also removes the queried symbol from its own caller list, while a direct self-call still appears at depth 1. Comment corrected, README limit recorded, DoD line amended.
+3. **`PutGraph`'s edge-delete comment claims a guarantee the schema already gives.** S20's survivor. Comment corrected.
+4. **The ledger's own gaps were real but small.** Three of the four open rows already had a test and the plan had not looked (`putGraph`, `ApproximateCallersOf`, `RepoGone`); one (`codetrail_typecheck_seconds`) was covered by an assertion on a whole delta vector that never named the histogram in prose. None was a missing test; all four were a missing sentence.
+5. **Step 4's list of ten was a floor and not a ceiling, and the plan said so.** The ten were all killed. Every survivor came from the eleven the sweep added, which is the plan's own point about per-task rounds restated one level up: a mutation list written before the code is a list of the things the author already thought about.
 
 ---
 
 ## Definition of done for P4
 
-- [ ] Definitions come from the AST, spelled by the same function that spells a span's symbol, with a live assertion that the two agree across a whole corpus.
+- [x] Definitions come from the AST, spelled by the same function that spells a span's symbol, with a live assertion that the two agree across a whole corpus. *(Task 1 moved the naming into `chunk.Decl`; Task 7's `TestTheGraphAndTheSpansAgreeOnEverySymbolNameLive` reads a whole corpus back out of Postgres and compares the two columns. The sweep's S1 is what says the shared function is load-bearing: dropping the receiver qualification fails tests in `chunk` **and** in `symbols` **and** in five live suites, from one edit.)*
 - [x] Edges are attempted through `go/packages` with type information; where `types.Info.Uses` resolves a call to an object **that has a symbol row in this repository**, the edge is `resolved` and points at it; everywhere else it is `syntactic` with a null target, enforced by a CHECK constraint rather than by convention. *(Tasks 2, 3 and 4.)*
 - [x] Provenance is per row. One repository carries both labels, and a fixture with two packages — one loadable, one not — pins it by naming an edge in each. No line of code copies a package-level fact onto a row. *(Task 4. The live fixture is stronger than the plan asked for: its type-check **fails**, and two of its three resolved edges are inside the package that failed.)*
 - [x] The type-check runs inside the sandbox, on the job's own remaining budget, with an environment allowlist that a hostile parent environment cannot widen and that makes a recording proxy receive zero requests. *(Task 3. The zero is paired with a control that fetches, so it is evidence rather than an absence.)*
 - [x] A type-check failure — missing toolchain, absent module, expired budget, disabled by knob — produces a complete graph of syntactic edges, a distinct counted reason, a log line, and a `done` job. *(Task 4, five reasons, each asserting the whole counter delta.)*
-- [x] "Who calls this" is a recursive CTE that terminates on self-calls, cycles and diamonds, reports depth and call sites, and never traverses a name. *(Task 5. The cycle guard turned out to be unobservable in the answer — `min(depth)` is the BFS distance — so what pins it is the traversal's own row count under `EXPLAIN (ANALYZE)`: 19 guarded, 46 unguarded.)*
+- [x] "Who calls this" is a recursive CTE that terminates on self-calls, cycles and diamonds, reports depth and call sites, and never traverses a name. *(Task 5, pinned by the traversal's own row count under `EXPLAIN (ANALYZE)`: 19 guarded, 46 unguarded on the fixture, 7 against 43 on `rs/zerolog`'s real mutual recursion. **Task 5's claim that the guard is unobservable in the answer is false on a cyclic graph and was corrected in Task 7:** the path array is seeded with the queried symbol, so on a cycle the guard also removes that symbol from its own caller list, while a direct self-call still appears at depth 1. The rows returned are otherwise identical.)*
 - [x] Approximate, name-matched callers are a separate labelled set at depth 1, with their own count. *(Task 5 ships the set; Task 6 ships the count, `matched_on`, a `failed` flag and the per-row `provenance`, and pins that the two lists never merge. Task 6 also found the name the set has to be queried with: the callee's last identifier, not `symbols.name`, or every method's approximate set is silently empty.)*
 - [x] Graph endpoints answer `404` for an unknown symbol, `410` for an evicted repo, `400` naming the rule for a bad `depth`, `limit` or `name`, and `500` opaquely with a request id; none of them touch the answer or refusal counters. *(Task 6, hermetic and live. `depth` is clamped nowhere: default 1, 1..5, out of range is a 400 naming the bound and moving no counter.)*
 - [x] Eviction takes the graph with it, in one `DELETE`. *(Task 2 at the schema, Task 4 end to end through a real job.)*
-- [ ] Every mutation recorded with observed output; every survivor recorded as a survivor with what it revealed; the whole-branch sweep run after the last merge.
+- [x] Every mutation recorded with observed output; every survivor recorded as a survivor with what it revealed; the whole-branch sweep run after the last merge. *(Tasks 1–6 recorded their own rounds. Task 7's branch-wide sweep: **31 mutations, 25 killed, 4 survivors, 2 void.** Every survivor was one of the two shapes P3's sweep predicted — three side effects nothing read back, and one comment claiming a statement did something the schema already did. Three were closed with a test, the fourth by deleting the false claim.)*
 
 **Not in P4, deliberately:** no `imports` or `references` edges (Open question 7). No LLM tool loop — §8's `definition_of` and `callers_of` are P7's tools and this phase ships the endpoints beneath them. No console (P5). No eval harness (P6); nothing in this phase touches the two-arm corpus design. No incremental re-index (P7): a new commit is a new repo id and a full graph. No second language (§7). No `/metrics` on the indexer, so this phase's four instruments join P3's three with nowhere to be scraped from.
 
