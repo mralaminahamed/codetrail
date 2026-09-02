@@ -45,9 +45,12 @@ const graphBatchSize = 1000
 // the given one, in one transaction. Passing nothing therefore clears it.
 //
 // Edges first, then symbols, then the inserts in the other order. The edge
-// delete is not redundant with symbols' cascade: it states the order rather
-// than leaving a reader to derive it, and it means a re-index that produces
-// *fewer* edges from the same definitions cannot leave the extras behind.
+// delete **is** redundant under this writer, and the comment here used to claim
+// it was not: edges.from_symbol_id cascades from symbols, every edge's tail is
+// a symbol of the same repo, and the branch-wide sweep removed the statement
+// with no test anywhere noticing. It is kept as the statement of order rather
+// than as a guarantee — what makes the replacement whole is the symbols delete,
+// and that is where a reader should look.
 //
 // The provenance/target pair is checked here as well as by the schema, and the
 // two are not duplicates. The constraint is the guarantee — it holds against a

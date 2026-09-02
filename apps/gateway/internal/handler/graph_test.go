@@ -579,10 +579,34 @@ func TestAFailedApproximateQueryDoesNotCostThePreciseAnswer(t *testing.T) {
 	if !strings.Contains(logged.String(), "does not exist") {
 		t.Errorf("the failure was dropped silently: %s", logged.String())
 	}
+	// And the corpus it happened in. This block is the one place a degraded
+	// answer is recorded at all — the request is a 200 — so a line that names
+	// only the driver's error leaves an operator with nothing to look at.
+	if !strings.Contains(logged.String(), `"repo_id":"`+fixtureRepoID+`"`) {
+		t.Errorf("the failure names no repository: %s", logged.String())
+	}
 	// The block still says what it would have matched on, so a client reading
 	// it does not have to guess why it is empty.
 	if out.Approximate.MatchedOn != "name" {
 		t.Errorf("matched_on %q", out.Approximate.MatchedOn)
+	}
+}
+
+// The citation memo cannot change a response — the same span renders the same
+// citation — so nothing in the payload can read it back and only the work it
+// saves can. The two approximate rows are two call sites inside one declaration
+// and share one span; the precise caller has another. Three rows, two reads.
+func TestTwoCallerRowsSharingOneSpanReadItOnce(t *testing.T) {
+	st, e := graphHandler(t)
+	out := decodeAs[callersPayload](t, getPath(e, "/api/repos/repo-1/symbols/"+symStoreGet+"/callers"), http.StatusOK)
+	if len(out.Callers) != 1 || len(out.Approximate.Callers) != 2 {
+		t.Fatalf("%d precise and %d approximate rows, want 1 and 2", len(out.Callers), len(out.Approximate.Callers))
+	}
+	if a, b := out.Approximate.Callers[0].Symbol, out.Approximate.Callers[1].Symbol; a.SpanID != b.SpanID || a.SpanID == "" {
+		t.Fatalf("the fixture no longer has two rows sharing one span: %q and %q", a.SpanID, b.SpanID)
+	}
+	if st.spanReads != 2 {
+		t.Errorf("the handler read %d spans for 3 caller rows over 2 distinct spans, want 2", st.spanReads)
 	}
 }
 

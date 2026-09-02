@@ -516,6 +516,29 @@ func TestASymbolLinksToTheMostSpecificOfTwoOverlappingWindows(t *testing.T) {
 	}
 }
 
+// mostSpecific's last tie-break is the id, and only two containers with the
+// *same* range reach it — which spans cannot have and definitions can:
+// `type A int; type B int` on one line is two declarations starting and ending
+// on line 1. Whichever order they arrive in, the same one has to win, or a
+// symbol's link depends on the order rows came back in.
+//
+// Found by the branch-wide sweep: the overlapping-windows test above covers the
+// start-line branch and nothing reached this one.
+func TestTwoDefinitionsOnOneLineResolveTheSameWayInEitherOrder(t *testing.T) {
+	a, b := container{"aaa", 1, 1}, container{"bbb", 1, 1}
+	first, ok := mostSpecific([]container{a, b}, 1)
+	second, alsoOK := mostSpecific([]container{b, a}, 1)
+	if !ok || !alsoOK {
+		t.Fatalf("line 1 is inside both containers: %v and %v", ok, alsoOK)
+	}
+	if first != second {
+		t.Fatalf("the same two containers resolved to %q one way and %q the other", first, second)
+	}
+	if first != a.id {
+		t.Fatalf("resolved to %q, want the smaller id %q", first, a.id)
+	}
+}
+
 // The link is nullable and this is the shape that needs it: with
 // STRIP_DOC_COMMENTS=true the chunker sees a file whose doc comments are gone,
 // so its spans start at the `func` keyword — while a definition's range comes
