@@ -526,6 +526,16 @@ func TestApproximateCallersAreASeparateFieldWithTheirOwnCount(t *testing.T) {
 	if want := []string{"f@cache/use.go:7", "f@cache/use.go:9"}; !slices.Equal(sites, want) {
 		t.Errorf("approximate call sites %v, want %v", sites, want)
 	}
+	// Each row cites its own definition's span. The precise caller above is in
+	// store/use.go and these are in cache/use.go, so a citation memoised under
+	// anything but the span id hands one of them the other's digest — and every
+	// other assertion in this file still passes.
+	span := graphSpan("span-f")
+	for _, a := range out.Approximate.Callers {
+		if a.Citation == nil || a.Citation.Digest != span.Digest || a.Citation.Path != span.Path {
+			t.Errorf("approximate caller f cites %+v, want %s %s", a.Citation, span.Path, span.Digest)
+		}
+	}
 }
 
 // symbols.name spells a method Store.Get; an edge's to_name is the callee's
