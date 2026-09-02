@@ -9,12 +9,15 @@ import (
 
 func eqTerms(t *testing.T, got, want []string) {
 	t.Helper()
+	// %q, not %v: one term holding a whole sentence prints the same as the
+	// several terms it should have been split into, which is a failure message
+	// that reads "got X, want X".
 	if len(got) != len(want) {
-		t.Fatalf("got %v, want %v", got, want)
+		t.Fatalf("got %d terms %q, want %d %q", len(got), got, len(want), want)
 	}
 	for i := range want {
 		if got[i] != want[i] {
-			t.Fatalf("got %v, want %v", got, want)
+			t.Fatalf("got %q, want %q", got, want)
 		}
 	}
 }
