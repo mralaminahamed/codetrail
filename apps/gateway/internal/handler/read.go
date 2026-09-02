@@ -245,6 +245,12 @@ func (h *Handler) getSpan(c echo.Context) error {
 type searchRequest struct {
 	Q     string `json:"q"`
 	Limit *int   `json:"limit"`
+	// Mode is declared only so it can be refused, and is a *string rather than
+	// a rag.Mode because nothing here parses it. Until it existed, echo's
+	// binder dropped the key and the response's own mode read as an echo of
+	// what was asked for. nil is absence, an explicit null included: neither
+	// names a mode.
+	Mode *string `json:"mode"`
 }
 
 func (h *Handler) search(c echo.Context) error {
@@ -423,6 +429,14 @@ func (h *Handler) query(c echo.Context, req *searchRequest, defLimit int) (strin
 	if err := c.Bind(req); err != nil {
 		h.Log.Warn().Err(err).Str("request_id", requestID(c)).Str("op", "bind").Msg("malformed request body")
 		badRequest(c, "malformed request body")
+		return "", 0, false
+	}
+	// Refused rather than honoured: retrieval mode is a process setting
+	// (RETRIEVAL_MODE) and Search takes no argument for it, so no value here
+	// could select anything. Every mode is refused, including the configured
+	// one, because which mode that is is not something a caller can know.
+	if req.Mode != nil {
+		badRequest(c, "mode is not a request field: it is configured per process and reported in the response")
 		return "", 0, false
 	}
 	q := strings.TrimSpace(req.Q)
