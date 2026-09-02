@@ -142,7 +142,7 @@ Each of these is a constraint on the design, not context.
 - **Tasks 1, 2 and 5 are independent** and can be worked in parallel from `trunk`.
   - Task 1 creates `packages/shared/symbols` (AST only, no database, no `go/packages`) and moves one function in `chunk`.
   - Task 2 creates the migration, the models and `store.PutGraph`.
-  - Task 5 creates `packages/shared/store/graph_read.go` — the reads. (Task 5's own file list says `graph_read.go` and this line said `graph.go`, which is Task 2's writer; corrected once Task 2 landed and took that name.) It depends on Task 2's *schema* but not on its writer; work it against the migration once Task 2's migration file lands, or write the migration in whichever task lands first and rebase the other onto it.
+  - Task 5 creates `packages/shared/store/graph_read.go` — the reads. (Task 5's own file list says `graph_read.go` and this line said `graph.go`, which is Task 2's writer; corrected once Task 2 landed and took that name.) It depends on Task 2's *schema* but not on its writer; work it against the migration once Task 2's migration file lands, or write the migration in whichever task lands first and rebase the other onto it. *(Landed.)*
 - **Task 3** (the sandboxed type-check) depends on Task 1 for the call-site keys.
 - **Task 4** (indexer wiring) depends on 1, 2 and 3. *(Landed.)*
 - **Task 6** (gateway endpoints) depends on 5.
@@ -949,6 +949,7 @@ Live, appended to `index_live_test.go`: `TestIndexingWritesAGraphForTheFixtureRe
 - Create: `packages/shared/store/graph_read.go`
 - Modify: `packages/shared/store/read.go` (`Stats` grows the graph counts)
 - Test: `packages/shared/store/graph_read_live_test.go` (`//go:build live`)
+- Not modified, and it is Task 6's: `apps/gateway/internal/handler/read.go` still serves three of `Stats`'s seven numbers. The four new ones have no consumer until the endpoints land, which is where open question 13's decision belongs.
 
 **Interfaces:**
 - Produces:
@@ -959,50 +960,64 @@ Live, appended to `index_live_test.go`: `TestIndexingWritesAGraphForTheFixtureRe
   - `func (s *Store) CallersOf(ctx context.Context, repoID, symbolID string, depth, limit int) ([]Caller, error)`
   - `func (s *Store) ApproximateCallersOf(ctx context.Context, repoID, name string, limit int) ([]Approximate, error)`
   - `store.Stats` gains `Symbols, Edges, EdgesResolved, EdgesSyntactic int`
+- Also produced, because four readers select the same ten columns and two spellings of that list would swap `path` and `name` silently — both are text and the scan would still succeed: one `symbolCols` constant and one `scanSymbol`, which is also where nullable `span_id` becomes the empty string once instead of at four call sites.
 
 **Decisions, with their reasoning:**
 
 - **`CallersOf` traverses `to_symbol_id` and nothing else.** A join from a syntactic edge's `to_name` to a `symbols.name` is the guess spec:84 forbids, made at query time where no column records that it happened. It would also be *invisible* in any corpus with unique names, which is most small fixtures and no real repository.
 - **The approximate set is a separate query, returned separately, at depth 1 only.** It answers a different question — "what else in this repository calls something with this name" — and merging the two would produce a "callers" list whose members are partly facts and partly coincidences, with no way for a caller to tell which is which. Depth 1 because traversing *from* a guess compounds it: at depth 2 the result would be "things that call something that might be this".
-- **The cycle guard is an explicit `path` array with `NOT from_symbol_id = ANY(path)`, not SQL's `CYCLE` clause.** The array is needed anyway to *report* the chain, and one mechanism doing both is one thing to get wrong. Recursion in a call graph is not an edge case — it is `f` calling `f`, mutual recursion between two helpers, and any interpreter or tree walker in the corpus.
-- **The depth bound and the cycle guard are two independent controls and each is separately killable.** With the cycle guard removed, the depth bound still terminates the query and the wrongness shows up as duplicate and self rows; with the depth bound removed, the cycle guard still terminates it and the wrongness shows up as rows deeper than asked for. **Removing both is a query that does not terminate, which rule 6 makes a non-mutation**, so it is excluded rather than attempted.
+- **The cycle guard is an explicit `path` array with `NOT from_symbol_id = ANY(path)`, not SQL's `CYCLE` clause.** ~~The array is needed anyway to *report* the chain, and one mechanism doing both is one thing to get wrong.~~ **False rationale, and this task's own interface is the proof: `Caller` has no field for the chain, so nothing reports it and the array's only job is the guard.** The array is still the right mechanism — `CYCLE` needs a `SET`/`USING` pair that carries the same array under another name — but the reason is that it is one expression rather than that it is two features. Recursion in a call graph is not an edge case: it is `f` calling `f`, mutual recursion between two helpers, and any interpreter or tree walker in the corpus.
+- ~~**The depth bound and the cycle guard are two independent controls and each is separately killable.**~~ **False rationale, measured. The cycle guard cannot change this query's rows at all.** `min(depth)` is the BFS distance, and a walk that revisits a node is never shorter than the simple path that does not, so the guard changes reachability-within-depth by nothing and the aggregate by nothing. Confirmed: under M2 every row assertion in the suite passed. What the guard changes is how much work the traversal does — 19 CTE rows guarded against 46 unguarded, on eight definitions at depth 5 — so what reads it back is `TestTheCycleGuardBoundsTheTraversalItselfLive`, which `EXPLAIN (ANALYZE)`s the shipped statement and asserts the `Recursive Union`'s actual row count. **Removing both is a query that does not terminate, which rule 6 makes a non-mutation**, so it is excluded rather than attempted — and it happened by accident anyway, which is recorded under the defects below.
 - **A diamond is deduplicated with `min(depth)`.** Two paths of different lengths to the same caller are one caller, at its shortest distance. Without the aggregation the same symbol appears twice, which is not an infinite loop and not an error — it is a plausible-looking wrong answer, and it is why the fixture has a diamond in it.
-- **`Definitions` matches `name` exactly by default.** The corpus spells a method `Store.Get`, P3's lexical arm reaches it through its parts, and a caller who types `Get` should not silently get every `Get` in the repository presented as though they had asked for it. `suffix=true` is the opt-in, and the rows say which match they came from.
-- **`Stats` grows the graph counts so the repo view can show the provenance split.** A per-repo *summary* is not a per-repo *label*: the column stays per row, and the summary is an aggregate over it, which is what makes "three packages resolved and two did not" visible to a user at all.
+- **`Definitions` matches `name` exactly by default.** The corpus spells a method `Store.Get`, P3's lexical arm reaches it through its parts, and a caller who types `Get` should not silently get every `Get` in the repository presented as though they had asked for it. `suffix=true` is the opt-in. The suffix arm is `right(name, char_length($2) + 1) = '.' || $2`, not `LIKE '%.' || $2`: a name carrying `%` or `_` would turn the pattern into a wildcard, which is the silent widening the signature exists to refuse.
+- **`Stats` grows the graph counts so the repo view can show the provenance split.** A per-repo *summary* is not a per-repo *label*: the column stays per row, and the summary is an aggregate over it, which is what makes "three packages resolved and two did not" visible to a user at all. Each label is counted by its own predicate rather than one as the total minus the other, because open question 8 wants a third label for a call that resolves outside the corpus and a subtraction would file it under `syntactic` with nothing looking wrong.
+- **The store does not validate `depth`.** The anchor is unconditional, so `depth=0` still returns the direct callers; out of range is a `400` at the endpoint (open question 1), and a store that clamped would hide the endpoint's bug rather than fix it.
 
-- [ ] **Step 1: Write the failing live tests**
+- [x] **Step 1: Write the failing live tests**
 
 The fixture is the load-bearing part of this task and every rule in "Fixtures that can tell a graph bug" applies at once. Two repositories; in the target repo, one package with:
 
 ```
-main ──▶ a ──▶ b ──▶ target        (a chain, so depth is observable)
-main ──▶ c ──▶ target              (a diamond: two paths to target)
-target ──▶ target                  (a direct self-call)
-d ──▶ e ──▶ d                      (a two-node cycle, reaching target through e)
-Store.Get and Cache.Get            (two definitions sharing a last segment)
-one syntactic edge to "Get"        (null target, for the approximate set)
+outer ─▶ main ─▶ a ─▶ b ─▶ target   a chain, so depth is observable
+         main ─▶ c ─▶ target        a diamond: two routes to target
+                target ─▶ target    a direct self-call
+         d ─▶ e ─▶ d, e ─▶ target   a two-node cycle reaching target
+Store.Get and Cache.Get             two definitions sharing a last segment
+f ─▶ "Get" twice, f ─▶ "target"     syntactic edges, null target
+g ─▶ Store.Get, h ─▶ Cache.Get      resolved edges naming Get
 ```
 
-and, in the **other** repo, a symbol also named `target` with **more** callers than the target repo's, so a missing repo filter changes the answer rather than adding a row.
+and, in the **other** repo, a symbol also named `target` with **more** callers than the target repo's (six to four), so a missing repo filter changes the answer rather than adding a row. Four differences from the fixture as the plan drew it, each because the drawn one could not fail under a bug it was named for:
+
+- **`outer` is new, and without it M1 survives at every depth above 1.** The diamond puts `main` at depth 2 by the short route, so in the plan's fixture nothing is reachable *only* at depth 3 — and `min(depth)` then hides the extra level an off-by-one adds. Measured: with the plan's fixture, `<` → `<=` at `depth=2` returns the identical row set. `outer → main` is the one node whose only route is the long one.
+- **The callers are split across `z.go` (the near ones) and `a.go` (the far ones)**, so the expected `(depth, path, start_line)` order disagrees with path order. In one file the two orders are the same and M12 proves nothing.
+- **`main`'s two hops are on two lines** (`a.go:8` to `a`, `a.go:9` to `c`), so the diamond's call-site assertion can say *which* hop was cited. On one line it cannot.
+- **`f` calls something named `Get` twice.** `ApproximateCallersOf`'s `ORDER BY` carries the call site precisely because one caller can hold two sites; with one site in the fixture that clause was a side effect nothing read back.
+
+The syntactic edges are named after a **plain function** (`f → "target"`, null target) as well as after a method. That is what makes M7 dangerous rather than merely wrong: `chunk.classify` spells a method `Store.Get` while an edge names the callee's last identifier `Get`, so a name join against a *method* matches nothing and returns an empty answer, while a name join against a *function* silently admits a caller that guessed.
 
 ```go
-func TestCallersOfWalksTheChainAndReportsDepth(t *testing.T)
-func TestCallersOfTerminatesOnASelfCall(t *testing.T)
-func TestCallersOfTerminatesOnATwoNodeCycle(t *testing.T)
-func TestADiamondYieldsOneCallerAtItsShortestDepth(t *testing.T)
-func TestCallersOfStopsAtTheRequestedDepth(t *testing.T)
-func TestCallersOfNeverIncludesASyntacticEdge(t *testing.T)
-func TestCallersOfReportsTheCallSiteOfEachHop(t *testing.T)
-func TestApproximateCallersAreNameMatchedAndSeparate(t *testing.T)
-func TestApproximateCallersExcludeResolvedEdges(t *testing.T)
-func TestDefinitionsMatchesExactlyUnlessSuffixIsAsked(t *testing.T)
-func TestDefinitionsIsScopedToOneRepo(t *testing.T)
-func TestRepoStatsSplitsEdgesByProvenance(t *testing.T)
+func TestCallersOfWalksTheChainAndReportsDepthLive(t *testing.T)
+func TestCallersOfTerminatesOnASelfCallLive(t *testing.T)
+func TestCallersOfTerminatesOnATwoNodeCycleLive(t *testing.T)
+func TestTheCycleGuardBoundsTheTraversalItselfLive(t *testing.T)   // new: nothing in the row set can read the guard back
+func TestADiamondYieldsOneCallerAtItsShortestDepthLive(t *testing.T)
+func TestCallersOfStopsAtTheRequestedDepthLive(t *testing.T)
+func TestCallersOfNeverIncludesASyntacticEdgeLive(t *testing.T)
+func TestCallersOfReportsTheCallSiteOfEachHopLive(t *testing.T)
+func TestApproximateCallersAreNameMatchedAndSeparateLive(t *testing.T)
+func TestApproximateCallersExcludeResolvedEdgesLive(t *testing.T)
+func TestDefinitionsMatchesExactlyUnlessSuffixIsAskedLive(t *testing.T)
+func TestDefinitionsIsScopedToOneRepoLive(t *testing.T)
+func TestSymbolIsScopedToItsRepositoryLive(t *testing.T)           // new: Task 6's 404 reads this
+func TestRepoStatsSplitsEdgesByProvenanceLive(t *testing.T)
 ```
 
-`TestCallersOfWalksTheChainAndReportsDepth` asserts the **whole ordered set with each row's depth**, not that `a` is present. `TestADiamondYieldsOneCallerAtItsShortestDepth` asserts the count *and* the depth: a mutant that keeps both rows and one that reports the longer depth are different bugs and the message should say which.
+(The `Live` suffix is this package's convention, not the plan's spelling.) `TestCallersOfWalksTheChainAndReportsDepth` asserts the **whole ordered set with each row's depth** — `[b:1 c:1 e:1 target:1 a:2 main:2 d:2 outer:3]` — plus that this order is neither path order nor id order, plus one caller's whole `models.Symbol`, since a row Task 6 serialises half-filled is uncitable. `TestADiamondYieldsOneCallerAtItsShortestDepth` asserts the count, the depth *and* the cited line.
 
-- [ ] **Step 2: Implement**
+- [x] **Step 2: Implement**
+
+As sketched, with three changes. `s.repo_id` and `s.file_id` join the select list, because the sketch's ten columns build a `models.Symbol` with two empty fields. The `GROUP BY` is `s.id` alone — Postgres's functional-dependency rule covers the rest, and the long list is a list to keep in agreement with the select. And `ApproximateCallersOf` orders by the call site after the symbol, because two sites in one function are two rows whose order must not be the planner's.
 
 ```sql
 WITH RECURSIVE callers AS (
@@ -1020,12 +1035,13 @@ WITH RECURSIVE callers AS (
       AND c.depth < $3
       AND NOT e.from_symbol_id = ANY(c.path)
 )
-SELECT s.id, s.name, s.pkg, s.kind, s.path, s.start_line, s.end_line, s.span_id,
+SELECT s.id, s.repo_id, s.file_id, s.path, s.name, s.pkg, s.kind,
+       s.start_line, s.end_line, s.span_id,
        min(c.depth) AS depth,
        (array_agg(c.call_path ORDER BY c.depth, c.call_path, c.call_line))[1] AS call_path,
        (array_agg(c.call_line ORDER BY c.depth, c.call_path, c.call_line))[1] AS call_line
 FROM callers c JOIN symbols s ON s.id = c.sym
-GROUP BY s.id, s.name, s.pkg, s.kind, s.path, s.start_line, s.end_line, s.span_id
+GROUP BY s.id
 ORDER BY depth, s.path, s.start_line, s.id
 LIMIT $4
 ```
@@ -1036,112 +1052,135 @@ The approximate query is separate and deliberately dull:
 SELECT s.*, e.to_name, e.path, e.line
 FROM edges e JOIN symbols s ON s.id = e.from_symbol_id
 WHERE e.repo_id = $1 AND e.to_symbol_id IS NULL AND e.to_name = $2
-ORDER BY s.path, s.start_line, s.id
+ORDER BY s.path, s.start_line, s.id, e.path, e.line, e.id
 LIMIT $3
 ```
 
-- [ ] **Step 3: Commit, then prove the tests discriminate**
+- [x] **Step 3: Commit, then prove the tests discriminate**
 
-**M1 — `c.depth < $3` → `c.depth <= $3`.**
+Sixteen mutations. **Thirteen killed, two recorded as survivors, one void in the form the plan spells it and killed in the form it names as the rewrite.**
+
+**M1 — `c.depth < $3` → `c.depth <= $3`.** Killed.
 - *Why the code exists:* the bound is the caller's, and an off-by-one on a graph traversal is a fan-out, not a row.
-- *Fixture that separates mutant from original:* the four-deep chain, queried at `depth=2`. A chain shorter than the bound cannot see it.
-- *Must fail:* `TestCallersOfStopsAtTheRequestedDepth`
-- *Expected (verify and correct):* `depth=2 returned [a:1 b:2 main:3], want [a:1 b:2]`
+- *Fixture that separates mutant from original:* the chain queried at `depth=1` **and** at `depth=2`. The plan said "the four-deep chain at `depth=2`, a chain shorter than the bound cannot see it", and with the plan's own fixture that is wrong: `min(depth)` collapses the extra level wherever the added node is already reachable sooner, and only `outer` is not.
+- *Must fail:* `TestCallersOfStopsAtTheRequestedDepthLive`
+- *Observed:* `depth=1 returned [b:1 c:1 e:1 target:1 a:2 main:2 d:2], want [b:1 c:1 e:1 target:1]` and `depth=2 returned [b:1 c:1 e:1 target:1 a:2 main:2 d:2 outer:3], want [b:1 c:1 e:1 target:1 a:2 main:2 d:2]`
 - *Compiles and vets:* yes.
 
-**M2 — the cycle guard replaced by `TRUE`.**
-- *Why the code exists:* recursion is normal in a call graph, and without the guard a cycle re-enters.
-- *Fixture that separates mutant from original:* the `d ──▶ e ──▶ d` cycle and the `target ──▶ target` self-call. **A DAG cannot see this at all** — the guard is dead code on a DAG, which is what makes it the easiest control in the phase to delete without noticing. The depth bound keeps the mutant terminating, so the failure is a wrong row set rather than a hang.
-- *Must fail:* `TestCallersOfTerminatesOnATwoNodeCycle`
-- *Expected (verify and correct):* `got [e:1 d:2 e:3 target:1 …], want [e:1 d:2 target:1 …]` — verify the exact duplication; `min(depth)` collapses some of it, which is worth knowing since it means the aggregation partially *masks* this mutant.
+**M2 — the cycle guard replaced by `TRUE`.** Killed, by the cost assertion only.
+- *Why the code exists:* recursion is normal in a call graph, and without the guard the traversal explores every *walk* rather than every *path*, which is exponential in the fan-in.
+- *Fixture that separates mutant from original:* the `d ─▶ e ─▶ d` cycle and the `target ─▶ target` self-call — but **not through any row the query returns.** Every row assertion in the suite passed under this mutant, including the two the plan named. `min(depth)` does not "partially mask" it, it masks it completely, for the reason under Decisions. `TestTheCycleGuardBoundsTheTraversalItselfLive` is what separates them.
+- *Must fail:* `TestTheCycleGuardBoundsTheTraversalItselfLive` — **not** `TestCallersOfTerminatesOnATwoNodeCycleLive`, which passes.
+- *Observed:* `the traversal produced 46 rows at depth 5, want 19` (and, second, `the counterfactual rewrote nothing: callersSQL no longer contains "AND NOT e.from_symbol_id = ANY(c.path)"`).
 - *Compiles and vets:* yes.
 
-**M3 — the depth bound replaced by `TRUE`.**
+**M3 — the depth bound replaced by `($3 >= 0 OR TRUE)`.** Killed.
 - *Why the code exists:* it bounds the work and it is the caller's parameter.
-- *Fixture that separates mutant from original:* the same chain at `depth=1`. The cycle guard keeps it terminating, so this is a finite wrong answer.
-- *Must fail:* `TestCallersOfStopsAtTheRequestedDepth`
-- *Expected (verify and correct):* `depth=1 returned 6 callers, want 2`
-- *Compiles and vets:* yes — and note that `$3` stays bound in the `SELECT` list or the parameter becomes unused, which is a pgx error and a void mutation. Spell it `AND ($3 IS NOT NULL OR TRUE)` if needed, and record which form was used.
+- *Fixture that separates mutant from original:* the chain at `depth=1`. The cycle guard keeps it terminating, so this is a finite wrong answer.
+- *Must fail:* `TestCallersOfStopsAtTheRequestedDepthLive`
+- *Observed:* `depth=1 returned [b:1 c:1 e:1 target:1 a:2 main:2 d:2 outer:3], want [b:1 c:1 e:1 target:1]`
+- *Compiles and vets:* yes. The plan's suggested spelling `($3 IS NOT NULL OR TRUE)` was not needed; `$3 >= 0` keeps the parameter bound *and* typed, where a bare `IS NOT NULL` leaves pgx nothing to infer `int4` from.
+- *This is the mutation that produced the phase's one accidental non-terminating query*, recorded under the defects.
 
-**M4 — `min(c.depth)` → `max(c.depth)`.**
+**M4 — `min(c.depth)` → `max(c.depth)`.** Killed.
 - *Why the code exists:* a caller reachable by two paths is one caller, at its shortest distance; the longer path is a fact about the graph, not about the caller.
-- *Fixture that separates mutant from original:* the diamond, where `target` is reachable from `main` at depth 2 and depth 3. **A fixture with one path per caller cannot.**
-- *Must fail:* `TestADiamondYieldsOneCallerAtItsShortestDepth`
-- *Expected (verify and correct):* `main at depth 3, want depth 2`
+- *Fixture that separates mutant from original:* the diamond, where `main` is reachable at depth 2 and, once the self-call lengthens a route, at depth 4.
+- *Must fail:* `TestADiamondYieldsOneCallerAtItsShortestDepthLive`
+- *Observed:* `main at depth 4, want depth 2 (main → c → target, not main → a → b → target)`; the whole-set assertion reads `[target:1 b:2 c:2 e:2 a:3 d:3 main:4 outer:5]`. The predicted `depth 3` was one short: the self-call `target → target` adds a hop to every long route.
 - *Compiles and vets:* yes.
 
-**M5 — the `GROUP BY` dropped (the aggregate becomes a plain select).**
+**M5 — the `GROUP BY` dropped (the aggregate becomes a plain select).** Void as the plan spells it; killed as the rewrite.
 - *Why the code exists:* the same caller reached twice is one row.
-- *Fixture that separates mutant from original:* the diamond again, asserting the **count**. A test that checks membership passes with duplicates present.
-- *Must fail:* `TestADiamondYieldsOneCallerAtItsShortestDepth`
-- *Expected (verify and correct):* a SQL error, not a row change — `min(c.depth)` without a `GROUP BY` aggregates the whole result. **That makes the naive form void (rule 2).** Spell the mutation as "drop the aggregation *and* the `min`, selecting `c.depth` directly", which is the mutant a person would actually write, and which returns duplicate rows.
-- *Compiles and vets:* only in the rewritten form. Record both.
+- *M5a, dropping `GROUP BY s.id` alone:* **void, confirmed.** `ERROR: column "s.id" must appear in the GROUP BY clause or be used in an aggregate function (SQLSTATE 42803)`, which arrives as a `t.Fatal` in the test's helper — a SQL error, not a row change (rule 2).
+- *M5b, dropping the aggregation and the `min` together and selecting `c.depth`, `c.call_path`, `c.call_line` directly:* killed, and it is the mutant a person would write.
+- *Must fail:* `TestADiamondYieldsOneCallerAtItsShortestDepthLive`
+- *Observed:* `main is in the answer 4 times, at depths [main:2 main:3 main:3 main:4]`, and the whole set becomes the CTE's 19 rows: `[b:1 c:1 e:1 target:1 a:2 main:2 d:2 b:2 c:2 e:2 a:3 main:3 main:3 d:3 outer:3 main:4 outer:4 outer:4 outer:5]`. Four other tests fail with it, including `main cites "a.go:8", want "a.go:9"`.
+- *Compiles and vets:* both forms compile; only M5b is a behaviour change.
 
-**M6 — the recursive term joins `e.from_symbol_id = c.sym` (direction inverted).**
+**M6 — the recursive term joins `e.from_symbol_id = c.sym` (direction inverted).** Killed.
 - *Why the code exists:* callers, not callees. The two queries are one character apart and both return plausible graphs.
-- *Fixture that separates mutant from original:* the chain, which is **asymmetric**: `target` has callers and no callees in the fixture. A fixture where every node both calls and is called cannot separate them.
-- *Must fail:* `TestCallersOfWalksTheChainAndReportsDepth`
-- *Expected (verify and correct):* `got [target:2], want [b:1 a:2]` — verify; the anchor is unchanged, so depth 1 is right and only the deeper rows are wrong, which is the more dangerous shape.
+- *Fixture that separates mutant from original:* the chain, whose transitive callers `a`, `main`, `d` and `outer` all disappear. The plan's stated reason — "`target` has callers and no callees" — is **wrong about the plan's own fixture**, which gives `target` a self-call and therefore a callee.
+- *Must fail:* `TestCallersOfWalksTheChainAndReportsDepthLive`
+- *Observed:* `callers of target: [b:1 c:1 e:1 target:1], want [b:1 c:1 e:1 target:1 a:2 main:2 d:2 outer:3]` — the recursion returns **nothing at all**, not the callee walk the plan predicted, because the inverted term selects `e.from_symbol_id` where `e.from_symbol_id = c.sym`, so every candidate row repeats `c.sym` and the cycle guard rejects it. Six tests fail; the sharpest is `d cites "", want "a.go:12"`.
 - *Compiles and vets:* yes.
 
-**M7 — the anchor drops `AND e.to_symbol_id = $2` in favour of `e.to_name = (SELECT name FROM symbols WHERE id = $2)`.**
+**M7 — the anchor drops `AND e.to_symbol_id = $2` in favour of `e.to_name = (SELECT name FROM symbols WHERE id = $2)`.** Killed.
 - *Why the code exists:* spec:84 — a syntactic edge's name is not a target, and binding it at read time is the guess the null column exists to refuse.
-- *Fixture that separates mutant from original:* the two `Get` methods plus the syntactic edge naming `Get`. **A fixture with unique names cannot see this**, which is rule 4 and the reason the fixture has two.
-- *Must fail:* `TestCallersOfNeverIncludesASyntacticEdge`
-- *Expected (verify and correct):* `callers of Store.Get include f, which calls something named Get with a null target`
+- *Fixture that separates mutant from original:* `f`, whose syntactic edge names `target`; and the two `Get` methods, which show the same mutation's other half. The plan's rule-4 fixture alone would not have caught the dangerous direction: an edge names the callee's *last identifier*, so a name join against `Store.Get` matches nothing.
+- *Must fail:* `TestCallersOfNeverIncludesASyntacticEdgeLive`
+- *Observed:* `callers of target include f, which calls something named target with a null target (cache.go:9)` and `callers of Store.Get: [], want [g:1] — f calls a null target named Get and h calls Cache.Get`. Both halves fired, and the traversal row count moved 19 → 20.
 - *Compiles and vets:* yes.
 
-**M8 — `ApproximateCallersOf` drops `AND e.to_symbol_id IS NULL`.**
+**M8 — `ApproximateCallersOf` drops `AND e.to_symbol_id IS NULL`.** Killed.
 - *Why the code exists:* the approximate set is what is *not* known; a resolved edge in it double-counts a caller that is already in the precise answer.
-- *Fixture that separates mutant from original:* the fixture's resolved edge to `Store.Get` alongside the syntactic one.
-- *Must fail:* `TestApproximateCallersExcludeResolvedEdges`
-- *Expected (verify and correct):* `approximate callers of Get: [f g], want [f]`
+- *Fixture that separates mutant from original:* `g → Store.Get` and `h → Cache.Get`, both resolved and both naming `Get`, beside `f`'s two syntactic ones.
+- *Must fail:* `TestApproximateCallersExcludeResolvedEdgesLive`
+- *Observed:* `approximate callers of Get: [f f h g], want [f f] (g and h resolve)`, and in the other test `[f@cache.go:8 f@cache.go:10 h@cache.go:12 g@store.go:8], want [f@cache.go:8 f@cache.go:10]`. The scoping half fires too — `approximate callers of target in repo A: [f b c e target], want [f]` — because every resolved edge into `target` also *names* it.
 - *Compiles and vets:* yes.
 
-**M9 — `Definitions` matches with `suffix` always on.**
+**M9 — `Definitions` matches with `suffix` always on.** Killed.
 - *Why the code exists:* an exact request that silently widens is a different question answered without saying so.
 - *Fixture that separates mutant from original:* `Store.Get` and `Cache.Get`, queried as `Get` with `suffix=false`, which must return **nothing**.
-- *Must fail:* `TestDefinitionsMatchesExactlyUnlessSuffixIsAsked`
-- *Expected (verify and correct):* `exact match for "Get" returned 2 definitions, want 0`
+- *Must fail:* `TestDefinitionsMatchesExactlyUnlessSuffixIsAskedLive`
+- *Observed:* `exact match for "Get" returned 2 definitions [Cache.Get Store.Get], want 0`
 - *Compiles and vets:* yes.
 
-**M10 — `Definitions` drops the repo filter (`repo_id = $1 OR TRUE`).**
+**M10 — `Definitions` drops the repo filter (`repo_id = $1 OR TRUE`).** Killed.
 - *Why the code exists:* names collide across repositories by construction; `parseConfig` exists in every second Go repository.
-- *Fixture that separates mutant from original:* the second repository's `target`, which the fixture gives **more** callers so the effect is a changed answer and not merely an extra row.
-- *Must fail:* `TestDefinitionsIsScopedToOneRepo`
-- *Expected (verify and correct):* `definitions of target: 2, want 1 (the extra is from repo B)`
+- *Fixture that separates mutant from original:* the second repository's `target`.
+- *Must fail:* `TestDefinitionsIsScopedToOneRepoLive`
+- *Observed:* `definitions of target: 2, want 1 (the extra is from repo B)`, with both rows printed so the message names which repo each came from.
 - *Compiles and vets:* yes — the parameter stays bound.
 
-**M11 — `CallersOf` drops the repo filter (`repo_id = $1 OR TRUE`) in both terms.**
+**M11 — `CallersOf` drops the repo filter (`repo_id = $1 OR TRUE`) in both terms.** **Survivor, as predicted.**
 - *Why the code exists:* defence in depth.
-- *Fixture that separates mutant from original:* **none, and this is a predicted survivor.** `SymbolID = hash(repo, path, start, kind, name)`, so a symbol id never collides across repositories and `to_symbol_id = $2` already pins the repo; the recursive term joins on ids for the same reason. Record it as a survivor with that reasoning, and keep the clause — the day a symbol id becomes anything but a repo-scoped hash, the filter is what stops a cross-repo traversal, and the *reason* it cannot be killed today is the reason it is cheap to keep.
-- *Must fail:* nothing. Survivor.
+- *Observed:* the whole suite passes. `SymbolID = hash(repo, path, start, kind, name)`, so a symbol id never collides across repositories, `to_symbol_id = $2` already pins the repo, and the recursive term joins on ids for the same reason. Keep the clause: the day a symbol id becomes anything but a repo-scoped hash, the filter is what stops a cross-repo traversal, and the *reason* it cannot be killed today is the reason it is cheap to keep.
 - *Compiles and vets:* yes.
 
-**M12 — the final `ORDER BY` dropped.**
+**M12 — the final `ORDER BY` dropped.** Killed.
 - *Why the code exists:* two runs over an unchanged corpus must be diffable, and the `LIMIT` makes the order decide *which* callers a caller sees.
-- *Fixture that separates mutant from original:* the chain queried with a `LIMIT` **smaller than the result**, so the order decides membership rather than presentation. **P3 measured twice that an unordered result is not an insertion-ordered one** — it came back in path order once and in a stable arbitrary order another time — so the test asserts the disagreement between the expected order and path order in its body rather than assuming it.
-- *Must fail:* `TestCallersOfWalksTheChainAndReportsDepth`
-- *Expected (verify and correct):* paste the observed order; predicting it is what went wrong in P3's M5 and M9.
+- *Fixture that separates mutant from original:* the callers split across two files so depth order and path order disagree — asserted in the test body, not assumed.
+- *Must fail:* `TestCallersOfWalksTheChainAndReportsDepthLive`
+- *Observed:* `callers of target: [outer:3 target:1 d:2 c:1 main:2 e:1 b:1 a:2]`. **A third measurement to add to P3's two:** the unordered result is neither path order nor insertion order nor id order — it is hash-aggregate order, which resembles nothing a test could have predicted. The `LIMIT`-below-the-result assertion never ran, since the whole-set one fails first.
 - *Compiles and vets:* yes.
 
-**M13 — `RepoStats` counts edges without the provenance split (both counts from the same total).**
+**M13 — `RepoStats` counts edges without the provenance split (both counts from the same total).** Killed.
 - *Why the code exists:* the split is the phase's headline claim and the repo view is where a user sees it.
-- *Fixture that separates mutant from original:* the target repo, which has **both** kinds. A fixture with only resolved edges makes the two counts equal and the mutant invisible.
-- *Must fail:* `TestRepoStatsSplitsEdgesByProvenance`
-- *Expected (verify and correct):* `resolved 9, syntactic 9, want resolved 7, syntactic 2`
+- *Fixture that separates mutant from original:* both repositories carry both kinds.
+- *Must fail:* `TestRepoStatsSplitsEdgesByProvenanceLive`
+- *Observed:* `repo A stats {Files:4 Spans:0 FilesWithSpans:0 Symbols:13 Edges:15 EdgesResolved:15 EdgesSyntactic:15}, want {… EdgesResolved:12 EdgesSyntactic:3}`, and repo B at 9/9/9 against 6/3.
 - *Compiles and vets:* yes.
 
-- [ ] **Step 4: Commit**
+Three more from the whole-reader sweep, since every survivor P3 found late was either a side effect nothing read back or an unexercised branch:
+
+**M14 — `Symbol` drops the repo filter.** Killed. `repo A's target read from repo B returned <nil>, want ErrNotFound` (`TestSymbolIsScopedToItsRepositoryLive`).
+
+**M15 — `symbolCols` swaps `s.repo_id` and `s.file_id`.** Killed. Both are text, so the scan succeeds and the values land in each other's fields: `read back {… RepoID:280bc6f… FileID:c334f9… }, want {… RepoID:c334f9… FileID:280bc6… }`. This is the mutation that proves the shared column list is read back **in full** rather than through the four fields the caller assertions name — `Pkg`, `SpanID`, `FileID` and `RepoID` are observed only by the whole-struct compares in `TestSymbolIsScopedToItsRepositoryLive` and `TestCallersOfWalksTheChainAndReportsDepthLive`.
+
+**M16 — `ApproximateCallersOf` drops the `e.path, e.line, e.id` tiebreak.** **Survivor.** With two rows the planner returns them in the same order either way, and forcing it to do otherwise would need a corpus rather than a fixture — the same thing P3 measured about its unordered results. The clause is a determinism guarantee about a repository, not about this fixture; kept, and recorded as unkillable at this size rather than as covered.
+
+- [x] **Step 4: Commit**
 
 **Definition of Done**
-- `CallersOf` terminates on a self-call, on a two-node cycle and on a diamond, with the row set, the depths and the call sites all asserted.
-- Each of the two termination controls is killed by a mutation while the other holds; removing both is recorded as excluded, not attempted.
-- No syntactic edge reaches the traversal, proven against a fixture with two definitions sharing a last segment.
-- The approximate set is name-matched, depth-1, separate, and excludes resolved edges.
-- `Definitions` is exact by default, scoped to one repo, and says which match it made.
-- `RepoStats` reports the provenance split from a repo carrying both.
-- M1–M13 recorded with observed output; M5's void form and its rewrite recorded; M11 recorded as a survivor with its reason.
+- [x] `CallersOf` terminates on a self-call, on a two-node cycle and on a diamond, with the row set, the depths and the call sites all asserted.
+- [x] Each of the two termination controls is killed by a mutation while the other holds — **the cycle guard only through the traversal's row count, because it cannot change the answer**; removing both is recorded as excluded, and the one time it happened by accident is recorded too.
+- [x] No syntactic edge reaches the traversal, proven against a fixture with two definitions sharing a last segment **and** a syntactic edge naming a plain function, which is the half that can actually admit one.
+- [x] The approximate set is name-matched, depth-1, separate, and excludes resolved edges.
+- [x] `Definitions` is exact by default and scoped to one repo. **It does not say which match it made:** the interface returns `[]models.Symbol`, which has no room for it, and open question 11 puts that on the response — so it is Task 6's to echo, per row if a suffix search is to distinguish an exact hit from a suffix hit.
+- [x] `RepoStats` reports the provenance split from a repo carrying both.
+- [x] M1–M16 recorded with observed output; M5's void form and its rewrite recorded; M11 and M16 recorded as survivors with their reasons.
+
+**Plan defects found by this task**
+
+1. **Two false rationales**, both under Decisions above: the `path` array is not "needed anyway to report the chain" (nothing reports it), and the two termination controls are not "each separately killable" in the answer (the guard cannot change a row).
+2. **M2's fixture claim is wrong in the direction that matters.** "`min(depth)` collapses some of it" understates it: the aggregation masks the mutant entirely, and both tests the plan names for it pass. Without the cost assertion this task would have shipped an unkillable cycle guard and called it covered.
+3. **M1's fixture cannot fail at the depth the plan names.** The plan's own diamond puts `main` at depth 2, so at `depth=2` the off-by-one adds no row. Fixed by adding `outer`.
+4. **M6's stated reason is wrong about the plan's own fixture** — `target ─▶ target` is a callee — and its predicted output is wrong about the mechanism: the inverted join returns nothing, because the cycle guard rejects the row it produces.
+5. **M4's predicted depth was one short** (3, observed 4): the self-call lengthens every route through `target`.
+6. **M7's mutant is harmless against a method and dangerous against a function.** `chunk.classify` spells `Store.Get` and an edge names `Get`, so rule 4's two-methods fixture proves the *weaker* half. A syntactic edge naming a plain function is what the rule should ask for.
+7. **The counterfactual in the cycle-guard test can build the query the plan excludes.** It strips the guard from whatever `callersSQL` currently is, so with M3 applied it had neither control and ran for two minutes with nothing to report. Now under `SET LOCAL statement_timeout`, where an unbounded traversal is a message. Rule 6 is about the tests a plan ships; it applies to the counterfactuals inside them too.
+8. **The sketch builds a half-filled `models.Symbol`** — no `repo_id`, no `file_id` — which Task 6 would have serialised.
+9. **`Stats` grew four fields with no consumer.** Task 5's file list excludes the gateway and open question 13 wants them on `GET /api/repos/:repo`; Task 6 owns closing that, or they are four numbers nothing reads.
 
 ---
 
@@ -1431,8 +1470,8 @@ New section, in the register the existing README uses. It must say, in these ter
 - [x] Provenance is per row. One repository carries both labels, and a fixture with two packages — one loadable, one not — pins it by naming an edge in each. No line of code copies a package-level fact onto a row. *(Task 4. The live fixture is stronger than the plan asked for: its type-check **fails**, and two of its three resolved edges are inside the package that failed.)*
 - [x] The type-check runs inside the sandbox, on the job's own remaining budget, with an environment allowlist that a hostile parent environment cannot widen and that makes a recording proxy receive zero requests. *(Task 3. The zero is paired with a control that fetches, so it is evidence rather than an absence.)*
 - [x] A type-check failure — missing toolchain, absent module, expired budget, disabled by knob — produces a complete graph of syntactic edges, a distinct counted reason, a log line, and a `done` job. *(Task 4, five reasons, each asserting the whole counter delta.)*
-- [ ] "Who calls this" is a recursive CTE that terminates on self-calls, cycles and diamonds, reports depth and call sites, and never traverses a name.
-- [ ] Approximate, name-matched callers are a separate labelled set at depth 1, with their own count.
+- [x] "Who calls this" is a recursive CTE that terminates on self-calls, cycles and diamonds, reports depth and call sites, and never traverses a name. *(Task 5. The cycle guard turned out to be unobservable in the answer — `min(depth)` is the BFS distance — so what pins it is the traversal's own row count under `EXPLAIN (ANALYZE)`: 19 guarded, 46 unguarded.)*
+- [ ] Approximate, name-matched callers are a separate labelled set at depth 1, with their own count. *(Task 5 ships the set, proven separate and free of resolved edges; the count is a field in a response and belongs to Task 6.)*
 - [ ] Graph endpoints answer `404` for an unknown symbol, `410` for an evicted repo, `400` naming the rule for a bad `depth`, `limit` or `name`, and `500` opaquely with a request id; none of them touch the answer or refusal counters.
 - [x] Eviction takes the graph with it, in one `DELETE`. *(Task 2 at the schema, Task 4 end to end through a real job.)*
 - [ ] Every mutation recorded with observed output; every survivor recorded as a survivor with what it revealed; the whole-branch sweep run after the last merge.
