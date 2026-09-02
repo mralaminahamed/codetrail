@@ -123,7 +123,7 @@ func TestEnqueueThenLeaseThenComplete(t *testing.T) {
 		t.Fatalf("want a lease expiring in the future, got %v", until)
 	}
 
-	if err := q.Complete(ctx, j.ID, "worker-1"); err != nil {
+	if err := q.Complete(ctx, j.ID, "worker-1", "repo-1"); err != nil {
 		t.Fatal(err)
 	}
 	after, err := q.Get(ctx, j.ID)
@@ -160,7 +160,7 @@ func TestEnqueueIsIdempotentWhileActive(t *testing.T) {
 	if _, ok, err := q.Lease(ctx, "w", time.Minute); err != nil || !ok {
 		t.Fatalf("lease before completing: ok=%v err=%v", ok, err)
 	}
-	if err := q.Complete(ctx, first.ID, "w"); err != nil {
+	if err := q.Complete(ctx, first.ID, "w", "repo-1"); err != nil {
 		t.Fatal(err)
 	}
 	third, err := q.Enqueue(ctx, "https://github.com/a/b", "main")
@@ -187,7 +187,7 @@ func TestEnqueueReturnsTheActiveJobNotAFinishedOne(t *testing.T) {
 	if _, ok, err := q.Lease(ctx, "w", time.Minute); err != nil || !ok {
 		t.Fatalf("lease: ok=%v err=%v", ok, err)
 	}
-	if err := q.Complete(ctx, done.ID, "w"); err != nil {
+	if err := q.Complete(ctx, done.ID, "w", "repo-1"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -474,7 +474,7 @@ func TestAReclaimedJobCannotBeCompletedByTheWorkerThatLostIt(t *testing.T) {
 		t.Fatalf("reclaim failed: ok=%v err=%v", ok, err)
 	}
 
-	if err := q.Complete(ctx, j.ID, "worker-a"); !errors.Is(err, ErrNotLeased) {
+	if err := q.Complete(ctx, j.ID, "worker-a", "repo-1"); !errors.Is(err, ErrNotLeased) {
 		t.Fatalf("want ErrNotLeased for the worker that lost the lease, got %v", err)
 	}
 	after, err := q.Get(ctx, j.ID)
@@ -528,7 +528,7 @@ func TestAReclaimedJobCannotBeFailedByTheWorkerThatLostIt(t *testing.T) {
 func TestCompleteAndFailOnAnUnknownJob(t *testing.T) {
 	ctx := context.Background()
 	q := queue(t)
-	if err := q.Complete(ctx, "nope", "w"); !errors.Is(err, ErrNotLeased) {
+	if err := q.Complete(ctx, "nope", "w", "repo-1"); !errors.Is(err, ErrNotLeased) {
 		t.Fatalf("want ErrNotLeased from Complete, got %v", err)
 	}
 	if err := q.Fail(ctx, "nope", "w", "reason", 3); !errors.Is(err, ErrNotLeased) {
@@ -671,5 +671,217 @@ func TestNewUsesTheShippedRetryBounds(t *testing.T) {
 	}
 	if q.RetryBase <= 0 || q.RetryBase > q.RetryMax {
 		t.Fatalf("the bounds are not a usable range: base=%v max=%v", q.RetryBase, q.RetryMax)
+	}
+}
+
+// seedTerminal writes a job that went terminal age ago. Written directly
+// because the age is the fixture: driving it through Lease and Complete would
+// stamp updated_at at now() and leave nothing for the window to bite on.
+func seedTerminal(t *testing.T, q *Queue, id string, status Status, age time.Duration) {
+	t.Helper()
+	seedJob(t, q, id, status, age, nil)
+}
+
+func seedJob(t *testing.T, q *Queue, id string, status Status, age time.Duration, leasedBy *string) {
+	t.Helper()
+	if _, err := q.pool.Exec(context.Background(), `
+		INSERT INTO jobs (id, remote, ref, status, attempts, leased_by, created_at, updated_at)
+		VALUES ($1, $2, 'main', $3, 1, $4, now() - $5::interval, now() - $5::interval)`,
+		id, "https://github.com/a/"+id, status, leasedBy,
+		fmt.Sprintf("%d milliseconds", age.Milliseconds())); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// sweepFixture holds all four states either side of a 24h window. One age, or
+// one status, cannot separate a retention rule from a DELETE with no WHERE.
+func sweepFixture(t *testing.T, q *Queue) {
+	t.Helper()
+	worker := "worker-a"
+	seedTerminal(t, q, "done-old", StatusDone, 48*time.Hour)
+	seedTerminal(t, q, "failed-old", StatusFailed, 30*time.Hour)
+	seedTerminal(t, q, "done-recent", StatusDone, time.Hour)
+	seedJob(t, q, "pending-ancient", StatusPending, 100*time.Hour, nil)
+	seedJob(t, q, "leased-ancient", StatusLeased, 100*time.Hour, &worker)
+}
+
+func exists(t *testing.T, q *Queue, id string) bool {
+	t.Helper()
+	_, err := q.Get(context.Background(), id)
+	if errors.Is(err, ErrNotFound) {
+		return false
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return true
+}
+
+const sweepWindow = 24 * time.Hour
+
+// Spec §14 asked how much job history to keep. It is an age, so what a caller
+// may poll for is a stated duration rather than a race with a stranger's
+// submission.
+func TestSweepDeletesTerminalJobsPastTheWindow(t *testing.T) {
+	q := queue(t)
+	sweepFixture(t, q)
+
+	n, err := q.Sweep(context.Background(), sweepWindow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("Sweep reported %d, want the 2 terminal jobs past the window", n)
+	}
+	for _, id := range []string{"done-old", "failed-old"} {
+		if exists(t, q, id) {
+			t.Errorf("%s is older than the window and was kept", id)
+		}
+	}
+	// Both terminal states age out. A rule that only swept 'done' would leave
+	// failures accumulating forever.
+	if got := len(sweptIDs(t, q)); got != 3 {
+		t.Errorf("%d jobs left, want 3", got)
+	}
+}
+
+// A caller polling a job that finished a moment ago must still get an answer.
+func TestSweepKeepsATerminalJobInsideTheWindow(t *testing.T) {
+	q := queue(t)
+	sweepFixture(t, q)
+
+	if _, err := q.Sweep(context.Background(), sweepWindow); err != nil {
+		t.Fatal(err)
+	}
+	if !exists(t, q, "done-recent") {
+		t.Fatal("the job that finished 1h ago was swept, inside a window of 24h")
+	}
+}
+
+// A pending or leased row is the lease. Deleting one hands the same repository
+// to a second worker with no record of the first, however old the row is — and
+// "however old" is the fixture, since the two here are older than everything
+// the window deletes.
+func TestSweepNeverDeletesAPendingOrLeasedJobHoweverOld(t *testing.T) {
+	q := queue(t)
+	sweepFixture(t, q)
+
+	if _, err := q.Sweep(context.Background(), sweepWindow); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"pending-ancient", "leased-ancient"} {
+		if !exists(t, q, id) {
+			t.Errorf("a %s job was swept", id)
+		}
+	}
+}
+
+func sweptIDs(t *testing.T, q *Queue) []string {
+	t.Helper()
+	rows, err := q.pool.Query(context.Background(), `SELECT id FROM jobs ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// The link from a submission to what it produced. The repo id is
+// hash(key, commit) and only the indexer ever saw the commit, so without this
+// a caller who polls a job to done cannot name the repository they indexed.
+//
+// Two jobs with different ids, and each compared against the id computed from
+// its own inputs: "non-empty", or one job, would both pass against a Complete
+// that writes the same string every time.
+func TestCompleteRecordsTheRepoTheJobProduced(t *testing.T) {
+	ctx := context.Background()
+	q := queue(t)
+
+	for _, tc := range []struct{ key, commit string }{
+		{"github.com/a/first", "1111111111111111111111111111111111111111"},
+		{"github.com/a/second", "2222222222222222222222222222222222222222"},
+	} {
+		j, err := q.Enqueue(ctx, "https://"+tc.key, "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok, err := q.Lease(ctx, "w", time.Minute); err != nil || !ok {
+			t.Fatalf("lease: ok=%v err=%v", ok, err)
+		}
+		want := store.RepoID(tc.key, tc.commit)
+		if err := q.Complete(ctx, j.ID, "w", want); err != nil {
+			t.Fatal(err)
+		}
+		got, err := q.Get(ctx, j.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.RepoID != want {
+			t.Errorf("job repo_id %q, want %q", got.RepoID, want)
+		}
+		if got.Status != StatusDone {
+			t.Errorf("want done, got %q", got.Status)
+		}
+	}
+}
+
+// A job that failed produced no repository, and must not name one: the column
+// is nullable for exactly this, and "" is what a caller reads.
+func TestAFailedJobHasNoRepoID(t *testing.T) {
+	ctx := context.Background()
+	q := queue(t)
+	q.RetryBase, q.RetryMax = 0, 0
+
+	j, err := q.Enqueue(ctx, "https://github.com/a/b", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := q.Lease(ctx, "w", time.Minute); err != nil || !ok {
+		t.Fatalf("lease: ok=%v err=%v", ok, err)
+	}
+	if err := q.Fail(ctx, j.ID, "w", "clone failed", 0); err != nil {
+		t.Fatal(err)
+	}
+	got, err := q.Get(ctx, j.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != StatusFailed {
+		t.Fatalf("want failed, got %q", got.Status)
+	}
+	if got.RepoID != "" {
+		t.Errorf("a failed job names the repo %q", got.RepoID)
+	}
+}
+
+// A pending job has no repo either, so nothing downstream can read one from a
+// job that has not run.
+func TestAPendingJobHasNoRepoID(t *testing.T) {
+	ctx := context.Background()
+	q := queue(t)
+	j, err := q.Enqueue(ctx, "https://github.com/a/b", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j.RepoID != "" {
+		t.Errorf("Enqueue returned a repo id: %q", j.RepoID)
+	}
+	got, err := q.Get(ctx, j.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RepoID != "" {
+		t.Errorf("a pending job names the repo %q", got.RepoID)
 	}
 }

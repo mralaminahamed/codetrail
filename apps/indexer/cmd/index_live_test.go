@@ -721,7 +721,7 @@ func TestEvictionRemovesSpansEndToEndLive(t *testing.T) {
 	if n, err := st.CountSpans(ctx, run.repoID); err != nil || n == 0 {
 		t.Fatalf("nothing to evict: %d spans, %v", n, err)
 	}
-	if _, err := st.Evict(ctx, 0); err != nil {
+	if _, err := st.Evict(ctx, 0, 100); err != nil {
 		t.Fatal(err)
 	}
 	n, err := st.CountSpans(ctx, run.repoID)

@@ -427,7 +427,7 @@ func TestEvictionRemovesSpansLive(t *testing.T) {
 	if n, err := s.CountSpans(ctx, repoID); err != nil || n != 2 {
 		t.Fatalf("the fixture wrote %d spans, want 2 (%v)", n, err)
 	}
-	if _, err := s.Evict(ctx, 0); err != nil {
+	if _, err := s.Evict(ctx, 0, 100); err != nil {
 		t.Fatal(err)
 	}
 	if n, err := s.CountSpans(ctx, repoID); err != nil || n != 0 {
