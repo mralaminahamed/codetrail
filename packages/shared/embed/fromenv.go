@@ -34,7 +34,10 @@ import (
 // job deadline the context already carries, the gateway a bound on the read
 // path.
 func FromEnv(ctx context.Context, schemaDim int, checkDim func(int) error, timeout time.Duration) (Embedder, error) {
-	dim := config.GetInt("EMBED_DIM", schemaDim)
+	dim, err := config.GetInt("EMBED_DIM", schemaDim)
+	if err != nil {
+		return nil, err
+	}
 	if err := checkDim(dim); err != nil {
 		return nil, fmt.Errorf("EMBED_DIM=%d: %w", dim, err)
 	}

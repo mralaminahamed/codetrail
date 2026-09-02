@@ -121,8 +121,13 @@ func newHandler(log zerolog.Logger, q handler.Enqueuer, rd handler.Reader, r *ra
 // empty string and no error anywhere.
 func answerBudget() (rag.Budget, error) {
 	b := rag.DefaultBudget()
-	b.MaxSpans = config.GetInt("ANSWER_MAX_SPANS", b.MaxSpans)
-	b.MaxChars = config.GetInt("ANSWER_MAX_CHARS", b.MaxChars)
+	var err error
+	if b.MaxSpans, err = config.GetInt("ANSWER_MAX_SPANS", b.MaxSpans); err != nil {
+		return rag.Budget{}, err
+	}
+	if b.MaxChars, err = config.GetInt("ANSWER_MAX_CHARS", b.MaxChars); err != nil {
+		return rag.Budget{}, err
+	}
 	if err := b.Validate(); err != nil {
 		return rag.Budget{}, err
 	}
@@ -158,7 +163,10 @@ func newRetriever(ctx context.Context, log zerolog.Logger, st rag.Searcher) (*ra
 	// infinity and k <= -2 inverts the ranking, both silently, and config.GetInt
 	// parses "-1" happily. 60 is the constant from the paper the method comes
 	// from and is not measured against this corpus.
-	k := config.GetInt("RETRIEVAL_RRF_K", 60)
+	k, err := config.GetInt("RETRIEVAL_RRF_K", 60)
+	if err != nil {
+		return nil, err
+	}
 	if k < 0 {
 		return nil, fmt.Errorf("RETRIEVAL_RRF_K must not be negative, got %d", k)
 	}
@@ -166,7 +174,10 @@ func newRetriever(ctx context.Context, log zerolog.Logger, st rag.Searcher) (*ra
 	// pinned image — read from pg_settings.boot_val, not assumed. Asking the
 	// ANN index for more rows than ef_search degrades recall with no error,
 	// and hnsw.iterative_scan is off by default, so nothing compensates.
-	candidates := config.GetInt("RETRIEVAL_CANDIDATES", 40)
+	candidates, err := config.GetInt("RETRIEVAL_CANDIDATES", 40)
+	if err != nil {
+		return nil, err
+	}
 	if candidates < 1 {
 		return nil, fmt.Errorf("RETRIEVAL_CANDIDATES must be positive, got %d", candidates)
 	}
@@ -215,9 +226,10 @@ func splitIdentifiers() (bool, error) {
 // scoreFloor reads ANSWER_SCORE_FLOOR and refuses what a cosine similarity
 // cannot produce, the way chunk.Options and walk.Limits refuse their own.
 //
-// Parsed here rather than through config, because config.GetInt answers its
-// default for anything it cannot parse and a floor that silently reverts to -1
-// on a typo is a filter an operator believes is running.
+// Parsed here rather than through config, which reads integers only. The
+// refusal is config.GetInt's now too, and for the same reason: a floor that
+// silently reverted to -1 on a typo is a filter an operator believes is
+// running.
 //
 // Calibrated is false whatever the value: the flag says *codetrail* measured
 // this number, and spec:315 puts that in P6. An operator's own number is still

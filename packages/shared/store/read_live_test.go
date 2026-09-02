@@ -5,6 +5,8 @@ package store
 import (
 	"context"
 	"errors"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -43,25 +45,71 @@ func repoIDFor(name string) string {
 	return RepoID("https://github.com/read/"+name, Digest(name)[:40])
 }
 
-// The listing is the corpus in the order eviction reads it, so its tail is what
-// goes next. The fixture's expected order disagrees with insertion order and
-// with id order, and both disagreements are asserted rather than constructed.
+// The listing is the corpus most recently used first, so its tail is what
+// eviction takes next.
+//
+// The fixture's expected order agrees with none of the orders a wrong query
+// could return the same four rows in — insertion, id, the remote's path, or
+// indexed_at — and each disagreement is checked below rather than assumed. The
+// version of this test that shipped with P3 wound the clock backwards, so its
+// expected order *was* insertion order: it killed ORDER BY ASC and survived
+// deleting the ORDER BY altogether.
+//
+// Two rows share a clock reading, which is a corpus state PutRepo produces, but
+// the tiebreak is not what this test kills: measured, deleting the id from the
+// ORDER BY leaves it green, because Postgres returns this pair in id order
+// anyway. The test below is where that key is asserted.
 func TestListReposIsMostRecentlyUsedFirstLive(t *testing.T) {
 	ctx := context.Background()
-	names := []string{"lru-one", "lru-two", "lru-three"}
+	names := []string{"lru-one", "lru-two", "lru-three", "lru-four"}
+	// Two clocks per repo, wound to different permutations: a query reading
+	// indexed_at where it means last_queried_at then returns a different order
+	// rather than the same one, and no row's two timestamps are equal.
+	base := time.Now().UTC().Truncate(time.Microsecond)
+	ago := func(n int) time.Time { return base.Add(time.Duration(-n) * time.Minute) }
+	lastUsed := map[string]time.Time{
+		"lru-one": ago(60), "lru-two": ago(180),
+		// Tied, which is what the id tiebreak decides between.
+		"lru-three": base, "lru-four": base,
+	}
+	indexed := map[string]time.Time{
+		"lru-one": ago(90), "lru-two": ago(240),
+		"lru-three": ago(120), "lru-four": ago(150),
+	}
+	// Most recently used first; lru-four's id sorts under lru-three's.
+	want := []string{"lru-four", "lru-three", "lru-one", "lru-two"}
+
+	byID := slices.Clone(names)
+	slices.SortFunc(byID, func(a, b string) int { return strings.Compare(repoIDFor(a), repoIDFor(b)) })
+	byPath := slices.Sorted(slices.Values(names))
+	byIndexed := slices.Clone(names)
+	slices.SortFunc(byIndexed, func(a, b string) int { return indexed[b].Compare(indexed[a]) })
+	for _, other := range []struct {
+		what  string
+		order []string
+	}{
+		{"insertion", names}, {"id", byID},
+		{"the remote's path", byPath}, {"indexed_at", byIndexed},
+	} {
+		if slices.Equal(want, other.order) {
+			t.Fatalf("fixture: the expected order agrees with %s order (%v)", other.what, other.order)
+		}
+	}
+
 	ids := make([]string, len(names))
+	name := make(map[string]string, len(names))
 	for i, n := range names {
 		ids[i] = repoIDFor(n)
+		name[ids[i]] = n
 	}
 	s := fresh(t, ids...)
 	for _, n := range names {
 		seedReadRepo(t, s, n, []string{"a.go"}, 1)
 	}
-	// Wound backwards, so the newest-used is the one inserted first.
-	for i, id := range ids {
+	for _, n := range names {
 		if _, err := s.pool.Exec(ctx,
-			`UPDATE repos SET last_queried_at = now() - ($2 * interval '1 hour') WHERE id = $1`,
-			id, i); err != nil {
+			`UPDATE repos SET last_queried_at = $2, indexed_at = $3 WHERE id = $1`,
+			repoIDFor(n), lastUsed[n], indexed[n]); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -70,32 +118,30 @@ func TestListReposIsMostRecentlyUsedFirstLive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := make([]string, 0, len(ids))
+	got := make([]string, 0, len(names))
 	for _, r := range rows {
-		for _, id := range ids {
-			if r.ID == id {
-				got = append(got, r.ID)
-			}
+		if n, ok := name[r.ID]; ok {
+			got = append(got, n)
 		}
 	}
-	if len(got) != 3 {
-		t.Fatalf("listed %d of the fixture's 3 repos", len(got))
-	}
-	for i, want := range ids {
-		if got[i] != want {
-			t.Fatalf("position %d is %s, want %s (order %v)", i, got[i], want, got)
-		}
-	}
-	// The property the assertion above depends on: if the fixture's ids happen
-	// to sort into the expected order, a query with no ORDER BY could pass.
-	if ids[0] < ids[1] && ids[1] < ids[2] {
-		t.Fatal("fixture: the expected order agrees with id order")
+	if !slices.Equal(got, want) {
+		t.Fatalf("listed %v, want %v", got, want)
 	}
 
-	// The clock, not the index time, and it is on the row a caller reads.
+	// The values, not merely the order. Selecting indexed_at into both columns
+	// leaves the order alone, and asserting that last_used_at is within a
+	// second of indexed_at cannot see the difference either — which is how that
+	// mutation survived P3.
 	for _, r := range rows {
-		if r.ID == ids[0] && !r.LastUsedAt.After(r.IndexedAt.Add(-time.Second)) {
-			t.Errorf("last_used_at %v is not a clock reading", r.LastUsedAt)
+		n, ok := name[r.ID]
+		if !ok {
+			continue
+		}
+		if !r.LastUsedAt.Equal(lastUsed[n]) {
+			t.Errorf("%s last_used_at %v, want %v", n, r.LastUsedAt, lastUsed[n])
+		}
+		if !r.IndexedAt.Equal(indexed[n]) {
+			t.Errorf("%s indexed_at %v, want %v", n, r.IndexedAt, indexed[n])
 		}
 	}
 
@@ -106,6 +152,55 @@ func TestListReposIsMostRecentlyUsedFirstLive(t *testing.T) {
 	}
 	if len(short) != 1 {
 		t.Fatalf("limit 1 returned %d rows", len(short))
+	}
+}
+
+// The id tiebreak, on a corpus where every row ties. PutRepo stamps
+// last_queried_at from now() once per transaction, so a batch indexed inside
+// one clock tick is exactly this shape, and without a second key two listings
+// of it may disagree.
+//
+// Six rows rather than two: with a single sort key Postgres may return a tied
+// pair in either order, and the two-row tie above happens to come back in id
+// order, so it proves nothing. Measured on these six with the key removed: they
+// list in the reverse of the order they were written.
+func TestListReposBreaksAClockTieByIdLive(t *testing.T) {
+	ctx := context.Background()
+	names := []string{"tie-a", "tie-b", "tie-c", "tie-d", "tie-e", "tie-f"}
+	ids := make([]string, len(names))
+	name := make(map[string]string, len(names))
+	for i, n := range names {
+		ids[i] = repoIDFor(n)
+		name[ids[i]] = n
+	}
+	s := fresh(t, ids...)
+	for _, n := range names {
+		seedReadRepo(t, s, n, []string{"a.go"}, 1)
+	}
+	tick := time.Now().UTC().Truncate(time.Microsecond)
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE repos SET last_queried_at = $2 WHERE id = ANY($1)`, ids, tick); err != nil {
+		t.Fatal(err)
+	}
+
+	want := slices.Clone(names)
+	slices.SortFunc(want, func(a, b string) int { return strings.Compare(repoIDFor(a), repoIDFor(b)) })
+	if slices.Equal(want, names) {
+		t.Fatal("fixture: id order is insertion order, so this asserts nothing")
+	}
+
+	rows, err := s.ListRepos(ctx, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, 0, len(names))
+	for _, r := range rows {
+		if n, ok := name[r.ID]; ok {
+			got = append(got, n)
+		}
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("a corpus indexed inside one clock tick listed %v, want id order %v", got, want)
 	}
 }
 

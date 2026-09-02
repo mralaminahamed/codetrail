@@ -5,6 +5,7 @@ package store
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -254,6 +255,78 @@ func TestNewerCommitFindsALaterIndexOfTheSameRefLive(t *testing.T) {
 	}
 	if want := base.AddDate(0, 0, -1); !at.Equal(want) {
 		t.Fatalf("newer indexed at %v, want %v", at, want)
+	}
+}
+
+// "The later commit" has to be the *latest* one when the ref moved twice.
+//
+// Until this fixture, no test ever put two candidate rows in the table, so the
+// whole ORDER BY was deletable: the note beside a citation would then name an
+// intermediate commit as the one that superseded it, which is a wrong claim to
+// a user rather than a missing one. The two intermediates straddle stNew in
+// commit_sha order and sit either side of it in insertion order, so ordering on
+// the wrong column, in the wrong direction, or not at all each names one of
+// them.
+func TestNewerCommitNamesTheLatestOfSeveralLive(t *testing.T) {
+	ctx := context.Background()
+	const (
+		stLowCommit  = "0000000000000000000000000000000000000000"
+		stHighCommit = "9999999999999999999999999999999999999999"
+	)
+	s := fresh(t, stID(stOld), stID(stLowCommit), stID(stHighCommit), stID(stNew))
+	base := time.Now().UTC().Truncate(time.Microsecond)
+	// Written oldest-answer-first, so the row a query with no ORDER BY reaches
+	// first is the wrong one.
+	putAt(t, s, stID(stOld), stRemote, "main", stOld, base.AddDate(0, 0, -92))
+	putAt(t, s, stID(stLowCommit), stRemote, "main", stLowCommit, base.AddDate(0, 0, -30))
+	putAt(t, s, stID(stHighCommit), stRemote, "main", stHighCommit, base.AddDate(0, 0, -60))
+	putAt(t, s, stID(stNew), stRemote, "main", stNew, base.AddDate(0, 0, -1))
+
+	commit, at, err := s.NewerCommit(ctx, stID(stOld))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if commit != stNew {
+		t.Fatalf("three later commits: named %q as the latest, want %q", commit, stNew)
+	}
+	if want := base.AddDate(0, 0, -1); !at.Equal(want) {
+		t.Fatalf("named %v as when it was indexed, want %v", at, want)
+	}
+}
+
+// Two commits of one ref indexed in the same transaction tie on indexed_at, and
+// then the commit_sha decides. Deterministically, because a note that names a
+// different superseding commit on each read is two claims about one repository.
+//
+// Four tied rows rather than two: with a single sort key Postgres may return a
+// tied pair in either order, and a pair that happens to come back in commit
+// order proves nothing.
+func TestNewerCommitBreaksAnIndexTieByCommitLive(t *testing.T) {
+	ctx := context.Background()
+	tied := []string{
+		"7777777777777777777777777777777777777777",
+		"4444444444444444444444444444444444444444",
+		"8888888888888888888888888888888888888888",
+		"5555555555555555555555555555555555555555",
+	}
+	ids := []string{stID(stOld)}
+	for _, c := range tied {
+		ids = append(ids, stID(c))
+	}
+	s := fresh(t, ids...)
+	base := time.Now().UTC().Truncate(time.Microsecond)
+	putAt(t, s, stID(stOld), stRemote, "main", stOld, base.AddDate(0, 0, -92))
+	for _, c := range tied {
+		putAt(t, s, stID(c), stRemote, "main", c, base)
+	}
+
+	commit, _, err := s.NewerCommit(ctx, stID(stOld))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The lowest of the four, which is neither the first written nor the last.
+	if want := slices.Min(tied); commit != want {
+		t.Fatalf("four commits indexed at one instant named %q, want %q", commit, want)
 	}
 }
 

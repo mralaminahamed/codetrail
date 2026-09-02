@@ -2,6 +2,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 )
@@ -13,13 +14,23 @@ func Get(key, def string) string {
 	return def
 }
 
-func GetInt(key string, def int) int {
-	if v, ok := os.LookupEnv(key); ok {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
+// GetInt reads an integer setting, or def when it is unset or empty.
+//
+// A value that is not an integer is an error rather than the default:
+// RETRIEVAL_CANDIDATES=4O with a letter O ran at 40 and said nothing, which is
+// a setting an operator believes is in force and is not. Every caller here
+// already refuses a value out of range; this closes the case where the value
+// never became a number at all.
+func GetInt(key string, def int) (int, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return def, nil
 	}
-	return def
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be an integer, got %q", key, v)
+	}
+	return n, nil
 }
 
 func MustGet(key string) string {
