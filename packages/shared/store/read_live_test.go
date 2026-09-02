@@ -161,8 +161,9 @@ func TestListReposIsMostRecentlyUsedFirstLive(t *testing.T) {
 // of it may disagree.
 //
 // Six rows rather than two: with a single sort key Postgres may return a tied
-// pair in either order, and a two-row fixture that happens to come back in id
-// order proves nothing. Six do not land in id order by accident.
+// pair in either order, and the two-row tie above happens to come back in id
+// order, so it proves nothing. Measured on these six with the key removed: they
+// list in the reverse of the order they were written.
 func TestListReposBreaksAClockTieByIdLive(t *testing.T) {
 	ctx := context.Background()
 	names := []string{"tie-a", "tie-b", "tie-c", "tie-d", "tie-e", "tie-f"}

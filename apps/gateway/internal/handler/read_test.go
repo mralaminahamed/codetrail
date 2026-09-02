@@ -1210,9 +1210,9 @@ func movedSince(t *testing.T, before map[string]float64) map[string]float64 {
 }
 
 // Each reason says what it means in words (spec §10 forbids a generic
-// refusal), and the strings are pinned whole. Only the below_floor one was ever
-// read back: the other two could be emptied, swapped or reduced to "refused"
-// and every assertion in this file still passed.
+// refusal), and the strings are pinned whole. Only below_floor's was read for
+// its content before this: no_spans' was checked for being non-empty, so any
+// other sentence passed, and unscored's was never read at all.
 func TestEveryRefusalReasonCarriesItsOwnDetail(t *testing.T) {
 	for _, tc := range []struct {
 		reason rag.Reason
