@@ -34,6 +34,10 @@ import (
 // declares. So one fixture holds both labels, and the assertions below name an
 // edge in each package rather than counting them — a count passes under a
 // mutant that swaps which package got which label.
+//
+// G's own call to fmt.Print is there for one reason, and it was measured: with
+// every call inside the file's *first* declaration, a stage that used the
+// first declaration as every edge's tail passed the tail test.
 var graphRepo = map[string]string{
 	"a.go": `package p
 
@@ -45,8 +49,10 @@ func F(n int) int {
 	return fns[0]()
 }
 
-// G doubles n.
+// G doubles n and says so, which is a call in a declaration that is not the
+// first one in the file.
 func G(n int) int {
+	fmt.Print(n)
 	return n * 2
 }
 
@@ -88,8 +94,8 @@ func gKeys(t *testing.T) []symbols.Key {
 // resolvedG is the answer a working type-checker gives for graphRepo: both
 // calls to G point at G's declaration.
 //
-// Line 12 is the `func G` line and G's definition starts at 11, its doc
-// comment. They are deliberately different: a target is the declaration's own
+// Line 12 is the `func G` line and G's definition starts at 11, the first line
+// of its two-line doc comment. They are deliberately different: a target is the declaration's own
 // token and a Def's range starts at the comment, so a stage that matched them
 // by equality would resolve nothing here.
 func resolvedG(t *testing.T) map[symbols.Key]symbols.Target {
@@ -172,6 +178,7 @@ func TestEveryCallIsAnEdgeBeforeAnythingIsResolved(t *testing.T) {
 		"F calls Println at a.go:7",
 		"F calls G at a.go:7",
 		"F calls G at a.go:7",
+		"G calls Print at a.go:14",
 		"Helper calls Missing at b/util.go:5",
 	}
 	if got := sites(unresolved); !slices.Equal(got, want) {
@@ -218,6 +225,7 @@ func TestOnlyTheCallSitesTheResolverNamedAreResolved(t *testing.T) {
 				"F calls Println-> at a.go:7 (syntactic)",
 				"F calls G->G at a.go:7 (resolved)",
 				"F calls G->G at a.go:7 (resolved)",
+				"G calls Print-> at a.go:14 (syntactic)",
 				"Helper calls Missing-> at b/util.go:5 (syntactic)",
 			}
 			if got := edgeStrings(edges(t, rec)); !slices.Equal(got, want) {
@@ -243,8 +251,8 @@ func TestATargetIsMatchedToTheDefinitionThatContainsIt(t *testing.T) {
 			g = s
 		}
 	}
-	if g.StartLine != 11 || g.EndLine != 14 {
-		t.Fatalf("G spans %d..%d, want 11..14 — the fixture no longer separates the two lines", g.StartLine, g.EndLine)
+	if g.StartLine != 11 || g.EndLine != 16 {
+		t.Fatalf("G spans %d..%d, want 11..16 — the fixture no longer separates its first line from its declaration", g.StartLine, g.EndLine)
 	}
 	for _, e := range rec.edges {
 		if e.ToName != "G" {
@@ -267,8 +275,11 @@ func TestTheEdgeTailIsTheDeclarationTheCallIsIn(t *testing.T) {
 
 	for _, e := range edges(t, rec) {
 		want := "F"
-		if strings.HasPrefix(e.at, "b/util.go") {
+		switch {
+		case strings.HasPrefix(e.at, "b/util.go"):
 			want = "Helper"
+		case e.at == "a.go:14":
+			want = "G"
 		}
 		if e.from != want {
 			t.Errorf("%s: the edge leaves %s, want %s", e, e.from, want)
@@ -321,6 +332,7 @@ func TestAResolverFailureLeavesEveryEdgeSyntacticAndTheJobIntact(t *testing.T) {
 				"F calls Println-> at a.go:7 (syntactic)",
 				"F calls G-> at a.go:7 (syntactic)",
 				"F calls G-> at a.go:7 (syntactic)",
+				"G calls Print-> at a.go:14 (syntactic)",
 				"Helper calls Missing-> at b/util.go:5 (syntactic)",
 			}
 			if got := edgeStrings(edges(t, rec)); !slices.Equal(got, want) {
@@ -335,7 +347,7 @@ func TestAResolverFailureLeavesEveryEdgeSyntacticAndTheJobIntact(t *testing.T) {
 			}
 			moved := movedGraphCounters(t, before)
 			wantMoved := map[string]float64{
-				`codetrail_graph_edges_total{provenance="syntactic"}`: 4,
+				`codetrail_graph_edges_total{provenance="syntactic"}`: 5,
 				`codetrail_typecheck_total{reason="` + tc.want + `"}`: 1,
 				// The stage times what it ran. With the knob off it ran
 				// nothing, so there is nothing to time — and that absence is
@@ -546,7 +558,7 @@ func TestTheJobLogNamesWhatTheGraphStageProducedAndWhyItStopped(t *testing.T) {
 	line := logLine(t, rec.logged.String(), "symbol graph")
 	want := map[string]any{
 		"level": "info", "message": "symbol graph",
-		"symbols": 4.0, "edges": 4.0, "resolved": 2.0, "syntactic": 2.0,
+		"symbols": 4.0, "edges": 5.0, "resolved": 2.0, "syntactic": 3.0,
 		"external": 1.0, "unnameable": 1.0, "reason": "ok",
 	}
 	for k, v := range want {
@@ -580,7 +592,7 @@ func TestTheGraphCountersMoveExactlyOnce(t *testing.T) {
 
 	want := map[string]float64{
 		`codetrail_graph_edges_total{provenance="resolved"}`:  2,
-		`codetrail_graph_edges_total{provenance="syntactic"}`: 2,
+		`codetrail_graph_edges_total{provenance="syntactic"}`: 3,
 		`codetrail_typecheck_total{reason="ok"}`:              1,
 		"codetrail_typecheck_seconds_count":                   1,
 	}
