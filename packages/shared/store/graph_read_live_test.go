@@ -87,6 +87,14 @@ func seedReadGraph(t *testing.T) graphFixture {
 	def("cache.go", 7, 10, "f")
 	def("cache.go", 11, 13, "h")
 
+	// cache.go is a second package, so ?pkg= has something to narrow: the two
+	// Get methods that make name matching visibly wrong are in two of them.
+	for _, n := range []string{"Cache.Get", "f", "h"} {
+		sy := sym[n]
+		sy.Pkg = "cache"
+		sym[n] = sy
+	}
+
 	var syms []models.Symbol
 	for _, sy := range sym {
 		syms = append(syms, sy)
@@ -512,7 +520,7 @@ func TestDefinitionsMatchesExactlyUnlessSuffixIsAskedLive(t *testing.T) {
 	ctx := context.Background()
 	defs := func(name string, suffix bool) []string {
 		t.Helper()
-		got, err := f.s.Definitions(ctx, f.repoA, name, suffix, 50)
+		got, err := f.s.Definitions(ctx, f.repoA, name, "", suffix, 50)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -537,13 +545,48 @@ func TestDefinitionsMatchesExactlyUnlessSuffixIsAskedLive(t *testing.T) {
 	}
 }
 
+// Two definitions sharing a last segment in two packages is the shape a caller
+// disambiguates with, and it is the only thing pkg is for. Asserted as the
+// whole set each way round: a predicate that ignored pkg passes a "Cache.Get is
+// in the answer" check.
+func TestDefinitionsCanBeNarrowedToOnePackageLive(t *testing.T) {
+	f := seedReadGraph(t)
+	ctx := context.Background()
+	defs := func(pkg string) []string {
+		t.Helper()
+		got, err := f.s.Definitions(ctx, f.repoA, "Get", pkg, true, 50)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := make([]string, 0, len(got))
+		for _, sy := range got {
+			out = append(out, sy.Name+"@"+sy.Pkg)
+		}
+		return out
+	}
+	if got, want := defs(""), []string{"Cache.Get@cache", "Store.Get@p"}; !slices.Equal(got, want) {
+		t.Errorf("no pkg: %v, want %v", got, want)
+	}
+	if got, want := defs("cache"), []string{"Cache.Get@cache"}; !slices.Equal(got, want) {
+		t.Errorf("pkg=cache: %v, want %v", got, want)
+	}
+	if got, want := defs("p"), []string{"Store.Get@p"}; !slices.Equal(got, want) {
+		t.Errorf("pkg=p: %v, want %v", got, want)
+	}
+	// A package the repository does not have is an empty answer, not every
+	// definition: an ignored predicate reads the same as an absent one.
+	if got := defs("nosuchpkg"); len(got) != 0 {
+		t.Errorf("pkg=nosuchpkg: %v, want none", got)
+	}
+}
+
 // parseConfig exists in every second Go repository. Repo B's target has six
 // callers to repo A's four, so an unscoped read is a different answer rather
 // than a longer one.
 func TestDefinitionsIsScopedToOneRepoLive(t *testing.T) {
 	f := seedReadGraph(t)
 	ctx := context.Background()
-	got, err := f.s.Definitions(ctx, f.repoA, "target", false, 50)
+	got, err := f.s.Definitions(ctx, f.repoA, "target", "", false, 50)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -555,7 +598,7 @@ func TestDefinitionsIsScopedToOneRepoLive(t *testing.T) {
 			got[0].ID, got[0].RepoID, f.sym["target"].ID, f.repoA)
 	}
 	// Repo B's own answer is its own, and the two do not collide.
-	other, err := f.s.Definitions(ctx, f.repoB, "target", false, 50)
+	other, err := f.s.Definitions(ctx, f.repoB, "target", "", false, 50)
 	if err != nil {
 		t.Fatal(err)
 	}

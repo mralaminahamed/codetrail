@@ -173,23 +173,30 @@ func (s *Store) ApproximateCallersOf(ctx context.Context, repoID, name string, l
 	return out, rows.Err()
 }
 
-// Definitions finds a symbol by name in one repository.
+// Definitions finds a symbol by name in one repository, optionally within one
+// package.
 //
 // Exact by default. The corpus spells a method Store.Get and P3's lexical arm
 // reaches it through its parts, so a caller who types Get is likely to have
 // come from there — but widening silently answers a different question than
 // the one asked, and the payload cannot say it happened. suffix is the opt-in.
 //
+// pkg narrows to one package clause and empty means every package. It is a
+// predicate rather than a filter over the rows this returns because LIMIT
+// applies here: filtering afterwards would drop rows the limit had already
+// spent, and answer 3 of 5 while reporting a bound of 20.
+//
 // right(), not LIKE: a name carrying % or _ would turn a LIKE pattern into a
 // wildcard, which is the silent widening this signature exists to refuse.
-func (s *Store) Definitions(ctx context.Context, repoID, name string, suffix bool, limit int) ([]models.Symbol, error) {
+func (s *Store) Definitions(ctx context.Context, repoID, name, pkg string, suffix bool, limit int) ([]models.Symbol, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT `+symbolCols+`
 		FROM symbols s
 		WHERE s.repo_id = $1
 		  AND (s.name = $2 OR ($3 AND right(s.name, char_length($2) + 1) = '.' || $2))
+		  AND ($4 = '' OR s.pkg = $4)
 		ORDER BY s.path, s.start_line, s.id
-		LIMIT $4`, repoID, name, suffix, limit)
+		LIMIT $5`, repoID, name, suffix, pkg, limit)
 	if err != nil {
 		return nil, err
 	}
