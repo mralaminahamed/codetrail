@@ -35,8 +35,9 @@ import (
 // and every failure path can be driven without a database.
 type queue interface {
 	Lease(ctx context.Context, worker string, d time.Duration) (jobs.Job, bool, error)
-	Complete(ctx context.Context, id, worker string) error
+	Complete(ctx context.Context, id, worker, repoID string) error
 	Fail(ctx context.Context, id, worker, reason string, maxAttempts int) error
+	Sweep(ctx context.Context, keepFor time.Duration) (int, error)
 }
 
 type limits struct {
@@ -47,8 +48,15 @@ type limits struct {
 	// keepRepos is how many repositories the corpus is allowed to hold. Anyone
 	// may submit one, so something has to bound it; see runJob.
 	keepRepos int
+	// keepTombstones bounds the evicted_repos table the same way, and for the
+	// same reason: eviction is unbounded, so what records it has to be bounded.
+	keepTombstones int
 	// embedBatch is how many span texts go in one Embed call.
 	embedBatch int
+	// jobHistory is how long a terminal job stays readable, and sweepEvery how
+	// often that is enforced; see sweepJobs.
+	jobHistory time.Duration
+	sweepEvery time.Duration
 }
 
 // indexer is the worker: a queue, the steps of a job, and the caps.
@@ -61,7 +69,7 @@ type indexer struct {
 	walk     func(ctx context.Context, root string, lim walk.Limits) ([]walk.File, error)
 	put      func(ctx context.Context, r models.Repo, files []models.File) error
 	putSpans func(ctx context.Context, repoID string, spans []store.EmbeddedSpan, model string, dim int) error
-	evict    func(ctx context.Context, keep int) (int, error)
+	evict    func(ctx context.Context, keep, keepTombstones int) (int, error)
 	emb      embed.Embedder
 	// opt and strip are the chunking decisions, read once at boot rather than
 	// per job: see chunkOptions and stripDocs.
@@ -75,6 +83,12 @@ type indexer struct {
 	id      string
 	scratch string
 	lim     limits
+
+	// now is the clock the sweep interval is measured on, a field so a test
+	// can count sweeps without waiting an hour. lastSweep is zero at boot, so
+	// the first pass of the loop sweeps.
+	now       func() time.Time
+	lastSweep time.Time
 }
 
 func main() {
@@ -122,6 +136,7 @@ func main() {
 		id:       workerID(),
 		scratch:  config.Get("SCRATCH_DIR", filepath.Join(os.TempDir(), "codetrail")),
 		lim:      lim,
+		now:      time.Now,
 	}
 	// At exit, so a worker asked to stop takes its checkouts with it. At boot
 	// too: with a fresh id each start that normally finds nothing, and one
@@ -208,16 +223,23 @@ func limitsFrom() (limits, error) {
 			MaxFiles:     get("MAX_REPO_FILES", 20000),
 			MaxFileBytes: int64(get("MAX_FILE_BYTES", 1<<20)),
 		},
-		tries:      get("MAX_ATTEMPTS", 3),
-		poll:       time.Duration(get("POLL_SECONDS", 2)) * time.Second,
-		keepRepos:  get("KEEP_REPOS", 50),
-		embedBatch: get("EMBED_BATCH", 32),
+		tries:          get("MAX_ATTEMPTS", 3),
+		poll:           time.Duration(get("POLL_SECONDS", 2)) * time.Second,
+		keepRepos:      get("KEEP_REPOS", 50),
+		keepTombstones: get("KEEP_TOMBSTONES", 500),
+		embedBatch:     get("EMBED_BATCH", 32),
+		// One week. A caller may poll a job id for that long after it finishes,
+		// which is a rule that can be stated; see jobs.Sweep for the two bounds
+		// this is chosen over.
+		jobHistory: time.Duration(get("JOB_HISTORY_HOURS", 168)) * time.Hour,
+		sweepEvery: time.Duration(get("JOB_SWEEP_MINUTES", 60)) * time.Minute,
 	}, err
 }
 
 // run leases and executes jobs until the process is asked to stop.
 func (ix *indexer) run(ctx context.Context) {
 	for ctx.Err() == nil {
+		ix.sweepJobs(ctx)
 		// A minute past the deadline the whole job shares, so the job is not
 		// handed to a second worker while the first is still working it. The
 		// spare minute is for the queue writes that follow the work; see
@@ -233,6 +255,37 @@ func (ix *indexer) run(ctx context.Context) {
 			continue
 		}
 		ix.runJob(ctx, job)
+	}
+}
+
+// sweepJobs ages terminal jobs out of the queue, at most once per
+// JOB_SWEEP_MINUTES.
+//
+// Here rather than in the gateway: spec §2 says the gateway writes job rows and
+// repos.last_queried_at and nothing else, and the indexer already owns terminal
+// states. In the lease loop rather than a goroutine of its own, so a worker
+// that stops leasing stops sweeping.
+//
+// The interval check is what keeps the DELETE off every poll: the loop polls
+// every POLL_SECONDS and the window it enforces is a week, so sweeping per poll
+// would be a scan a couple of thousand times more often than anything can
+// change the answer.
+func (ix *indexer) sweepJobs(ctx context.Context) {
+	if ix.now().Sub(ix.lastSweep) < ix.lim.sweepEvery {
+		return
+	}
+	ix.lastSweep = ix.now()
+	n, err := ix.q.Sweep(ctx, ix.lim.jobHistory)
+	if err != nil {
+		// Logged and dropped. Retention is not what this worker is for, the
+		// next interval tries again, and a failure here must not cost the queue
+		// a poll.
+		ix.log.Warn().Err(err).Msg("job sweep failed")
+		return
+	}
+	if n > 0 {
+		ix.log.Info().Int("swept", n).Str("older_than", ix.lim.jobHistory.String()).
+			Msg("aged out terminal jobs")
 	}
 }
 
@@ -353,7 +406,7 @@ func (ix *indexer) runJob(ctx context.Context, job jobs.Job) {
 	// leaving the row 'leased' with no reason on it until the lease runs out.
 	done, cancelDone := context.WithTimeout(ctx, recordDeadline)
 	defer cancelDone()
-	if err := ix.q.Complete(done, job.ID, ix.id); err != nil {
+	if err := ix.q.Complete(done, job.ID, ix.id, repoID); err != nil {
 		// ErrNotLeased means this worker's lease expired and another indexer
 		// took the job. Losing that race is normal; completing someone else's
 		// job would not be. Anything else — a cancelled context under SIGTERM,
@@ -377,7 +430,7 @@ func (ix *indexer) runJob(ctx context.Context, job jobs.Job) {
 	// released by now, so there is nothing left to retry, and the next
 	// successful index evicts down to the same bound regardless of how far
 	// over this one left it.
-	if n, err := ix.evict(done, ix.lim.keepRepos); err != nil {
+	if n, err := ix.evict(done, ix.lim.keepRepos, ix.lim.keepTombstones); err != nil {
 		l.Warn().Err(err).Msg("evict failed")
 	} else if n > 0 {
 		l.Info().Int("evicted", n).Msg("evicted least recently queried repos")
