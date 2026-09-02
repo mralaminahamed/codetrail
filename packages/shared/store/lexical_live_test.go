@@ -20,8 +20,8 @@ import (
 //	a_body.go    no symbol, parseConfig twice in ~200 tokens      the B case
 //	d_prose.go   no symbol, "parse the config file"               split terms only
 //	e_method.go  symbol Store.Get, text matching nothing          the dotted symbol
-//	x_repeat.go  alpha six times                                  ranking function
 //	y_cover.go   alpha and beta once each                         ranking function
+//	x_repeat.go  alpha six times                                  ranking function
 //
 // and in a second repository, a_body.go with symbol parseConfig and the term ten
 // times over — a better match than anything in the target repo, so a missing
@@ -51,8 +51,14 @@ func lexFixture(t *testing.T) (*Store, string, string) {
 	other := RepoID(lexOtherRemote, Digest(lexOtherRemote)[:40])
 	s := fresh(t, target, other)
 
-	// c_symbol.go last: physical order is insertion order, so a query that
-	// lost its ORDER BY cannot pass by returning the answer first.
+	// c_symbol.go goes in last though it ranks first, so a query that lost
+	// its ORDER BY cannot pass by returning rows in the order they arrived.
+	// y_cover.go before x_repeat.go for the same reason, though measured that
+	// is not enough on its own: with the ORDER BY deleted this pair still came
+	// back [x_repeat, y_cover] — the expected answer — whichever order they
+	// were inserted in. Unordered is not insertion-ordered. So the ranking
+	// function test does not detect a missing ORDER BY and TestSymbolOutweighsBody
+	// is what does.
 	seedLexSpans(t, s, target, lexTargetRemote, []lexSpan{
 		{path: "a_body.go", line: 10, text: strings.Repeat(lexFiller, 60) +
 			" parseConfig " + strings.Repeat("more filler text ", 60) +
@@ -60,8 +66,8 @@ func lexFixture(t *testing.T) (*Store, string, string) {
 		{path: "d_prose.go", line: 20, text: "// parse the config file and return it"},
 		{path: "e_method.go", line: 30, symbol: "Store.Get",
 			text: "func (r *zzz) yyy() error { return nil }"},
-		{path: "x_repeat.go", line: 40, text: strings.Repeat("alpha ", 6) + strings.Repeat(lexFiller, 30)},
-		{path: "y_cover.go", line: 50, text: "alpha beta " + strings.Repeat(lexFiller, 30)},
+		{path: "y_cover.go", line: 40, text: "alpha beta " + strings.Repeat(lexFiller, 30)},
+		{path: "x_repeat.go", line: 50, text: strings.Repeat("alpha ", 6) + strings.Repeat(lexFiller, 30)},
 		{path: "c_symbol.go", line: 60, symbol: "parseConfig",
 			text: "func zzz(a int) error { return nil }"},
 	})
@@ -290,6 +296,8 @@ func TestMigration0008AppliesToAPopulatedTableTwiceLive(t *testing.T) {
 		`INSERT INTO spans (id, repo_id, file_id, path, kind, symbol, start_line, end_line,
 			text, digest, embed_model, embed_dim)
 			VALUES ('m8-s', 'm8', 'm8-f', 'a.go', 'func', 'Store.Get', 1, 1, 'body words', 'd', 'm', 768)`,
+		// The text carries neither store nor get, so the AND below can only be
+		// satisfied by the symbol half of the expression.
 	} {
 		if _, err := tx.Exec(ctx, stmt); err != nil {
 			t.Fatal(err)
@@ -302,7 +310,7 @@ func TestMigration0008AppliesToAPopulatedTableTwiceLive(t *testing.T) {
 		}
 		var matches bool
 		if err := tx.QueryRow(ctx, `
-			SELECT lex @@ to_tsquery('simple', 'store | get | body')
+			SELECT lex @@ to_tsquery('simple', 'store & get')
 			FROM spans WHERE id = 'm8-s'`).Scan(&matches); err != nil {
 			t.Fatalf("run %d: %v", i+1, err)
 		}
