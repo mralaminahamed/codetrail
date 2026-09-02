@@ -106,8 +106,9 @@ func (ix *indexer) buildGraph(ctx context.Context, j graphJob) graphRows {
 		for _, d := range f.Defs {
 			fileID, ok := fileIDs[d.Path]
 			if !ok {
-				// A definition in a file with no row would fail the foreign
-				// key and take the whole job with it.
+				// index appends a row for every file it reads, so this is a
+				// guard and not a case: a definition whose file has no row
+				// fails the foreign key and takes the whole job with it.
 				continue
 			}
 			id := store.SymbolID(j.repoID, d.Path, d.StartLine, string(d.Kind), d.Name)
