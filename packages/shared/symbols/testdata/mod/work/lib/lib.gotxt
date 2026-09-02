@@ -1,0 +1,9 @@
+package lib
+
+func Double(n int) int { return n * 2 }
+
+func Add(a, b int) int { return a + b }
+
+// One is documented so that a resolved target's line can be told apart from
+// the definition's start line, which begins at the doc comment.
+func One() int { return 1 }

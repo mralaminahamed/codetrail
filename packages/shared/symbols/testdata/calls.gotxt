@@ -1,0 +1,28 @@
+package calls
+
+// a is the first declaration in this file: a pass that hangs every call on
+// the first declaration it saw names this one.
+func a(x, y int) int { return x + y }
+
+func b() int { return 1 }
+
+// twoOnALine is the shape a line key collapses: a(b(), b()) is two calls to
+// b, and Task 2 hashes the key into the edge id.
+func twoOnALine() int {
+	return a(b(), b())
+}
+
+// unnameable holds the callees this pass refuses to name.
+func unnameable(fns []func(), f func() func()) {
+	fns[0]()
+	f()()
+	func() { b() }()
+}
+
+// handler puts its call inside a func literal inside a var declaration: the
+// only definition the call can belong to is the var.
+var handler = func() {
+	g()
+}
+
+func g() {}

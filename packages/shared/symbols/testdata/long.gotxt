@@ -1,0 +1,29 @@
+package long
+
+// Big is longer than MaxDeclLines: P2 sub-windows it into kind=file spans,
+// so no span has its range — and it is the shape most worth asking who
+// calls it.
+func Big() int {
+	n := 0
+	n++
+	n++
+	n++
+	n++
+	n++
+	n++
+	n++
+	n++
+	n++
+	n++
+	n++
+	n++
+	n++
+	n++
+	n++
+	n++
+	n++
+	n++
+	n++
+	n++
+	return n
+}

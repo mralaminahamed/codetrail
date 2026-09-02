@@ -71,6 +71,18 @@ func (deadStore) NewerCommit(context.Context, string) (string, time.Time, error)
 	return "", time.Time{}, errors.New("postgres is down")
 }
 func (deadStore) TouchRepo(context.Context, string) error { return errors.New("postgres is down") }
+func (deadStore) Definitions(context.Context, string, string, string, bool, int) ([]models.Symbol, error) {
+	return nil, errors.New("postgres is down")
+}
+func (deadStore) Symbol(context.Context, string, string) (models.Symbol, error) {
+	return models.Symbol{}, errors.New("postgres is down")
+}
+func (deadStore) CallersOf(context.Context, string, string, int, int) ([]store.Caller, error) {
+	return nil, errors.New("postgres is down")
+}
+func (deadStore) ApproximateCallersOf(context.Context, string, string, int) ([]store.Approximate, error) {
+	return nil, errors.New("postgres is down")
+}
 
 func serve(e *echo.Echo, method, path, body string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, strings.NewReader(body))

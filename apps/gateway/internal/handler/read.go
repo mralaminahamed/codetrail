@@ -29,6 +29,14 @@ type Reader interface {
 	GetSpan(ctx context.Context, repoID, spanID string) (models.Span, error)
 	NewerCommit(ctx context.Context, repoID string) (string, time.Time, error)
 	TouchRepo(ctx context.Context, id string) error
+	// The graph reads (see graph.go). CallersOf and ApproximateCallersOf are
+	// two methods rather than one because §6 refuses to merge their answers,
+	// and a single method returning one list would put that decision behind an
+	// interface where no test could see it.
+	Definitions(ctx context.Context, repoID, name, pkg string, suffix bool, limit int) ([]models.Symbol, error)
+	Symbol(ctx context.Context, repoID, symbolID string) (models.Symbol, error)
+	CallersOf(ctx context.Context, repoID, symbolID string, depth, limit int) ([]store.Caller, error)
+	ApproximateCallersOf(ctx context.Context, repoID, name string, limit int) ([]store.Approximate, error)
 }
 
 // Retriever is what search and ask retrieve with: *rag.Retriever in the binary.
@@ -207,7 +215,13 @@ func (h *Handler) getRepo(c echo.Context) error {
 		// and one figure would invent the relationship.
 		"files": stats.Files, "spans": stats.Spans,
 		"files_with_spans": stats.FilesWithSpans,
-		"staleness":        rag.NewStaleness(r, newer, h.now()),
+		// The graph, split by provenance. The only place a reader can see how
+		// much of a repository's call graph is precise — an aggregate over a
+		// per-row column, never a per-repo label, which is why every caller row
+		// carries the label too (spec:190).
+		"symbols": stats.Symbols, "edges": stats.Edges,
+		"edges_resolved": stats.EdgesResolved, "edges_syntactic": stats.EdgesSyntactic,
+		"staleness": rag.NewStaleness(r, newer, h.now()),
 	})
 }
 

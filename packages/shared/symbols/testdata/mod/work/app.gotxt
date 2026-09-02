@@ -1,0 +1,17 @@
+package app
+
+import (
+	"fmt"
+
+	"example.test/std/lib"
+)
+
+// Run holds the four shapes this fixture exists for: a call into a sibling
+// package, a call into the standard library, a call through a local closure,
+// and two calls to one function on one line.
+func Run(x int) int {
+	fmt.Println(lib.Double(x))
+	fn := func(n int) int { return n + 1 }
+	fn(x)
+	return lib.Add(lib.One(), lib.One())
+}

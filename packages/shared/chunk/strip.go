@@ -26,6 +26,12 @@ import (
 // instead moves Counter.Add from 37..46 to 22..28 and turns six windows into
 // four, so the two arms would tile different lines and every citation into the
 // stripped corpus would name code that is not there.
+//
+// It is the *lines* that survive, not the bytes: the prose is removed and only
+// its line terminators are kept, so line numbers are invariant and byte
+// offsets are not. The symbols package measures it, because a caller keying
+// anything by offset must be given the same bytes it will later resolve
+// against.
 func StripDocs(filename string, src []byte) ([]byte, error) {
 	if !strings.HasSuffix(filename, ".go") {
 		return src, nil

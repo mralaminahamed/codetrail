@@ -99,6 +99,11 @@ type fakeStore struct {
 	embedderErr error
 
 	touched []string
+	// How many span reads the handler actually made. The citation memo cannot
+	// change a response — the same span renders the same citation — so its only
+	// observable effect is this number, and without it the memo is a line any
+	// mutation may delete for free.
+	spanReads int
 	// The limit the last listing asked for. Recorded because the default is a
 	// number nothing else can see: the fake would answer its one row whatever
 	// it was handed.
@@ -107,20 +112,35 @@ type fakeStore struct {
 	vector, lexical []models.Cite
 	model           string
 	dim             int
+
+	// The graph half, in graph_test.go: its fixture, its four reads and its own
+	// error hooks. Embedded rather than spelled here so the graph endpoints'
+	// fake lives beside the tests that set it.
+	*graphFake
 }
 
 func newStore() *fakeStore {
-	spans := make(map[string]models.Span, len(fixtureSpans))
+	spans := make(map[string]models.Span, len(fixtureSpans)+len(fixtureGraphSpans))
 	for _, s := range fixtureSpans {
+		spans[s.ID] = s
+	}
+	// The spans the graph fixture's definitions cite. In the same map because
+	// one GetSpan serves both, and out of fixtureSpans because the retrieval
+	// tests count that list row by row.
+	for _, s := range fixtureGraphSpans {
 		spans[s.ID] = s
 	}
 	return &fakeStore{
 		repos: map[string]models.Repo{fixtureRepoID: fixtureRepo},
 		rows:  []store.RepoRow{{Repo: fixtureRepo, LastUsedAt: fixtureNow}},
-		stats: store.Stats{Files: 12, Spans: 30, FilesWithSpans: 9},
+		stats: store.Stats{
+			Files: 12, Spans: 30, FilesWithSpans: 9,
+			Symbols: 5, Edges: 7, EdgesResolved: 4, EdgesSyntactic: 3,
+		},
 		spans: spans,
 		gone:  map[string]bool{},
 		model: "fake-hashed-bow", dim: fixtureDim,
+		graphFake: newGraphFake(),
 	}
 }
 
@@ -164,6 +184,7 @@ func (f *fakeStore) RepoStats(context.Context, string) (store.Stats, error) {
 }
 
 func (f *fakeStore) GetSpan(_ context.Context, _, spanID string) (models.Span, error) {
+	f.spanReads++
 	if f.spanErr != nil {
 		return models.Span{}, f.spanErr
 	}
@@ -827,6 +848,12 @@ func repoRoutes() []repoRoute {
 		{http.MethodGet, func(r string) string { return "/api/repos/" + r + "/spans/span-c" }, ""},
 		{http.MethodPost, func(r string) string { return "/api/repos/" + r + "/search" }, `{"q":"sampler"}`},
 		{http.MethodPost, func(r string) string { return "/api/repos/" + r + "/ask" }, `{"q":"sampler"}`},
+		// The graph routes answer the same three questions about a repository,
+		// so they belong to the same list rather than to a second one that can
+		// drift from it.
+		{http.MethodGet, func(r string) string { return "/api/repos/" + r + "/symbols?name=Store.Get" }, ""},
+		{http.MethodGet, func(r string) string { return "/api/repos/" + r + "/symbols/" + symStoreGet }, ""},
+		{http.MethodGet, func(r string) string { return "/api/repos/" + r + "/symbols/" + symStoreGet + "/callers" }, ""},
 	}
 }
 

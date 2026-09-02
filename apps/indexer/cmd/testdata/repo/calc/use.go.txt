@@ -1,0 +1,10 @@
+package calc
+
+// Total renders a machine after pushing every n. CODETRAILDOC.
+func Total(ns []int) string {
+	m := &Machine{}
+	for _, n := range ns {
+		m.Push(n)
+	}
+	return Render(m)
+}

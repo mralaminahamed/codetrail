@@ -1,0 +1,13 @@
+package fixture
+
+import "fmt"
+
+// Count reports how many rows Table holds. CODETRAILDOC.
+func Count() int {
+	return len(Table)
+}
+
+// Report names the row count in a sentence. CODETRAILDOC.
+func Report() string {
+	return fmt.Sprintf("%d rows", Count())
+}

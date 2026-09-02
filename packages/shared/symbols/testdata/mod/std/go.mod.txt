@@ -1,0 +1,3 @@
+module example.test/std
+
+go 1.27
