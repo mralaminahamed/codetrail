@@ -1,0 +1,19 @@
+package twoget
+
+// Store is one of three types with a Get method: a fixture whose names are
+// all unique cannot tell Store.Get from Get.
+type Store struct{ m map[string]string }
+
+// Get reads a key.
+func (s *Store) Get(k string) string { return s.m[k] }
+
+type Cache struct{ m map[string]string }
+
+// Get reads a key.
+func (c Cache) Get(k string) string { return c.m[k] }
+
+// Pair is generic: a receiver's type parameters are not part of its name.
+type Pair[K comparable, V any] struct{ k K; v V }
+
+// Get reads the value.
+func (p Pair[K, V]) Get() V { return p.v }
