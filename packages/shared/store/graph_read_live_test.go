@@ -249,16 +249,28 @@ func TestCallersOfTerminatesOnATwoNodeCycleLive(t *testing.T) {
 // fails with a count rather than with a comparison against a second query the
 // same mutation would also have changed. The counterfactual follows, because
 // 19 is only evidence next to what the unguarded form actually costs.
+//
+// statement_timeout, because the counterfactual removes the guard from whatever
+// callersSQL currently is: with the depth bound gone as well it is the query
+// that does not terminate, and a hang is not a failure a reader can read.
 func TestTheCycleGuardBoundsTheTraversalItselfLive(t *testing.T) {
 	f := seedReadGraph(t)
 	ctx := context.Background()
+	tx, err := f.s.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, "SET LOCAL statement_timeout = '10s'"); err != nil {
+		t.Fatal(err)
+	}
 
-	rowsOf := func(sql string) float64 {
+	rowsOf := func(sql string) (float64, error) {
 		t.Helper()
 		var raw []byte
-		if err := f.s.pool.QueryRow(ctx, "EXPLAIN (ANALYZE, TIMING OFF, FORMAT JSON) "+sql,
+		if err := tx.QueryRow(ctx, "EXPLAIN (ANALYZE, TIMING OFF, FORMAT JSON) "+sql,
 			f.repoA, f.sym["target"].ID, 5, 50).Scan(&raw); err != nil {
-			t.Fatal(err)
+			return 0, err
 		}
 		var plans []struct {
 			Plan map[string]any `json:"Plan"`
@@ -270,11 +282,15 @@ func TestTheCycleGuardBoundsTheTraversalItselfLive(t *testing.T) {
 		if !ok {
 			t.Fatalf("no Recursive Union in the plan:\n%s", raw)
 		}
-		return n
+		return n, nil
 	}
 
 	const wantRows = 19
-	if got := rowsOf(callersSQL); got != wantRows {
+	got, err := rowsOf(callersSQL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != wantRows {
 		t.Errorf("the traversal produced %v rows at depth 5, want %v", got, wantRows)
 	}
 
@@ -284,9 +300,17 @@ func TestTheCycleGuardBoundsTheTraversalItselfLive(t *testing.T) {
 		t.Errorf("the counterfactual rewrote nothing: callersSQL no longer contains %q", guard)
 		return
 	}
-	if got := rowsOf(unguarded); got <= wantRows {
+	// A timeout is the strongest form of the same evidence: unbounded is what
+	// the guard exists to prevent, and it is what the query does on a cycle
+	// once the depth bound is not there to hide it.
+	switch open, err := rowsOf(unguarded); {
+	case err != nil && strings.Contains(err.Error(), "statement timeout"):
+		t.Logf("without the guard the traversal did not terminate: %v", err)
+	case err != nil:
+		t.Fatal(err)
+	case open <= wantRows:
 		t.Errorf("without the guard the traversal produced %v rows, not more than %v: "+
-			"the fixture has no cycle for the guard to stop", got, wantRows)
+			"the fixture has no cycle for the guard to stop", open, wantRows)
 	}
 }
 
