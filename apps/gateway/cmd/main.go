@@ -104,8 +104,29 @@ func allowedHosts() []string {
 // newHandler builds the API handler main serves from. A function so a test can
 // pin the wiring: every field here is one main could silently forget, and a
 // zero-value logger discards without complaining.
-func newHandler(log zerolog.Logger, q handler.Enqueuer) *handler.Handler {
-	return &handler.Handler{Policy: admit.NewPolicy(allowedHosts()), Jobs: q, Log: log}
+//
+// The floor is copied off the retriever rather than read from the environment a
+// second time: two parses of ANSWER_SCORE_FLOOR could disagree, and then the
+// number in the payload would not be the number the decision used.
+func newHandler(log zerolog.Logger, q handler.Enqueuer, rd handler.Reader, r *rag.Retriever, b rag.Budget) *handler.Handler {
+	return &handler.Handler{
+		Policy: admit.NewPolicy(allowedHosts()), Jobs: q,
+		Repos: rd, Rag: r, Floor: r.Floor, Budget: b, Now: time.Now, Log: log,
+	}
+}
+
+// answerBudget reads what one answer may hold. Both knobs are validated rather
+// than clamped, for the reason the read endpoints refuse an out-of-range limit:
+// a zero budget is a misconfiguration that would answer every question with an
+// empty string and no error anywhere.
+func answerBudget() (rag.Budget, error) {
+	b := rag.DefaultBudget()
+	b.MaxSpans = config.GetInt("ANSWER_MAX_SPANS", b.MaxSpans)
+	b.MaxChars = config.GetInt("ANSWER_MAX_CHARS", b.MaxChars)
+	if err := b.Validate(); err != nil {
+		return rag.Budget{}, err
+	}
+	return b, nil
 }
 
 // queryEmbedTimeout bounds one embed call on the read path. The indexer hands
@@ -232,8 +253,8 @@ func scoreFloor() (rag.Floor, error) {
 // make it return, and an os.Stdout swap to see what it logged. That is heavier
 // and flakier machinery than anything else in this suite. The body is uncovered
 // by judgement, not because it cannot be reached.
-func newServer(log zerolog.Logger, st storeHandle) *echo.Echo {
-	return newRouter(readinessFor(log, st).Ready, newHandler(log, jobs.New(st.Pool())))
+func newServer(log zerolog.Logger, st storeHandle, r *rag.Retriever, b rag.Budget) *echo.Echo {
+	return newRouter(readinessFor(log, st).Ready, newHandler(log, jobs.New(st.Pool()), st, r, b))
 }
 
 func main() {
@@ -248,14 +269,20 @@ func main() {
 	defer st.Close()
 	log.Info().Msg("postgres ready, schema up to date")
 
-	// Nothing serves from it yet — the read endpoints are the next task — but
-	// boot depends on it now, because a gateway that starts without a working
-	// embedder can only fail one request at a time.
-	if _, err := newRetriever(ctx, log, st); err != nil {
+	// Boot depends on the embedder, because a gateway that starts without a
+	// working one can only fail one request at a time.
+	ret, err := newRetriever(ctx, log, st)
+	if err != nil {
 		log.Fatal().Err(err).Msg("bad retrieval config")
 	}
+	budget, err := answerBudget()
+	if err != nil {
+		log.Fatal().Err(err).Msg("bad answer budget")
+	}
+	log.Info().Int("answer_max_spans", budget.MaxSpans).Int("answer_max_chars", budget.MaxChars).
+		Msg("answer budget configured; spans are dropped whole, never truncated")
 
-	e := newServer(log, st)
+	e := newServer(log, st, ret, budget)
 
 	addr := ":" + config.Get("PORT", "8080")
 	go func() {

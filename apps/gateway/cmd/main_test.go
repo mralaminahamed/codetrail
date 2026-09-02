@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/labstack/echo/v4"
@@ -39,9 +40,9 @@ func (deadStore) Ping(context.Context) error { return errors.New("postgres is do
 func (d deadStore) Pool() *pgxpool.Pool      { return d.pool }
 func (deadStore) Close()                     {}
 
-// The retrieval arms, which nothing in this file calls: the retriever is
-// constructed at boot and served from in the next task. They return the error a
-// dead store would.
+// The retrieval arms and the read path's queries. All of them answer what a
+// dead store answers, so the assembly can be driven without a database and a
+// route that is wired reaches its 500 rather than a 404.
 func (deadStore) VectorSearch(context.Context, string, []float32, int) ([]models.Cite, error) {
 	return nil, errors.New("postgres is down")
 }
@@ -51,6 +52,25 @@ func (deadStore) LexicalSearch(context.Context, string, []string, int) ([]models
 func (deadStore) SpanEmbedder(context.Context, string) (string, int, error) {
 	return "", 0, errors.New("postgres is down")
 }
+func (deadStore) ListRepos(context.Context, int) ([]store.RepoRow, error) {
+	return nil, errors.New("postgres is down")
+}
+func (deadStore) GetRepo(context.Context, string) (models.Repo, error) {
+	return models.Repo{}, errors.New("postgres is down")
+}
+func (deadStore) RepoGone(context.Context, string) (bool, error) {
+	return false, errors.New("postgres is down")
+}
+func (deadStore) RepoStats(context.Context, string) (store.Stats, error) {
+	return store.Stats{}, errors.New("postgres is down")
+}
+func (deadStore) GetSpan(context.Context, string, string) (models.Span, error) {
+	return models.Span{}, errors.New("postgres is down")
+}
+func (deadStore) NewerCommit(context.Context, string) (string, time.Time, error) {
+	return "", time.Time{}, errors.New("postgres is down")
+}
+func (deadStore) TouchRepo(context.Context, string) error { return errors.New("postgres is down") }
 
 func serve(e *echo.Echo, method, path, body string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
@@ -120,7 +140,11 @@ func TestNewHandlerWiresTheLoggerPolicyAndQueue(t *testing.T) {
 	q := fakeQueue{}
 	// logger.New pins production to InfoLevel; a test logger that accepts more
 	// would pass on a line production never writes.
-	h := newHandler(zerolog.New(&logged).Level(zerolog.InfoLevel), q)
+	st := deadStore{}
+	ret := &rag.Retriever{Store: st, Mode: rag.ModeHybrid, K: 60, Candidates: 40,
+		Floor: rag.Floor{Value: 0.25, Calibrated: false}}
+	budget := rag.Budget{MaxSpans: 3, MaxChars: 4096}
+	h := newHandler(zerolog.New(&logged).Level(zerolog.InfoLevel), q, st, ret, budget)
 
 	h.Log.Error().Msg("ping")
 	if logged.Len() == 0 {
@@ -135,6 +159,24 @@ func TestNewHandlerWiresTheLoggerPolicyAndQueue(t *testing.T) {
 	}
 	if h.Jobs != q {
 		t.Errorf("queue not wired: %#v", h.Jobs)
+	}
+	if h.Repos != handler.Reader(st) {
+		t.Errorf("read store not wired: %#v", h.Repos)
+	}
+	if h.Rag != ret {
+		t.Errorf("retriever not wired: %#v", h.Rag)
+	}
+	// Values, not presence: the floor in the payload has to be the floor the
+	// decision used, and a budget of zero would answer every question with an
+	// empty string.
+	if h.Floor != ret.Floor {
+		t.Errorf("floor %+v, want the retriever's %+v", h.Floor, ret.Floor)
+	}
+	if h.Budget != budget {
+		t.Errorf("budget %+v, want %+v", h.Budget, budget)
+	}
+	if h.Now == nil {
+		t.Error("no clock: every citation would be dated from the zero time")
 	}
 }
 
@@ -154,7 +196,9 @@ func TestNewServerAssemblesWhatMainServes(t *testing.T) {
 	defer pool.Close()
 
 	var logged bytes.Buffer
-	e := newServer(zerolog.New(&logged).Level(zerolog.InfoLevel), deadStore{pool})
+	e := newServer(zerolog.New(&logged).Level(zerolog.InfoLevel), deadStore{pool},
+		&rag.Retriever{Store: deadStore{pool}, Mode: rag.ModeHybrid, K: 60, Candidates: 40, Floor: rag.DefaultFloor()},
+		rag.DefaultBudget())
 
 	// Readiness has to reflect the dependency, not a constant.
 	if rec := serve(e, http.MethodGet, "/health", ""); rec.Code != http.StatusOK {
@@ -184,6 +228,20 @@ func TestNewServerAssemblesWhatMainServes(t *testing.T) {
 	// And the assembled handler logs, so a 500 in production is not silent.
 	if !strings.Contains(logged.String(), out.RequestID) {
 		t.Errorf("no log line for request %s: %s", out.RequestID, logged.String())
+	}
+
+	// The read routes are part of the assembly too, and a handler built without
+	// a store would 404 them rather than fail on the dead one.
+	for _, tc := range []struct{ method, path, body string }{
+		{http.MethodGet, "/api/repos", ""},
+		{http.MethodGet, "/api/repos/r1", ""},
+		{http.MethodGet, "/api/repos/r1/spans/s1", ""},
+		{http.MethodPost, "/api/repos/r1/search", `{"q":"parse"}`},
+		{http.MethodPost, "/api/repos/r1/ask", `{"q":"parse"}`},
+	} {
+		if rec := serve(e, tc.method, tc.path, tc.body); rec.Code != http.StatusInternalServerError {
+			t.Errorf("%s %s: want 500 from the dead store, got %d: %s", tc.method, tc.path, rec.Code, rec.Body)
+		}
 	}
 }
 

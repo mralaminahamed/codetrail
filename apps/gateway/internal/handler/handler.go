@@ -6,12 +6,14 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/labstack/echo/v4"
 	"github.com/rs/zerolog"
 
 	"github.com/mralaminahamed/codetrail/packages/shared/admit"
 	"github.com/mralaminahamed/codetrail/packages/shared/jobs"
+	"github.com/mralaminahamed/codetrail/packages/shared/rag"
 )
 
 // Enqueuer is the queue surface the API needs. An interface so the handler
@@ -24,13 +26,31 @@ type Enqueuer interface {
 type Handler struct {
 	Policy admit.Policy
 	Jobs   Enqueuer
-	Log    zerolog.Logger
+	// Repos, Rag, Floor and Budget are the read path (see read.go). Floor
+	// travels with every answer rather than being applied inside the retriever,
+	// because only this handler knows whether a request was a search or an ask.
+	Repos  Reader
+	Rag    Retriever
+	Floor  rag.Floor
+	Budget rag.Budget
+	// Now dates citations. A field so a test can pin the staleness wording
+	// against a fixed clock.
+	Now func() time.Time
+	Log zerolog.Logger
 }
 
 func Mount(e *echo.Echo, h *Handler, mw ...echo.MiddlewareFunc) {
 	g := e.Group("/api", mw...)
 	g.POST("/repos", h.postRepo)
 	g.GET("/jobs/:id", h.getJob)
+	g.GET("/repos", h.listRepos)
+	g.GET("/repos/:repo", h.getRepo)
+	g.GET("/repos/:repo/spans/:span", h.getSpan)
+	// POST, with the query in the body: a question in a query string is logged
+	// by every proxy, load balancer and access log between the caller and this
+	// process, and it is the one string in this phase that must not be.
+	g.POST("/repos/:repo/search", h.search)
+	g.POST("/repos/:repo/ask", h.ask)
 }
 
 type repoRequest struct {
@@ -50,15 +70,21 @@ type repoRequest struct {
 // deliberately not honoured yet: no safe vocabulary for a reason exists today,
 // and git's stderr is not one. Surfacing nothing beats surfacing a path. Do
 // not close this gap by piping the raw column through.
+//
+// repo_id is the one field added since: every read endpoint is keyed on a repo
+// id, and hash(key, commit) is computable only by the indexer, which saw the
+// commit. Without it, submit-then-poll cannot name what it produced and the
+// only route to an id is the corpus listing. Empty until the job is done.
 type jobView struct {
 	ID     string      `json:"id"`
 	Remote string      `json:"remote"`
 	Ref    string      `json:"ref"`
 	Status jobs.Status `json:"status"`
+	RepoID string      `json:"repo_id,omitempty"`
 }
 
 func view(j jobs.Job) jobView {
-	return jobView{ID: j.ID, Remote: j.Remote, Ref: j.Ref, Status: j.Status}
+	return jobView{ID: j.ID, Remote: j.Remote, Ref: j.Ref, Status: j.Status, RepoID: j.RepoID}
 }
 
 // maxRefLen bounds what reaches git's argv. Git's own limit is the filesystem's;
