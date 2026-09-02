@@ -402,6 +402,13 @@ func TestCallersCarryTheirCallSiteAndACitation(t *testing.T) {
 	if len(out.Callers) != 1 {
 		t.Fatalf("callers %+v, want one", out.Callers)
 	}
+	// The answer names the corpus it came from. Nothing else in this response
+	// carries a repo id — the citations do, but a caller row with no span has
+	// none — so without this a client cannot tie the answer back to what it
+	// asked about.
+	if out.RepoID != fixtureRepoID {
+		t.Errorf("repo_id %q, want %q", out.RepoID, fixtureRepoID)
+	}
 	got := out.Callers[0]
 	if got.Symbol.Name != "g" || got.Depth != 1 {
 		t.Errorf("caller %q at depth %d, want g at 1", got.Symbol.Name, got.Depth)
