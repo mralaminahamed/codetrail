@@ -371,8 +371,20 @@ func TestAskOverARealIndexReturnsACitationWhoseDigestMatchesTheSpan(t *testing.T
 	blocks := blocksOf(t, res.Answer, res)
 	for i, c := range res.Citations {
 		cit := c.Citation
-		if cit.RepoID != repo.ID {
-			t.Fatalf("citation %d names repo %s, not the one asked: %s", c.Marker, cit.RepoID, repo.ID)
+		// The span itself, read back under the asked repository. Not
+		// citation.repo_id: NewCitation fills that from the repository the
+		// route named, so a span that leaked in from another one would still
+		// carry this id — measured, by defeating the repo filter in both arms
+		// and watching a foreign span arrive with the right repo_id on it.
+		// GetSpan is repo-scoped, so a leaked span is ErrNotFound here.
+		stored, err := st.GetSpan(context.Background(), repo.ID, c.SpanID)
+		if err != nil {
+			t.Fatalf("citation %d cites span %s, which is not in %s: %v",
+				c.Marker, c.SpanID, repo.ID, err)
+		}
+		if stored.Digest != cit.Digest || stored.Path != cit.Path {
+			t.Errorf("citation %d says %s@%s, the stored row says %s@%s",
+				c.Marker, cit.Path, cit.Digest, stored.Path, stored.Digest)
 		}
 		if cit.Commit != repo.Commit {
 			t.Errorf("citation %d cites commit %s, want %s", c.Marker, cit.Commit, repo.Commit)
