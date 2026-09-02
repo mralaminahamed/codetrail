@@ -102,8 +102,9 @@ Every rule below exists because of one of those. Read them before Task 1's mutat
 Retrieval is the easiest subsystem in this project to test vacuously. Five rules, each of which invalidates a test that would otherwise look fine. They apply to **every** retrieval fixture in this phase.
 
 1. **A single-document corpus cannot detect a ranking bug.** Every retrieval fixture holds at least three spans with a known, non-obvious intended order.
-2. **The expected order must disagree with insertion order, path order, and span-id order.** A query that lost its `ORDER BY` returns rows in physical order, which is insertion order; a fixture whose best answer was inserted first passes anyway. Build the fixtures so the correct answer is neither first-inserted nor first-alphabetically.
-3. **Every retrieval fixture holds two repositories.** A missing `WHERE repo_id = $1` is otherwise invisible, and the other repo's spans must be *better* matches than the target repo's, so the filter is load-bearing rather than decorative.
+2. **The expected order must disagree with insertion order, path order, and span-id order.** A fixture whose best answer was inserted first, or sorts first by path, passes under a query that lost its `ORDER BY`. Build the fixtures so the correct answer is none of those — and **assert each disagreement in the test body rather than constructing it and trusting it**.
+   **Corrected against measurement, twice.** The reason first given here was that a query with no `ORDER BY` returns rows in physical order, which is insertion order. That is not what happens. Task 2's M5 came back in **path** order, served from `spans_path_idx`; Task 3's M9 came back in the *same* order whichever order its two spans were inserted in. An unordered result is not an insertion-ordered result, so the insertion-order half of this rule is close to decorative and the path-order half is what has done the killing. Which is why the disagreements are asserted: the property a kill depends on has to fail loudly when it stops holding, not silently turn the kill into a coincidence.
+3. **Every retrieval fixture holds two repositories.** A missing `WHERE repo_id = $1` is otherwise invisible, and the other repo's spans must be **strictly better** matches than every span in the target repo, so the filter is load-bearing rather than decorative. *Strictly* is the correction: Task 2's scope fixture used an exact copy of the query vector, which **ties** the target repo's parallel span at cosine 1.0 instead of beating it, and the tie resolved with the target repo's span first — leaving a test whose message named rank 1 unable to say anything about rank 1. A fixture that ties is a fixture whose result is a coin flip. Drop the tying span from the target set, or make the other repo's match strictly better.
 4. **Unit vectors cannot tell cosine from L2 — and they cannot tell cosine from inner product either.** The vector fixture uses deliberately non-unit vectors chosen so that cosine order, L2 order and inner-product order are three different orders. Task 2 gives the exact vectors.
 5. **A query that lexically matches its own answer cannot tell the vector arm from the lexical one.** And under `embed.Fake` — a hashed bag of words over the same text — *no* end-to-end query can, because both arms are then computing lexical overlap. Therefore: **arm separation and fusion are tested on synthetic ranked lists with no embedder and no database** (Task 1), the arms are tested individually against hand-written rows (Tasks 2 and 3), and the end-to-end tests prove wiring only. Any test that claims to show fusion working end to end is measuring the fake.
 
@@ -565,8 +566,8 @@ pgvector cosine over spans, filtered by repo (spec §8). Plus the guard that sto
 **Decisions, with their reasoning:**
 
 - **The score returned is cosine *similarity*, `1 - (embedding <=> q)`, not the distance.** `<=>` is a distance: smaller is better, and it is the operator the HNSW index is built for, so the `ORDER BY` must use it directly. But the number that leaves this package is compared against a floor and put in a response, and a threshold on a quantity where lower is better is the sort of thing that survives review and inverts a product.
-- **`ORDER BY embedding <=> $2::vector` with a `LIMIT`, not `ORDER BY score DESC`.** Only the first form uses `spans_embedding_idx`. Sorting on the computed similarity is the same ordering and a sequential scan.
-- **`embedding IS NOT NULL` in the `WHERE`.** The column is nullable; `PutSpans` always writes one, so this is for a row written by something else — and the consequence without it is not a bad ranking, it is a scan error, because the similarity of a NULL is NULL and the destination is a `float64`.
+- **`ORDER BY embedding <=> $2::vector` with a `LIMIT`, not `ORDER BY score DESC`.** Only the first form can use `spans_embedding_idx`. Sorting on the computed similarity is the same ordering by a route the ANN index cannot serve — measured, it reaches that index under no planner settings at all, while the shipped form reaches it once the alternatives are priced out. (Corrected: this bullet said "a sequential scan", which is more specific than what was observed; with `enable_seqscan` off the mutant plans a `spans_path_idx` scan plus a `Sort`. The claim that survives measurement is *no ANN path*, not *a seq scan*.) See M8.
+- **`embedding IS NOT NULL` in the `WHERE`.** The column is nullable; `PutSpans` always writes one, so this is for a row written by something else — and the consequence without it is not a bad ranking, it is a scan error, because the similarity of a NULL is NULL and it is scanned into a non-pointer `float64` local. (Corrected: that local is on the way to `models.Cite.Score`, which is a `float32`. The mechanism is the scan, not the field.)
 - **`SpanEmbedder` returns the repo's own `embed_model`/`embed_dim` and refuses a repo carrying two.** `PutSpans` replaces a repo's spans wholesale so a repo is single-model by construction; this reads what is there rather than trusting that, because the failure it prevents is a query and a corpus in different vector spaces, which produces confident nonsense and nothing about the query looks wrong (spec §3 says this about widths; it is equally true of models).
 - **No `kind` filter and no `kind` weighting.** `kind=file` does not say which arm produced a row (P2), so any heuristic over it is a heuristic over a label that means two different things.
 
@@ -589,15 +590,20 @@ With `e0` and `e1` the first two basis vectors of the 768-wide space, query `q =
 
 All three differ, so one fixture kills all three operator mutations. Insert in the order `C, D, B, A` so physical order is the reverse of the answer, and give the spans paths whose alphabetical order is also not the answer.
 
+**Corrected: it is the path disagreement that earns its keep, not the insertion-order one.** With the `ORDER BY` deleted the rows did not come back in insertion order at all — Postgres served them from `spans_path_idx` and returned `[D C B A]`, which is `alpha, beta, mu, zeta`. So "the best answer is inserted last" is not what kills M5; "the expected order is not path order" is. Both properties are asserted in the test rather than assumed, because either one silently ceasing to hold turns a kill into a coincidence.
+
+**Corrected during implementation — the skeleton below said `package store_test`.** Every live suite already in this package is `package store`, and both the NULL-embedding fixture and the two-model fixture reach `s.pool` for direct `INSERT`s that `PutSpans` cannot produce. An external test package cannot compile either of them.
+
 ```go
 //go:build live
 
-package store_test
+package store
 
 // TestVectorSearchRanksByCosineAndNotByDistance seeds the table above, plus a
-// second repo whose span is an exact copy of the query vector — a better match
-// than anything in the target repo, so a missing repo filter shows up as that
-// span appearing rather than as a subtly different order.
+// second repo whose span is an exact copy of the query vector, so a missing
+// repo filter shows up as that span appearing rather than as a subtly
+// different order. Corrected: an exact copy *ties* A at cosine 1.0 rather
+// than outranking it — see M4.
 func TestVectorSearchRanksByCosineAndNotByDistance(t *testing.T) { /* … */ }
 
 // The score in the response is a similarity: 1 for the parallel vector, 0 for
@@ -605,8 +611,16 @@ func TestVectorSearchRanksByCosineAndNotByDistance(t *testing.T) { /* … */ }
 // descending" holds for the distance too.
 func TestVectorSearchScoresAreCosineSimilarity(t *testing.T) { /* … */ }
 
+// Corrected: this one seeds a target set with no A in it. A is parallel to
+// the query too, so the other repo's copy ties it at distance 0 and the tie
+// resolves either way — measured, [A OTHER]. See M4.
 func TestVectorSearchIsScopedToOneRepo(t *testing.T)      { /* … */ }
 func TestVectorSearchRespectsTheLimit(t *testing.T)        { /* … */ }
+
+// Added during implementation. The DoD's "index-using" claim had no test in
+// this list, and no ranking, score, scope or limit test can see it: ORDER BY
+// score DESC returns the same rows in the same order. See M8.
+func TestVectorSearchOrderByCanUseTheAnnIndexLive(t *testing.T) { /* … */ }
 
 // A span with a NULL embedding is skipped rather than scanned into a float64.
 // Written with a direct INSERT: PutSpans cannot produce one, which is exactly
@@ -671,31 +685,39 @@ func (s *Store) VectorSearch(ctx context.Context, repoID string, q []float32, li
 
 **M4 — drop `WHERE repo_id = $1`.**
 - *Why the code exists:* retrieval is per repository; the corpus holds up to `KEEP_REPOS` of them.
-- *Fixture that separates mutant from original:* the second repo's span is an *exact copy of the query vector*, so it outranks everything in the target repo and appears at position 1. A second repo whose spans are poorer matches would leave the target repo's order intact and the test would pass.
+- *Fixture that separates mutant from original:* the second repo's span is an *exact copy of the query vector*, so it beats every target-repo span it does not tie. A second repo whose spans are poorer matches would leave the target repo's order intact and the test would pass.
+- **Corrected — the fixture as prescribed could not deliver that message.** An exact copy of `q` does not outrank `A`: `A` is `10·e0` and the copy is `e0`, so both sit at cosine 1.0 and distance 0, and the tie resolves arbitrarily. Measured, it resolved `[A OTHER]` — the other repo's span at rank 2, in a test whose message names rank 1. Fixed in code by giving the scope test a target set of `C, D, B` with no `A` in it, so the copy is strictly the best row in the table and its rank is not a coin flip. The ranking test keeps the full four-span set, where the tie is harmless.
 - *Must fail:* `TestVectorSearchIsScopedToOneRepo`
-- *Expected (verify and correct):* `span from repo other-repo appeared at rank 1`
+- *Expected (verify and correct):* the shipped assertion is `span %s from repo %s appeared at rank %d; the whole result was %v`, and with the target set corrected the mutant puts `OTHER` at rank 1 unambiguously (1.0 against `B`'s 0.995). Paste the run's own line; the failing rank is what the prediction got wrong before, so it is the part to read.
 - *Compiles and vets:* **check this one.** Dropping the clause leaves `$1` unbound, which is a pgx protocol error, not a ranking change — P1 scored two void kills exactly this way. Apply it as `WHERE repo_id = $1 OR TRUE` instead, which keeps every parameter bound.
 
 **M5 — drop the `ORDER BY` (keep the `LIMIT`).**
 - *Why the code exists:* it is the ranking, and it is the clause that uses the ANN index.
-- *Fixture that separates mutant from original:* the insertion order `C, D, B, A` is the reverse of the expected answer, so rows returned in physical order fail immediately. A fixture inserted best-first would pass under this mutant.
+- *Fixture that separates mutant from original:* **corrected — not the property this block credited.** The prediction was that rows come back in physical order, i.e. insertion order `C, D, B, A`. Observed `[D C B A]`: with no `ORDER BY` the planner served the rows from `spans_path_idx`, so what came back was *path* order — `alpha.go, beta.go, mu.go, zeta.go` — which is `D, C, B, A`. The fixture kills M5 because its expected order disagrees with **path** order; the insertion-order disagreement contributed nothing. A fixture whose expected answer happened to be alphabetical by path would have passed under this mutant however it was inserted.
 - *Must fail:* `TestVectorSearchRanksByCosineAndNotByDistance`
-- *Expected (verify and correct):* `ranked [C D B A], want [A B D C]` — physical order is not guaranteed by Postgres, so record what actually came back; any order other than the expected one is the kill.
+- *Expected (verify and correct):* `ranked [D C B A], want [A B D C] (L2 would give [B C D A], inner product [A D B C], physical order [C D B A])`. Neither order is guaranteed by Postgres, which is the reason both disagreements are asserted in the test body rather than trusted.
 - *Compiles and vets:* yes.
 
 **M6 — drop `AND embedding IS NOT NULL`.**
-- *Why the code exists:* a NULL similarity cannot be scanned into a `float64`.
+- *Why the code exists:* a NULL similarity has no destination in the scan. **Corrected: this block said the destination is a `float64`, which reads as the field the score lands in.** `models.Cite.Score` is a `float32`; the scan goes through a non-pointer `float64` local and is converted. The mechanism is right — a NULL cannot be scanned into either — but the type named was neither the field nor a claim about it.
 - *Fixture that separates mutant from original:* the directly-inserted NULL-embedding row in `TestSpansWithNoEmbeddingAreNotRetrieved`. No corpus written by `PutSpans` contains one.
 - *Must fail:* `TestSpansWithNoEmbeddingAreNotRetrieved`
-- *Expected (verify and correct):* a scan error naming a NULL destination. **If the failure is a `t.Fatal(err)` rather than the test's own assertion, that is an incident, not a kill** (rule 7): rewrite the test to assert `err != nil` *and* that the error is not a bare scan panic, or to assert on the returned ids with the row present. Record which shape you ended up with.
+- *Expected (verify and correct):* a scan error naming a NULL destination. **If the failure is a `t.Fatal(err)` rather than the test's own assertion, that is an incident, not a kill** (rule 7): rewrite the test to assert `err != nil` *and* that the error is not a bare scan panic, or to assert on the returned ids with the row present. Record which shape you ended up with. **Shipped shape:** the test asserts the *positive* claim — the call succeeds with the NULL row present (`a repo holding one NULL embedding made VectorSearch fail: %v`) and returns exactly `[A]` — so under M6 the failure is the test's own assertion about the error it did not expect, not a panic on the way to one.
 - *Compiles and vets:* yes.
 
-**M7 — `SpanEmbedder` returns the first row instead of refusing two.**
+**M7 — `SpanEmbedder` returns a row instead of refusing two** (corrected: "the first row" is not what the natural mutant does).
 - *Why the code exists:* a query and a corpus in different vector spaces rank nonsense confidently.
 - *Fixture that separates mutant from original:* the two-model repo, built with direct INSERTs. `PutSpans` cannot produce one.
 - *Must fail:* `TestSpanEmbedderRefusesARepoWithTwoModels`
-- *Expected (verify and correct):* `got model "a-model", want ErrMixedEmbedders`
+- *Expected (verify and correct):* **corrected — the predicted message was wrong twice over.** The mutation is deleting the `n > 1` guard, and the loop scans every row into the same `model`/`dim` variables, so what survives is the **last** row `DISTINCT` yields, not the first. And there is no `a-model` anywhere: the fixture's two models are `fake-768` (written by `PutSpans`) and `another-model-768` (the direct INSERT). The assertion's shape is `got model %q dim %d err %v, want ErrMixedEmbedders`; paste the run's line, since which of the two names appears is `DISTINCT`'s order and not a property to predict.
 - *Compiles and vets:* yes.
+
+**M8 — `ORDER BY embedding <=> $2::vector` → `ORDER BY score DESC`** (added: the DoD claimed "index-using" and this task prescribed no test for it).
+- *Why the code exists:* only the distance form can use `spans_embedding_idx`. Sorting on the returned similarity is the *same ordering* by a different route.
+- *Fixture that separates mutant from original:* **none of them, and that is the finding.** This mutant returns the same rows in the same order, with the same scores, scoped and limited identically, so every ranking, score, scope and limit test above passes. The only instrument that can see it is `EXPLAIN`.
+- *Must fail:* `TestVectorSearchOrderByCanUseTheAnnIndexLive`
+- *Expected (verify and correct):* observed — the shipped statement reaches `spans_embedding_idx` once `enable_seqscan`, `enable_bitmapscan` and `enable_sort` are priced out; the `ORDER BY score DESC` rewrite reaches it under no settings at all. **With every planner knob left alone, and even with `enable_seqscan=off`, the plan on this five-row per-repo fixture is `spans_path_idx` plus a `Sort` for both forms** — five rows are cheaper to sort than to walk a graph for. So what this test can assert at fixture size is that an index path *exists*, not that it is chosen, and it asserts the counterfactual alongside it so the claim is a comparison rather than a hope. The test `EXPLAIN`s the shipped `vectorSearchSQL` constant, not a transcription of it (`a790956`): a copy is a test of the test.
+- *Compiles and vets:* yes — `score` is a select-list alias and is orderable.
 
 - [ ] **Step 5: Commit**
 
@@ -722,11 +744,12 @@ answer."
 ```
 
 **Definition of Done**
-- Cosine ranking, scoped to one repo, limited, index-using, with a similarity in the response.
-- The fixture distinguishes cosine from both L2 and inner product, and its expected order disagrees with insertion order, path order and id order.
+- Cosine ranking, scoped to one repo, limited, with a similarity in the response.
+- **The `ORDER BY` is a form the ANN index can serve, asserted by `EXPLAIN` against the shipped statement and against the counterfactual** — corrected: the original wording was "index-using", which no test in this task's list could check and which is in any case weaker than it sounds. On a per-repo fixture the planner picks `spans_path_idx` plus a `Sort` whatever the `ORDER BY` says, so "an index path exists" is the honest claim and "the index is used" is not one this suite can make.
+- The fixture distinguishes cosine from both L2 and inner product, and its expected order disagrees with insertion order, path order and id order — **both disagreements asserted, not assumed**, since M5 turned out to be killed by the path one.
 - A NULL embedding cannot reach a scan.
 - A repo carrying two embedders is refused rather than silently half-searched.
-- M1–M7 recorded with observed output; M4's rewrite (to keep every parameter bound) recorded.
+- M1–M8 recorded with observed output; M4's rewrite (to keep every parameter bound) recorded, and M4's fixture correction (the second repo's copy of `q` ties `A` rather than beating it) recorded with it.
 
 ---
 
@@ -745,7 +768,7 @@ Spec §8: "a lexical arm over symbol names and identifiers". Postgres full-text 
 
 **Decisions, with their reasoning:**
 
-- **A `STORED GENERATED` column plus a GIN index, not an on-the-fly `to_tsvector`.** Computing the vector per query is a sequential scan over the repo's spans and re-tokenises text that never changes. The two-argument `to_tsvector(regconfig, text)` is immutable — the one-argument form is only stable, because it reads `default_text_search_config` — so the generated column is legal only with the configuration named explicitly. **Verify that against the pinned image before writing the migration** (step 1); if it is rejected, the fallback is an expression index and the query must then repeat the expression verbatim.
+- **A `STORED GENERATED` column plus a GIN index, not an expression index.** **The reason first given here was false and is corrected rather than deleted, because it is the argument a later reader would otherwise inherit:** the claim was that computing the vector per query means a sequential scan. It does not. Measured over 5,000 rows on the pinned image, an expression index whose expression the query repeats **verbatim** plans as a **Bitmap Index Scan** — an expression index is a working index, not a scan. What it actually costs is **drift**: change one `setweight` letter in the query and the same statement plans as a **Seq Scan**, with no error and no warning, only a slower answer. Every call site has to reproduce a two-`setweight` expression character for character forever, and nothing checks that they do. The second cost is that `ts_rank_cd` then recomputes the vector for every row it ranks. A column named `lex` cannot drift from itself, and `lex @@ q` cannot be spelled wrongly. The two-argument `to_tsvector(regconfig, text)` is immutable — the one-argument form is only stable, because it reads `default_text_search_config` — so a generated column has to name the configuration explicitly in any case. **Verify the column is accepted at all against the pinned image before writing the migration** (step 1).
 - **The `simple` configuration, not `english`.** `english` stems and drops stopwords: `Files` and `filing` collapse together, and `Get`, `New`, `Do` are near-stopwords in Go. Code is not English, and a stemmer is a lossy rename of every identifier in the corpus.
 - **`symbol` at weight A and `text` at weight B.** The spec asks for symbol names *and* identifiers; a span's identifiers are its text's tokens, so indexing the text is how identifiers get indexed at all. It also indexes comment prose, which is deliberate: in production, doc comments are the best signal a span has (spec §5), and in the eval corpus they are blanked, so the arm behaves the same way in both.
 - **Deviation, recorded rather than hidden:** the arm therefore indexes keywords and string literals too, not only identifiers. Narrowing it to identifiers means extracting them from the AST at index time, which is a new column, an indexer change and a full re-index. That is a P7 change, listed in Open Questions.
@@ -769,6 +792,20 @@ CREATE TEMP TABLE t (a text, b text,
 
 The tokeniser in `rag.Terms` must produce terms the index actually contains. Two things this measurement settles and this plan deliberately does not guess: whether `parse_config` is one token or two, and whether `x.y` is one. Write `Terms` against the observed answer, and record it in `terms.go`'s comment.
 
+**Settled, against `pgvector/pgvector:pg17` (PostgreSQL 17.10):**
+
+```
+parseConfig            -> 'parseconfig'          camel case is NOT split
+parse_config           -> 'parse' 'config'       TWO tokens; _ is a blank
+HTTPServer, httpServer -> 'httpserver'
+v2                     -> 'v2'                   numword, not a split
+x.y                    -> 'x.y'                  ONE token; the dot binds (alias file)
+s.pool.Query(ctx)      -> 's.pool.query' 'ctx'   alias host
+Store.Get              -> 'store.get'            ONE token — see the A-weight correction below
+```
+
+Both open questions answered, and the second is the one that mattered: because the dot binds, a term built from letters and digits can never match a dotted token, so `Terms` cannot reach `x.y` or `Store.Get` except through their parts. `Terms` keeps the whole run *and* — with splitting on — its camel-case parts; splitting on the underscore is not a choice, since the index already holds those halves apart.
+
 - [ ] **Step 2: Write the failing tests**
 
 `terms_test.go` is hermetic. The table is written *after* step 1 and reflects what Postgres actually does:
@@ -788,20 +825,36 @@ func TestTermsWithSplittingOffKeepsOnlyWholeIdentifiers(t *testing.T)
 
 | span | symbol | text contains | why it is there |
 | --- | --- | --- | --- |
-| `S` | `parseConfig` | nothing matching | the A-weight case: symbol only |
-| `T` | `` (empty) | `parseConfig` once, in 400 tokens | the B-weight case: body only |
-| `U` | `` (empty) | "parse the config file", no `parseConfig` | only reachable via the split terms |
+| `S` (`c_symbol.go`) | `parseConfig` | nothing matching | the A-weight case: symbol only |
+| `T` (`a_body.go`) | `` (empty) | `parseConfig` **twice**, in ~200 tokens | the B-weight case: body only |
+| `U` (`d_prose.go`) | `` (empty) | "parse the config file", no `parseConfig` | only reachable via the split terms |
+| `M` (`e_method.go`) | `Store.Get` | neither word | added: the dotted symbol, see M8 |
+| `Y` (`y_cover.go`) | `` (empty) | `alpha beta` once each | added: the ranking function, see M6 |
+| `X` (`x_repeat.go`) | `` (empty) | `alpha` six times | added: the ranking function, see M6 |
 | `V` (other repo) | `parseConfig` | `parseConfig` ten times | outranks everything if the repo filter is missing |
+
+**Corrected — `T` at one occurrence cannot discriminate as this fixture claimed.** With the symbol appearing once in a long body, the weighted ranking gives `S` 1.0 against `T`'s 0.4 and the unweighted one gives **0.1 against 0.1** — a tie, which `ORDER BY score DESC, path, start_line, id` then breaks by path. `a_body.go` sorts before `c_symbol.go`, so M2 "fails" the test whether or not the weights do anything: a phantom kill of exactly P1's kind. Measured at each count:
+
+| occurrences of `parseConfig` in `T` | weighted (`S` vs `T`) | unweighted (`S` vs `T`) |
+| --- | --- | --- |
+| 1 | 1.0 vs 0.4 | 0.1 vs 0.1 — **tie, broken by path** |
+| 2 | 1.0 vs 0.8 | 0.1 vs 0.2 — a real flip |
+| 3 | 1.2 vs 1.0 | the body wins **even with the weights on** |
+
+So the count is two, and it is measured rather than chosen: it is the only value at which dropping the weights changes the order *on the score*.
 
 ```go
 func TestLexicalSearchFindsASpanBySymbol(t *testing.T)
 func TestSymbolOutweighsBody(t *testing.T)          // expects S above T
 func TestSplitTermsReachProseThatNamesThePartsSeparately(t *testing.T) // expects U present
+func TestAMethodSymbolIsReachableByItsParts(t *testing.T)              // added: expects M present
 func TestLexicalSearchIsScopedToOneRepo(t *testing.T)                  // expects V absent
+func TestRepetitionOutranksCoverageUnderTheShippedRankingFunction(t *testing.T) // added: X above Y
 func TestNoUsableTermsReturnsNothingRatherThanErroring(t *testing.T)   // terms == nil
+func TestAQuestionWithPunctuationIsNotASyntaxError(t *testing.T)       // added by M1
 ```
 
-`TestSymbolOutweighsBody` is the one that can pass vacuously: assert the returned slice is non-empty *and* that `S` precedes `T` by index, not that `S` is "in" the results.
+`TestSymbolOutweighsBody` is the one that can pass vacuously: assert the returned slice is non-empty *and* that `S` precedes `T` by index, not that `S` is "in" the results. Run it with splitting **off**, so the only term is the whole identifier and the two spans differ in nothing but which column carries it.
 
 - [ ] **Step 3: Implement**
 
@@ -818,13 +871,32 @@ func TestNoUsableTermsReturnsNothingRatherThanErroring(t *testing.T)   // terms 
 -- symbol at weight A, text at weight B. A span's identifiers are its text's
 -- tokens, so indexing the text is how "identifiers" get indexed at all; the
 -- weight is what keeps a definition above a mention.
+--
+-- The dots in a method's symbol become spaces first. Measured: to_tsvector(
+-- 'simple', 'Store.Get') is the single token 'store.get' — the parser calls it
+-- a host — which no query term built from letters and digits can match.
 ALTER TABLE spans ADD COLUMN IF NOT EXISTS lex tsvector
     GENERATED ALWAYS AS (
-        setweight(to_tsvector('simple', symbol), 'A') ||
+        setweight(to_tsvector('simple', replace(symbol, '.', ' ')), 'A') ||
         setweight(to_tsvector('simple', text), 'B')
     ) STORED;
+
+-- Plain, not CONCURRENTLY: migrate() runs the whole ledger inside one
+-- transaction holding pg_advisory_xact_lock, and CREATE INDEX CONCURRENTLY
+-- cannot run in a transaction block.
 CREATE INDEX IF NOT EXISTS spans_lex_idx ON spans USING gin (lex);
 ```
+
+**Corrected — the SQL first prescribed here leaves the A weight dead for every method in the corpus.** `chunk.classify` writes a method's symbol as `Store.Get`, and `to_tsvector('simple', 'Store.Get')` is the single token `'store.get'`, so:
+
+```
+to_tsquery('simple','store | get') @@ to_tsvector('simple','Store.Get')                     -> f
+to_tsquery('simple','store | get') @@ to_tsvector('simple', replace('Store.Get','.',' '))   -> t
+```
+
+`rag.Terms` builds terms from letters and digits only — that is what makes them safe to join with `|` — so no term it can produce ever matches `'store.get'`. The whole A weight, the thing this arm's `setweight` exists for, was unreachable for every method. `replace(symbol, '.', ' ')` is the fix and it is applied only to `symbol`: in `text` the same rule is what holds `3.14` and `http://a.b` together, and breaking those is a cost with no matching benefit.
+
+**No test in this task's own list detects that.** `S`/`c_symbol.go` uses a plain function symbol; the mutation that is *literally the SQL this plan prescribed* survives `TestLexicalSearchFindsASpanBySymbol`, `TestSymbolOutweighsBody` and every other test above. `TestAMethodSymbolIsReachableByItsParts` was added for it, with a fixture span whose symbol is `Store.Get` and whose text contains neither word — see M8.
 
 `lexical.go`:
 
@@ -850,9 +922,9 @@ Go side: `strings.Join(terms, " | ")` — terms come from `rag.Terms`, whose cha
 
 **M2 — drop both `setweight` calls.**
 - *Why the code exists:* a symbol match is a definition; a body match is a mention.
-- *Fixture that separates mutant from original:* `S` (symbol only) versus `T` (one occurrence in a long body). Without weights, `ts_rank_cd` ranks on frequency and length, and `T` is expected to rise. **A fixture whose symbol also appears in its own text — which is every real span — cannot separate these**, because both documents then carry both weights.
+- *Fixture that separates mutant from original:* `S` (symbol only) versus `T` (**two** occurrences in a long body — corrected; at one it is 0.1 against 0.1 unweighted and the "kill" is a path tie-break the weights had nothing to do with, and at three the body wins even weighted). Without weights `ts_rank_cd` ranks on frequency, and at two occurrences `T` rises past `S` on the score itself: 0.1 against 0.2. **A fixture whose symbol also appears in its own text — which is every real span — cannot separate these**, because both documents then carry both weights.
 - *Must fail:* `TestSymbolOutweighsBody`
-- *Expected (verify and correct):* `parseConfig ranked [T S], want S first`
+- *Expected (verify and correct):* `parseConfig ranked [a_body.go c_symbol.go], want c_symbol.go before a_body.go` — splitting is off, so those are the only two spans the term reaches. The assertion compares the two indices; paste the ranked slice the run prints.
 - *Compiles and vets:* yes.
 
 **M3 — drop `WHERE repo_id = $1` (as `OR TRUE`, to keep `$1` bound — see Task 2 M4).**
@@ -877,17 +949,32 @@ Go side: `strings.Join(terms, " | ")` — terms come from `rag.Terms`, whose cha
 - *Compiles and vets:* yes.
 
 **M6 — `ts_rank_cd` → `ts_rank`.**
-- *Why the code exists:* cover density prefers a span where the query's terms appear close together, which for code is a span that is *about* the thing rather than one that mentions it in passing.
-- *Fixture that separates mutant from original:* a two-term query and two spans in which the terms are adjacent versus 300 tokens apart. **The current fixture cannot** — with single-term queries the two functions frequently tie. Either add that fixture and predict a kill, or record this mutation as a **deliberate survivor** and say the choice of ranking function is unpinned by any test. Do not record a kill without the fixture.
-- *Must fail:* `TestCoverDensityPrefersTermsThatAppearTogether`, if written.
-- *Expected (verify and correct):* record the observed outcome either way.
+- *Why the code exists:* **corrected — the stated reason was wrong, and so was the fixture built from it.** The reason given was cover density: that `ts_rank_cd` prefers a span whose query terms appear close together. **Cover density never runs under `OR`, which is the only query shape this arm builds.** Measured: two spans with the same two terms adjacent and 300 tokens apart score **identically** — 0.8 under `ts_rank_cd`, 0.2431708 under `ts_rank`. The prescribed fixture below could not have separated the two functions, and a kill recorded against it would have been a kill against nothing. What actually separates them is **frequency**: `ts_rank_cd` sums a term's weight per occurrence while `ts_rank` saturates and rewards matching *distinct* terms. Measured on `alpha beta`: six mentions of `alpha` alone score 2.4 under `ts_rank_cd` and 0.1813 under `ts_rank`, against 0.8 and 0.2432 for one mention each of the two terms. So the two functions rank that pair in opposite orders, and *that* is the discriminating fixture.
+- *Fixture that separates mutant from original:* ~~a two-term query and two spans in which the terms are adjacent versus 300 tokens apart~~ — that fixture ties under both functions and must not be used. Use `X` (`alpha` six times) against `Y` (`alpha beta` once each), queried with `alpha beta`: `ts_rank_cd` ranks `[X Y]`, `ts_rank` ranks `[Y X]`.
+- *Must fail:* `TestRepetitionOutranksCoverageUnderTheShippedRankingFunction`
+- *Expected (verify and correct):* `alpha beta ranked [y_cover.go x_repeat.go], want [x_repeat.go y_cover.go]`.
 - *Compiles and vets:* yes.
+- *What this pins and what it does not:* which function ships, so swapping it is a visible change rather than a silent one. Not that it is the better one — that is unmeasured against any corpus and is spec:316's experiment. The test is named for the consequence rather than for the function, so a reader meets the tradeoff before they meet the choice. See Open question 15.
 
 **M7 — the generated column drops `symbol` (index `text` only).**
 - *Why the code exists:* spec §8 says the arm is over symbol names.
 - *Fixture that separates mutant from original:* `S`, whose symbol carries the term and whose text does not.
 - *Must fail:* `TestLexicalSearchFindsASpanBySymbol`
-- *Expected (verify and correct):* `S was not retrieved`. **Applying this mutation requires re-running the migration on a fresh database** — the generated column is materialised, so editing the SQL without recreating the table changes nothing. The live suites create their own database per run (`testdb.Scratch`), so this happens automatically; confirm it rather than assuming it, because a mutation that silently tests the old column is a phantom kill of exactly P1's kind.
+- *Expected (verify and correct):* `S was not retrieved`. **Applying this mutation requires re-running the migration on a fresh database** — the generated column is materialised, so editing the SQL without recreating the table changes nothing. The live suites create their own database per run (`testdb.Scratch`), so this happens automatically; confirm it rather than assuming it, because a mutation that silently tests the old column is a phantom kill of exactly P1's kind. **Recorded:** M7 also left the migration re-application test green while that test's own message claimed "the backfilled row does not match its own symbol" — the assertion did not depend on the symbol half of the expression at all. It now asserts `store & get` against a row whose text carries neither word, which only the symbol half can satisfy, and it fails on both runs under M7.
+
+**M8 — the generated column drops `replace(symbol, '.', ' ')`** (added: the mutation that is *literally the SQL this plan prescribed*, see the correction under Step 3).
+- *Why the code exists:* a method's symbol is `Store.Get`, which `to_tsvector` reads as the single token `'store.get'`; no term `rag.Terms` can build ever matches it, so without the `replace` the A weight is dead for every method in the corpus.
+- *Fixture that separates mutant from original:* `M` (`e_method.go`), symbol `Store.Get`, whose text contains neither `store` nor `get`. **`S` cannot** — its symbol is an undotted function name and it matches either way, which is why every test in this task's original list survives this mutant.
+- *Must fail:* `TestAMethodSymbolIsReachableByItsParts`
+- *Expected (verify and correct):* `e_method.go was not retrieved for "Store.Get": got []`.
+- *Compiles and vets:* yes. As with M7, applying it needs a fresh database, since the column is materialised.
+
+**M9 — drop the `ORDER BY score DESC, path, start_line, id`** (added: this task prescribed no mutation of its own ordering).
+- *Why the code exists:* it is the ranking, and the tie-break after it is what makes two runs over an unchanged corpus diffable.
+- *Fixture that separates mutant from original:* **not the one that looks like it.** `TestRepetitionOutranksCoverageUnderTheShippedRankingFunction` does not detect this mutant, and two attempts to make it did not work. Its two spans were first inserted in the order it expects them back — one coincidence, removed by inserting `y_cover.go` first — and that was not enough: measured, with the `ORDER BY` deleted the pair still comes back `[x_repeat, y_cover]` **whichever order they were inserted in**. An unordered result is not an insertion-ordered one, and a fixture built on the assumption that it is proves nothing. Recorded in the fixture as a fact rather than claimed fixed. What kills M9 is `TestSymbolOutweighsBody`, whose `c_symbol.go` goes in last for that reason.
+- *Must fail:* `TestSymbolOutweighsBody`
+- *Expected (verify and correct):* the same `want c_symbol.go before a_body.go` failure as M2, reached by a different route.
+- *Compiles and vets:* yes.
 
 - [ ] **Step 5: Commit**
 
@@ -919,9 +1006,9 @@ Tokeniser measured against pgvector/pgvector:pg17, output below:
 
 **Definition of Done**
 - The migration applies to a fresh database and to one that already holds spans.
-- The arm finds a span by symbol, ranks a symbol match above a body mention, is scoped to one repo, and cannot be made to error by punctuation.
-- The tokeniser's behaviour was measured against the pinned image before it was written, and the measurement is in the commit.
-- M1–M7 recorded, including M6's survivor status if its fixture was not written.
+- The arm finds a span by symbol — **including a method's dotted symbol, which the SQL first prescribed here could not reach** — ranks a symbol match above a body mention, is scoped to one repo, and cannot be made to error by punctuation.
+- The tokeniser's behaviour was measured against the pinned image before it was written, the measurement is in the commit, and both questions Step 1 posed are answered in this document.
+- M1–M9 recorded. M6 is a kill, on a **different fixture and for a different reason** than this plan first gave; the generated column's rationale and the A/B weight fixture were both corrected against measurement rather than argued.
 
 ---
 
@@ -1751,12 +1838,19 @@ Nothing here is blocking. Each is something the spec does not settle, with the t
     *Recommendation:* as above. Past it, an evicted repo goes back to `404`, which is honest — we no longer remember. A time-based bound would be equally defensible; count is chosen because the table's purpose is "recently evicted" and its growth is bounded by eviction, which is itself bounded.
 
 12. **Generated column versus expression index for the lexical arm.**
-    *Recommendation:* the generated column. It costs a table rewrite on migration and roughly a third more storage on `spans`, and it buys a query that reads `lex @@ q` instead of repeating a two-`setweight` expression that has to match the index's definition character for character. Revisit if the corpus grows two orders of magnitude.
+    *Recommendation:* the generated column — **on the measured reason, not the one first written down**. The plan originally argued that an expression index means a sequential scan; over 5,000 rows on the pinned image, the expression repeated verbatim plans as a Bitmap Index Scan, so that argument is false. It costs a table rewrite on migration and roughly a third more storage on `spans`, and it buys a query that reads `lex @@ q` instead of repeating a two-`setweight` expression that has to match the index's definition character for character — where one changed letter turns the same plan into a Seq Scan with no error — plus not recomputing the vector in `ts_rank_cd` for every row it ranks. Revisit if the corpus grows two orders of magnitude.
 
 13. **How a caller finds a repo id.** `jobs.repo_id` covers the submit-then-poll flow, and `GET /api/repos` lists the corpus.
     *Recommendation:* both, as specified. What is deliberately *not* added is `GET /api/repos?remote=…&ref=…`: it is the right endpoint for the console, and P5 is where the console's needs are known. After the job history window, a caller's only route to an id is the listing — which is correct, since the corpus is itself LRU-evicted and a link to a repo that is gone should not resolve.
 
 14. **Where the eval's two arms live** (carried forward from P2, unchanged and still open). `RepoID` and `SpanID` have no room for a strategy, so the arms want a database each. P3 does not foreclose it: the retriever takes a store, the store takes a DSN, and nothing in this phase joins across arms or infers a strategy from a row. P6 decides.
+
+15. **The lexical arm's ranking function makes repetition outrank coverage, and `simple` has no stopword list.** Both are consequences of Task 3's shipped choices, both were found by measurement, and neither is a defect to fix now.
+    Under `ts_rank_cd` a span mentioning one query term six times outranks a span mentioning each of two terms once (2.4 against 0.8); under `ts_rank` the order reverses (0.1813 against 0.2432). Cover density does not enter into it — it never runs under `OR`, which is the only shape this arm builds — so the choice between the functions is a choice between *frequency* and *distinct-term coverage*, made without a corpus to measure against. Separately, the `simple` configuration drops nothing, so "where is X defined" ORs in `where`, `is` and `defined`, and every span containing the word "defined" is a candidate. The two compound: a span that says "where" six times is a hit.
+    *Recommendation:* leave both as they ship, and keep them visible rather than papering over them. Task 3's test is named `TestRepetitionOutranksCoverageUnderTheShippedRankingFunction` precisely so the consequence is in the test list and not only in a comment, and M6 records that the function is pinned but not justified. **This is a P6 question** — spec:316 makes the whole arm's value an experiment, and both a ranking-function sweep and a code-appropriate stopword list are things to decide with a golden set in front of you. Adding either now would be a guess wearing a measurement's clothes, which is the same mistake the `-1` floor exists to avoid.
+
+16. **Nothing in the lexical suite detects a missing `ORDER BY` on the ranking pair, and the obvious fix does not work.** Task 3's M9 dropped the arm's `ORDER BY` and survived `TestRepetitionOutranksCoverageUnderTheShippedRankingFunction` twice: once because the two spans had been inserted in the order the test expects them back, and again after that was corrected, because with no `ORDER BY` the pair comes back `[x_repeat, y_cover]` **whichever order it was inserted in**. An unordered result is not an insertion-ordered result, and "Fixtures" rule 2 — build the fixture so the answer disagrees with insertion order — is therefore necessary but not sufficient; Task 2's M5 found the same thing from the other side, where the rows came back in *path* order.
+    *Recommendation:* nothing to change now. M9 is killed by `TestSymbolOutweighsBody`, so the arm's ordering is pinned; what is recorded here is that the fixture rule the plan leaned on does not do the work it was assumed to do. A phase that writes a new retrieval fixture should assert the disagreement it depends on rather than construct it, as Task 2's ranking test now does.
 
 ---
 
