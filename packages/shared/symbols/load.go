@@ -24,6 +24,13 @@ const (
 	ReasonPolicy      = "policy"
 )
 
+// Reasons is the whole set, exported so a counter's label set can be pinned
+// against it rather than copied and left to drift.
+var Reasons = []string{
+	ReasonOK, ReasonDisabled, ReasonNoToolchain, ReasonNoModule,
+	ReasonLoadError, ReasonDeadline, ReasonPolicy,
+}
+
 // Key is one call site, spelled exactly as Parse spells it: a repo-relative
 // path and the byte offset of the callee's identifier.
 //

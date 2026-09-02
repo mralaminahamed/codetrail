@@ -105,8 +105,8 @@ var langByExt = map[string]string{".go": "go", ".md": "markdown", ".yaml": "yaml
 // measured: doc.go holds only a package comment and tools.go only imports, and
 // f.Doc is not a Decl, so the AST arm emits nothing for either.
 var (
-	astPaths    = []string{"README.md", "big.go", "calc/broken.go", "calc/calc.go", "config.yaml"}
-	windowPaths = []string{"README.md", "big.go", "calc/broken.go", "calc/calc.go", "config.yaml", "doc.go", "tools.go"}
+	astPaths    = []string{"README.md", "big.go", "calc/broken.go", "calc/calc.go", "calc/use.go", "config.yaml", "use.go"}
+	windowPaths = []string{"README.md", "big.go", "calc/broken.go", "calc/calc.go", "calc/use.go", "config.yaml", "doc.go", "tools.go", "use.go"}
 )
 
 // fixtureBytes is the file a citation names, as committed. The byte-for-byte

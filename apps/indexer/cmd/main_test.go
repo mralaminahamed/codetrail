@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +23,7 @@ import (
 	"github.com/mralaminahamed/codetrail/packages/shared/jobs"
 	"github.com/mralaminahamed/codetrail/packages/shared/models"
 	"github.com/mralaminahamed/codetrail/packages/shared/store"
+	"github.com/mralaminahamed/codetrail/packages/shared/symbols"
 )
 
 type failCall struct {
@@ -143,6 +145,14 @@ func testIndexer(t *testing.T, q *fakeQueue) (*indexer, *bytes.Buffer) {
 			// Small enough that a fixture of a few spans crosses batches: a
 			// batch loop that stops after the first is invisible at 32.
 			embedBatch: 2,
+			// Production's default, so a test that means to exercise the
+			// stage does not have to turn it on; the resolver below is what
+			// keeps it from running unasked. goBin is a value nothing on this
+			// machine resolves to, so a Policy built from anything else is
+			// visible.
+			typecheck: true,
+			goBin:     "/opt/codetrail-test/go",
+			goProxy:   symbols.ProxyOff,
 		},
 		// The embedder is a dependency, not a step: anything that reaches the
 		// chunker needs one, and spec §9 puts the fake in CI.
@@ -164,6 +174,14 @@ func testIndexer(t *testing.T, q *fakeQueue) (*indexer, *bytes.Buffer) {
 			t.Error("putSpans ran when it should not have")
 			return errors.New("unexpected putSpans")
 		},
+		graph: func(context.Context, symbols.Policy) (map[symbols.Key]symbols.Target, symbols.Stats) {
+			t.Error("the type-checker ran when it should not have")
+			return nil, symbols.Stats{Reason: symbols.ReasonLoadError}
+		},
+		putGraph: func(context.Context, string, []models.Symbol, []models.Edge) error {
+			t.Error("putGraph ran when it should not have")
+			return errors.New("unexpected putGraph")
+		},
 		evict: func(context.Context, int, int) (int, error) {
 			t.Error("evict ran when it should not have")
 			return 0, errors.New("unexpected evict")
@@ -176,6 +194,14 @@ func testIndexer(t *testing.T, q *fakeQueue) (*indexer, *bytes.Buffer) {
 const testCommit = "0123456789abcdef0123456789abcdef01234567"
 
 func okPutSpans(context.Context, string, []store.EmbeddedSpan, string, int) error { return nil }
+
+func okPutGraph(context.Context, string, []models.Symbol, []models.Edge) error { return nil }
+
+// okGraph is a type-checker that names nothing: every edge stays syntactic,
+// which is what a job that only means to reach Complete needs from it.
+func okGraph(context.Context, symbols.Policy) (map[symbols.Key]symbols.Target, symbols.Stats) {
+	return nil, symbols.Stats{Reason: symbols.ReasonOK}
+}
 
 // writeCheckout puts the given files on disk under dir. The chunk pass reads
 // every walked file a second time, so a walk that names a file the checkout
@@ -285,6 +311,8 @@ func TestLimitsAreWiredToTheCapsTheyName(t *testing.T) {
 	t.Setenv("KEEP_TOMBSTONES", "99")
 	t.Setenv("JOB_HISTORY_HOURS", "111")
 	t.Setenv("JOB_SWEEP_MINUTES", "222")
+	t.Setenv("TYPECHECK", "false")
+	t.Setenv("TYPECHECK_GOPROXY", "https://proxy.example")
 	lim, err := limitsFrom()
 	if err != nil {
 		t.Fatal(err)
@@ -299,6 +327,12 @@ func TestLimitsAreWiredToTheCapsTheyName(t *testing.T) {
 		embedBatch:     88,
 		jobHistory:     111 * time.Hour,
 		sweepEvery:     222 * time.Minute,
+		typecheck:      false,
+		// Not a knob: whatever this machine's PATH resolves, which is the
+		// binary go/packages would fork. Empty here would mean no toolchain,
+		// which is a downgrade rather than a boot failure.
+		goBin:   goToolchain(),
+		goProxy: "https://proxy.example",
 	}
 	if lim != want {
 		t.Fatalf("want %+v, got %+v", want, lim)
@@ -369,6 +403,7 @@ func TestRunJobIndexesAndCompletes(t *testing.T) {
 		gotSpans, gotModel, gotDim = sp, model, dim
 		return nil
 	}
+	ix.graph, ix.putGraph = okGraph, okPutGraph
 	var keeps []int
 	ix.evict = func(_ context.Context, keep, keepTombstones int) (int, error) {
 		keeps = append(keeps, keep)
@@ -487,6 +522,7 @@ func TestRunJobRemovesTheScratchTreeOnEveryPath(t *testing.T) {
 			ix.clone, ix.walk = okClone, okWalk
 			ix.put = func(context.Context, models.Repo, []models.File) error { return nil }
 			ix.putSpans = okPutSpans
+			ix.graph, ix.putGraph = okGraph, okPutGraph
 			ix.evict = func(context.Context, int, int) (int, error) { return 0, nil }
 		}, false},
 	} {
@@ -634,6 +670,7 @@ func TestALostLeaseIsLogged(t *testing.T) {
 			ix.walk = func(context.Context, string, walk.Limits) ([]walk.File, error) { return nil, nil }
 			ix.put = func(context.Context, models.Repo, []models.File) error { return nil }
 			ix.putSpans = okPutSpans
+			ix.graph, ix.putGraph = okGraph, okPutGraph
 
 			ix.runJob(context.Background(), aJob())
 			out := logged.String()
@@ -800,6 +837,7 @@ func TestEvictionRunsOnlyAfterAnIndexThatCompleted(t *testing.T) {
 	}{
 		{"indexed and completed", &fakeQueue{}, func(ix *indexer) {
 			ix.clone, ix.walk, ix.put, ix.putSpans = okClone, okWalk, okPut, okPutSpans
+			ix.graph, ix.putGraph = okGraph, okPutGraph
 		}, true},
 		{"the write failed", &fakeQueue{}, func(ix *indexer) {
 			ix.clone, ix.walk = okClone, okWalk
@@ -816,6 +854,7 @@ func TestEvictionRunsOnlyAfterAnIndexThatCompleted(t *testing.T) {
 		// successful index either way.
 		{"the completion was refused", &fakeQueue{completeErr: jobs.ErrNotLeased}, func(ix *indexer) {
 			ix.clone, ix.walk, ix.put, ix.putSpans = okClone, okWalk, okPut, okPutSpans
+			ix.graph, ix.putGraph = okGraph, okPutGraph
 		}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -850,6 +889,7 @@ func TestAFailedEvictionIsLoggedAndDoesNotUncompleteTheJob(t *testing.T) {
 	ix.walk = func(context.Context, string, walk.Limits) ([]walk.File, error) { return nil, nil }
 	ix.put = func(context.Context, models.Repo, []models.File) error { return nil }
 	ix.putSpans = okPutSpans
+	ix.graph, ix.putGraph = okGraph, okPutGraph
 	ix.evict = func(context.Context, int, int) (int, error) { return 0, errors.New("postgres went away") }
 
 	ix.runJob(context.Background(), aJob())
@@ -876,6 +916,7 @@ func TestAnEvictionThatDroppedReposSaysHowMany(t *testing.T) {
 	ix.walk = func(context.Context, string, walk.Limits) ([]walk.File, error) { return nil, nil }
 	ix.put = func(context.Context, models.Repo, []models.File) error { return nil }
 	ix.putSpans = okPutSpans
+	ix.graph, ix.putGraph = okGraph, okPutGraph
 	ix.evict = func(context.Context, int, int) (int, error) { return 3, nil }
 
 	ix.runJob(context.Background(), aJob())
@@ -909,6 +950,7 @@ func TestCaseVariantRemotesIndexToOneRepo(t *testing.T) {
 			return nil
 		}
 		ix.putSpans = okPutSpans
+		ix.graph, ix.putGraph = okGraph, okPutGraph
 		ix.evict = func(context.Context, int, int) (int, error) { return 0, nil }
 		ix.runJob(context.Background(), jobs.Job{
 			ID: "j", Remote: remote, Ref: "main", Status: jobs.StatusLeased, Attempts: 1,
@@ -950,6 +992,10 @@ type recorder struct {
 	dim       int
 	order     []string
 	deadlines map[string]time.Time
+	// The graph the stage wrote, and the policy it handed the type-checker.
+	syms   []models.Symbol
+	edges  []models.Edge
+	policy symbols.Policy
 }
 
 func (r *recorder) failReason() string {
@@ -992,6 +1038,12 @@ func (e recordingEmbedder) Embed(ctx context.Context, texts []string) ([][]float
 type fixture struct {
 	files map[string]string
 	block bool
+	// resolved and stats are what the substituted type-checker answers, so a
+	// test can say which call sites were named without forking a compiler.
+	resolved    map[symbols.Key]symbols.Target
+	stats       symbols.Stats
+	graphErr    error
+	graphPanics bool
 }
 
 type fixtureOpt func(t *testing.T, f *fixture)
@@ -1012,6 +1064,27 @@ func withBlockingEmbedder() fixtureOpt {
 	return func(_ *testing.T, f *fixture) { f.block = true }
 }
 
+// withResolver is the type-checker's answer: which call sites it named, and
+// why it stopped where it did.
+func withResolver(resolved map[symbols.Key]symbols.Target, stats symbols.Stats) fixtureOpt {
+	return func(_ *testing.T, f *fixture) { f.resolved, f.stats = resolved, stats }
+}
+
+func withGraphWriteError(err error) fixtureOpt {
+	return func(_ *testing.T, f *fixture) { f.graphErr = err }
+}
+
+// withPanickingResolver is the strong form of "the stage did not run":
+// asserting that every edge is syntactic also passes when the resolver ran and
+// failed.
+func withPanickingResolver() fixtureOpt {
+	return func(_ *testing.T, f *fixture) { f.graphPanics = true }
+}
+
+func typechecking(on bool) fixtureOpt {
+	return func(t *testing.T, _ *fixture) { t.Setenv("TYPECHECK", strconv.FormatBool(on)) }
+}
+
 // fakeIndexer drives a whole job with no network, no git and no Postgres: a
 // clone that writes the fixture on disk, the real walk over it, the real
 // chunker and the fake embedder, and a recorder in place of the two writes.
@@ -1021,7 +1094,7 @@ func withBlockingEmbedder() fixtureOpt {
 // test rather than something only production would show.
 func fakeIndexer(t *testing.T, opts ...fixtureOpt) (*indexer, *recorder) {
 	t.Helper()
-	f := &fixture{files: fixtureRepo}
+	f := &fixture{files: fixtureRepo, stats: symbols.Stats{Reason: symbols.ReasonOK}}
 	for _, o := range opts {
 		o(t, f)
 	}
@@ -1035,6 +1108,13 @@ func fakeIndexer(t *testing.T, opts ...fixtureOpt) (*indexer, *recorder) {
 	if ix.opt, err = chunkOptions(); err != nil {
 		t.Fatal(err)
 	}
+	// Through limitsFrom, as the chunk knobs are: a test that set TYPECHECK
+	// by hand would be testing a worker production never builds.
+	lim, err := limitsFrom()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ix.lim.typecheck = lim.typecheck
 	if ix.strip, err = stripDocs(); err != nil {
 		t.Fatal(err)
 	}
@@ -1072,6 +1152,24 @@ func fakeIndexer(t *testing.T, opts ...fixtureOpt) (*indexer, *recorder) {
 		rec.order = append(rec.order, "putSpans")
 		return nil
 	}
+	ix.graph = func(ctx context.Context, p symbols.Policy) (map[symbols.Key]symbols.Target, symbols.Stats) {
+		if f.graphPanics {
+			panic("the type-checker ran with TYPECHECK off")
+		}
+		if dl, ok := ctx.Deadline(); ok {
+			rec.deadlines["graph"] = dl
+		}
+		rec.policy = p
+		return f.resolved, f.stats
+	}
+	ix.putGraph = func(ctx context.Context, _ string, syms []models.Symbol, edges []models.Edge) error {
+		if dl, ok := ctx.Deadline(); ok {
+			rec.deadlines["putGraph"] = dl
+		}
+		rec.syms, rec.edges = syms, edges
+		rec.order = append(rec.order, "putGraph")
+		return f.graphErr
+	}
 	ix.evict = func(context.Context, int, int) (int, error) { return 0, nil }
 	return ix, rec
 }
@@ -1105,14 +1203,17 @@ func TestAJobIndexesEachFileWithTheArmItsContentEarns(t *testing.T) {
 	}
 }
 
-// Files exist before spans reference them: spans.file_id is a foreign key, so
-// the wrong order is a failed insert against a real database.
-func TestFilesAreWrittenBeforeSpans(t *testing.T) {
+// Files exist before spans reference them, and both before the graph:
+// spans.file_id, symbols.file_id and symbols.span_id are foreign keys, so the
+// wrong order is a failed insert against a real database. The graph is last
+// for a second reason too — the span it links to by containment has to have a
+// range before there is anything to contain.
+func TestFilesAreWrittenBeforeSpansAndBothBeforeTheGraph(t *testing.T) {
 	ix, rec := fakeIndexer(t)
 	ix.runJob(context.Background(), aJob())
 
-	if len(rec.order) != 2 || rec.order[0] != "put" || rec.order[1] != "putSpans" {
-		t.Fatalf("call order %v, want [put putSpans]", rec.order)
+	if want := []string{"put", "putSpans", "putGraph"}; !slices.Equal(rec.order, want) {
+		t.Fatalf("call order %v, want %v", rec.order, want)
 	}
 	// Every span names a file row that was in that write.
 	rows := map[string]bool{}
@@ -1239,7 +1340,7 @@ func TestEveryStageSharesTheOneJobDeadline(t *testing.T) {
 	start := time.Now()
 	ix.runJob(context.Background(), aJob())
 
-	stages := []string{"clone", "walk", "embed", "put", "putSpans"}
+	stages := []string{"clone", "walk", "embed", "put", "putSpans", "graph"}
 	for _, s := range stages {
 		if rec.deadlines[s].IsZero() {
 			t.Fatalf("%s ran with no deadline at all", s)
@@ -1256,6 +1357,18 @@ func TestEveryStageSharesTheOneJobDeadline(t *testing.T) {
 			t.Errorf("%s got deadline %s, the clone got %s: that is a fresh budget per stage",
 				s, rec.deadlines[s], rec.deadlines["clone"])
 		}
+	}
+	// And the one write that is deliberately not on it. The type-check spends
+	// the job's remaining budget by design, so writing its result on the same
+	// context would make a slow type-check fail the job — the outcome spec:196
+	// says is expected rather than exceptional. It is bounded, just not by the
+	// deadline it was told to spend.
+	if rec.deadlines["putGraph"].Equal(rec.deadlines["clone"]) {
+		t.Errorf("the graph write ran on the job's own budget (%s): the type-check spends it",
+			rec.deadlines["clone"])
+	}
+	if rec.deadlines["putGraph"].IsZero() {
+		t.Error("the graph write ran with no deadline at all")
 	}
 }
 
@@ -1677,6 +1790,7 @@ func TestACompletedJobNamesTheRepoItIndexed(t *testing.T) {
 		return nil
 	}
 	ix.putSpans = okPutSpans
+	ix.graph, ix.putGraph = okGraph, okPutGraph
 	ix.evict = func(context.Context, int, int) (int, error) { return 0, nil }
 
 	ix.runJob(context.Background(), aJob())
