@@ -3,10 +3,15 @@ package rag
 import (
 	"context"
 	"errors"
+	"io"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/mralaminahamed/codetrail/packages/shared/embed"
 	"github.com/mralaminahamed/codetrail/packages/shared/models"
@@ -358,5 +363,47 @@ func TestSearchRefusesAConfigurationFuseCannotSurvive(t *testing.T) {
 				t.Fatal("accepted")
 			}
 		})
+	}
+}
+
+// scrape reads the process's own metrics the way Prometheus does, so the
+// assertions below are about what an operator sees rather than about an
+// internal counter.
+func scrape(t *testing.T) string {
+	t.Helper()
+	srv := httptest.NewServer(promhttp.Handler())
+	defer srv.Close()
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// A lexical-only run has no cosine similarity, and observing its NaN would
+// make the histogram's _sum NaN for the life of the process — every quantile
+// and every average over it, permanently, with no error anywhere. The floor's
+// whole calibration story reads that histogram in P6.
+//
+// Latency is recorded here too, labelled by mode: it is the retriever that
+// knows what "retrieval latency" covers.
+func TestALexicalOnlyRunIsTimedAndDoesNotPoisonTheTopScoreHistogram(t *testing.T) {
+	r, _, _ := retriever(t, ModeLexical)
+	search(t, r, 10)
+
+	body := scrape(t)
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, "codetrail_retrieval_top_score_sum") && strings.Contains(line, "NaN") {
+			t.Fatalf("the top-score histogram is poisoned: %s", line)
+		}
+	}
+	const timed = `codetrail_retrieval_seconds_count{mode="lexical"} 0`
+	if strings.Contains(body, timed) {
+		t.Fatalf("retrieval was not timed under its own mode: %s", timed)
 	}
 }
