@@ -24,7 +24,7 @@ export default function Corpus() {
       <PageTitle>Corpus</PageTitle>
       {outcome?.kind === "ok" && (
         <>
-          <p>{`${outcome.value.repos.length} repositories, most recently used first.`}</p>
+          <p>{`${outcome.value.count} repositories, most recently used first.`}</p>
           <ul>
             {/* The server's order, rendered as given and never sorted:
                 ListRepos is ORDER BY last_queried_at DESC, id
