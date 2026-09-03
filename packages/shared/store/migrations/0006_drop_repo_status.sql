@@ -1,4 +1,11 @@
 -- 0004 added repos.status and nothing has ever written or read it. A column
 -- whose only value is its default is a claim the schema makes and the code
 -- does not keep; P3 can add one when it knows what the states are.
+-- expand-only-exempt: nothing ever wrote or read repos.status, so no previous
+-- image can miss it during a rolling deploy. This is the file the expand-only
+-- rule was written against, and it is the rule's first fixture: from P8 forward
+-- a destructive migration ships one release AFTER the code that stopped using
+-- the thing it drops, because migrate() runs at boot inside the new task while
+-- the old one is still serving, and a rollback moves the task definition and
+-- never the schema.
 ALTER TABLE repos DROP COLUMN IF EXISTS status;
