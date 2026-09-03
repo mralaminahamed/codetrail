@@ -157,6 +157,16 @@ func mechanicsFlags(t *testing.T, root, repoID, out string) flags {
 	}
 }
 
+// logged runs the harness and captures the per-arm progress lines, which are
+// the only observable evidence that an arm was retrieved at all.
+func logged(t *testing.T, f flags) (string, error) {
+	t.Helper()
+	var b strings.Builder
+	f.log = &b
+	err := run(context.Background(), f)
+	return b.String(), err
+}
+
 func setEnv(t *testing.T) {
 	t.Helper()
 	// Spec §9: CI runs the harness with no model. Set here rather than in the
@@ -421,7 +431,7 @@ func TestTheRunnerRefusesBeforeItRetrievesWhenTheProbeFindsLive(t *testing.T) {
 	repoID := corpora(t, root, true)
 	out := t.TempDir()
 
-	err := run(context.Background(), mechanicsFlags(t, root, repoID, out))
+	log, err := logged(t, mechanicsFlags(t, root, repoID, out))
 	if err == nil {
 		t.Fatal("the run succeeded over a leaking corpus")
 	}
@@ -434,6 +444,12 @@ func TestTheRunnerRefusesBeforeItRetrievesWhenTheProbeFindsLive(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Errorf("the output directory holds %v after a refused run; want no artefact written", entries)
+	}
+	// Before it *retrieves*, not merely before it writes. A mutant that probed
+	// after retrieving but before writing leaves no artefact either, so the
+	// assertion above cannot tell the two apart — measured, it survived.
+	if log != "" {
+		t.Errorf("the runner printed %q; it retrieved before the probe refused the corpus", log)
 	}
 }
 
