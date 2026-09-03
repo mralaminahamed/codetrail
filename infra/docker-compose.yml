@@ -11,6 +11,7 @@ services:
       POSTGRES_DB: codetrail
     ports: ["55432:5432"]
     volumes: ["pg:/var/lib/postgresql/data"]
+    networks: [data]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U codetrail -d codetrail"]
       interval: 5s
@@ -26,7 +27,80 @@ services:
     image: ollama/ollama:0.33.0@sha256:08ddf4b4dbfdc4fc1f5b0fe535915998581085402e307b57bb308db68460e372
     ports: ["11435:11434"]
     volumes: ["ollama:/root/.ollama"]
+    networks: [data]
     profiles: ["ai"]
+
+  # The two application images, behind a profile so `make up` stays a database
+  # and nothing else. Two networks rather than one, because §2 makes the split a
+  # deployment boundary: compose cannot give them different egress, and saying
+  # so is better than implying parity — what it can express is that the indexer
+  # is on no network the gateway can reach it from.
+  gateway:
+    build:
+      context: ..
+      dockerfile: infra/gateway.Dockerfile
+    image: codetrail/gateway:dev
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      DATABASE_URL: postgres://codetrail:codetrail@postgres:5432/codetrail?sslmode=disable
+      EMBED_PROVIDER: ${EMBED_PROVIDER:-fake}
+      OLLAMA_URL: http://ollama:11434
+    ports: ["8080:8080"]
+    read_only: true
+    tmpfs: ["/tmp"]
+    healthcheck:
+      test: ["CMD", "/gateway", "-probe"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks: [edge, data]
+    profiles: ["apps"]
+
+  indexer:
+    build:
+      context: ..
+      dockerfile: infra/indexer.Dockerfile
+    image: codetrail/indexer:dev
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      DATABASE_URL: postgres://codetrail:codetrail@postgres:5432/codetrail?sslmode=disable
+      EMBED_PROVIDER: ${EMBED_PROVIDER:-fake}
+      OLLAMA_URL: http://ollama:11434
+      ALLOWED_HOSTS: github.com,codeberg.org
+    ports: ["9090:9090"]
+    read_only: true
+    # The two writable paths, and no others: the same surface Task 5's task
+    # definition gives it.
+    tmpfs: ["/scratch:mode=1777", "/tmp:mode=1777"]
+    healthcheck:
+      test: ["CMD", "/indexer", "-probe"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks: [data]
+    profiles: ["apps"]
+
+  # The same rule file the cloud task would mount. One alerts.yml, two scrape
+  # files: a second copy of the rules would drift invisibly until an alert that
+  # fires locally does not fire in production.
+  #
+  # No Alertmanager. The rules evaluate and are visible here; nothing pages
+  # anyone, and saying so is cheaper than a runbook that is not true.
+  prometheus:
+    image: prom/prometheus:v3.14.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.compose.yml
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+    ports: ["9091:9090"]
+    networks: [data]
+    profiles: ["obs"]
+
+networks:
+  edge:
+  data:
 
 volumes:
   pg:

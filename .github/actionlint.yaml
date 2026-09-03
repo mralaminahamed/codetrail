@@ -1,0 +1,15 @@
+# One ignore, and it is a gap in the linter rather than in the workflow.
+#
+# `concurrency.queue` is documented GitHub workflow syntax — `single` (the
+# default) or `max`, which allows up to 100 pending runs — and it is what makes
+# deploy.yml actually queue. Without it, `cancel-in-progress: false` still lets
+# a newly queued run CANCEL the pending one it finds, so three dispatches would
+# run the first and the third and silently discard the second.
+#
+# actionlint 1.7.12 rejects the key as unknown. Verified against GitHub's
+# workflow-syntax reference before this ignore was written; re-check it when the
+# linter is next upgraded, and delete this file if it has caught up.
+paths:
+  ".github/workflows/deploy.yml":
+    ignore:
+      - 'unexpected key "queue" for "concurrency" section'

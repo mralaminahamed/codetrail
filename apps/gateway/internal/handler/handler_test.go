@@ -5,17 +5,22 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"
 
 	"github.com/mralaminahamed/codetrail/packages/shared/admit"
 	"github.com/mralaminahamed/codetrail/packages/shared/jobs"
+	"github.com/mralaminahamed/codetrail/packages/shared/metrics"
 )
 
 type fakeQueue struct {
@@ -421,5 +426,105 @@ func TestAFinishedJobNamesTheRepositoryItProduced(t *testing.T) {
 	}
 	if _, ok := running["repo_id"]; ok {
 		t.Errorf("a running job names a repository: %s", rec.Body)
+	}
+}
+
+// admissionSeries is the whole label set of both admission counters. Whole,
+// because an assertion on the one series a test expected to move passes under a
+// mutant that increments its neighbour.
+func admissionSeries(t *testing.T) map[string]float64 {
+	t.Helper()
+	srv := httptest.NewServer(promhttp.Handler())
+	defer srv.Close()
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]float64{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if !strings.HasPrefix(line, "codetrail_admission_total{") &&
+			!strings.HasPrefix(line, "codetrail_admission_rejected_total{") {
+			continue
+		}
+		i := strings.LastIndex(line, " ")
+		v, err := strconv.ParseFloat(line[i+1:], 64)
+		if err != nil {
+			t.Fatalf("metric %q: %v", line, err)
+		}
+		out[line[:i]] = v
+	}
+	if want := 2 + len(metrics.AdmissionRules); len(out) != want {
+		t.Fatalf("read %d admission series, want %d", len(out), want)
+	}
+	return out
+}
+
+func movedAdmission(t *testing.T, before map[string]float64) map[string]float64 {
+	t.Helper()
+	out := map[string]float64{}
+	for series, now := range admissionSeries(t) {
+		if d := now - before[series]; d != 0 {
+			out[series] = d
+		}
+	}
+	return out
+}
+
+func TestAnAdmittedSubmissionAndARefusedOneMoveDifferentCounters(t *testing.T) {
+	e := router(&fakeQueue{})
+
+	before := admissionSeries(t)
+	if rec := do(e, http.MethodPost, "/api/repos", `{"remote":"https://github.com/a/b"}`); rec.Code != http.StatusAccepted {
+		t.Fatalf("want 202, got %d: %s", rec.Code, rec.Body)
+	}
+	if got, want := movedAdmission(t, before), map[string]float64{
+		`codetrail_admission_total{outcome="accepted"}`: 1,
+	}; !maps.Equal(got, want) {
+		t.Fatalf("an accepted submission moved %v, want exactly %v", got, want)
+	}
+
+	before = admissionSeries(t)
+	if rec := do(e, http.MethodPost, "/api/repos", `{"remote":"https://gitlab.com/a/b"}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d: %s", rec.Code, rec.Body)
+	}
+	if got, want := movedAdmission(t, before), map[string]float64{
+		`codetrail_admission_total{outcome="rejected"}`:   1,
+		`codetrail_admission_rejected_total{rule="host"}`: 1,
+	}; !maps.Equal(got, want) {
+		t.Fatalf("a refused submission moved %v, want exactly %v", got, want)
+	}
+}
+
+// Named, not counted: spec §10 wants a 400 to say which rule refused, and the
+// counter has to answer the same question. A rejection recorded under the wrong
+// rule is what would send an operator to look at the allowlist when the URL was
+// never a URL.
+func TestEachAdmissionRuleIsCountedUnderItsOwnLabel(t *testing.T) {
+	cases := []struct{ name, body, rule string }{
+		{"a body that is not the shape", `{"remote":[]}`, "form"},
+		{"an empty remote", `{"remote":""}`, "form"},
+		{"a ref git should never see", `{"remote":"https://github.com/a/b","ref":"--upload-pack=x"}`, "form"},
+		{"a scheme that is not https", `{"remote":"git://github.com/a/b"}`, "scheme"},
+		{"a host nobody allowed", `{"remote":"https://evil.example/a/b"}`, "host"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before := admissionSeries(t)
+			if rec := do(router(&fakeQueue{}), http.MethodPost, "/api/repos", tc.body); rec.Code != http.StatusBadRequest {
+				t.Fatalf("want 400, got %d: %s", rec.Code, rec.Body)
+			}
+			want := map[string]float64{
+				`codetrail_admission_total{outcome="rejected"}`:              1,
+				`codetrail_admission_rejected_total{rule="` + tc.rule + `"}`: 1,
+			}
+			if got := movedAdmission(t, before); !maps.Equal(got, want) {
+				t.Fatalf("moved %v, want exactly %v", got, want)
+			}
+		})
 	}
 }

@@ -71,6 +71,74 @@ jobs:
       # leave that test green while it asserted this file instead of the code —
       # and the mutation that flips the default in main.go would survive in CI
       # and die only on a developer's machine.
+      # Expand-only from P8 forward, enforced rather than written down.
+      # migrate() runs at boot inside the new task while the old one is still
+      # serving, and a rollback moves the task definition and never the schema.
+      - name: migrations are expand-only
+        run: make migrations-lint
+
+      # Four Terraform steps, all with no AWS account and no credentials that
+      # resolve to anything. The stack has no data source that calls the API,
+      # which is what makes a plan — and therefore every assertion over it —
+      # something a pull request can run.
+      #
+      # tfplan and tfplan.json hold every secret this stack has in cleartext.
+      # They stay on the runner: never uploaded, never printed.
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: 1.9.8
+          terraform_wrapper: false
+      - name: terraform fmt, validate
+        run: make tf-check
+      - name: terraform plan, offline
+        run: make tf-plan
+      # Vetted under its own tag for the reason the ollama suite is: `go vet
+      # ./...` skips a tagged file, so this suite could rot between runs.
+      - name: plan policy suite
+        run: |
+          go vet -tags=tfplan ./infra/...
+          go test -tags=tfplan -count=1 ./infra/policy/
+
+      # promtool has no cloud account and needs none: it parses the rules and
+      # replays a synthetic series through them. The test rules are what turn
+      # "the conjunct is there" into "the conjunct decides the outcome" —
+      # `promtool check rules` cannot tell a real metric from a typo, and it
+      # passes an unfireable rule.
+      - name: prometheus rules
+        run: |
+          curl -sSfL "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz" \
+            | tar xz --strip-components=1 -C /usr/local/bin "prometheus-${PROMETHEUS_VERSION}.linux-amd64/promtool"
+          make alerts-test
+        env:
+          PROMETHEUS_VERSION: 3.14.0
+
+      # Both images, on every pull request. The properties the sandbox depends
+      # on — one go on PATH, no inherited GO*/GIT_*/*_PROXY, non-root under a
+      # read-only root filesystem, a readable RDS trust store — are facts about
+      # a built artifact, and nothing in the Go suite can see them.
+      - name: image assertions
+        run: ./infra/image_test.sh
+
+      # The whole path, against the images built above: admission refuses an
+      # unlisted forge, a real public repository indexes end to end, call edges
+      # resolve, and a citation names the commit that was indexed.
+      #
+      # EMBED_PROVIDER=fake, said explicitly. Step 6 indexes a real repository
+      # and something has to embed it; the alternative under compose is an
+      # Ollama plus a ~274 MB model pull on every pull request. It is the same
+      # choice the live suites already make, and it is banned only in the cloud,
+      # where meaningless retrieval would sit behind a wall of 200s. Nothing
+      # this asserts depends on embedding quality: edges_resolved depends on the
+      # Go toolchain and the citation check on the commit, not on the ranking.
+      - name: smoke test over compose
+        env:
+          EMBED_PROVIDER: fake
+        run: |
+          docker tag codetrail/gateway:test codetrail/gateway:dev
+          docker tag codetrail/indexer:test codetrail/indexer:dev
+          docker compose -f infra/docker-compose.yml --profile apps up -d --no-build
+          ./infra/smoke.sh --target compose http://localhost:8080
+
       - name: live datastore tests
         env:
           EMBED_PROVIDER: fake

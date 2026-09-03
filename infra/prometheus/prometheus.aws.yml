@@ -1,0 +1,38 @@
+# Scrape configuration for the Prometheus task, behind observability_enabled.
+#
+# dns_sd_configs over the Cloud Map names, because a Fargate task's address
+# changes on every replacement. The consequence is the mirror of the compose
+# file's: a service scaled to zero has no target and no series at all, so
+# `up == 0` cannot match and only IndexerAbsent can speak. That is the
+# behaviour the parked operating mode wants, and it also means `up == 0` cannot
+# detect "no tasks at all" here.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - alerts.yml
+
+scrape_configs:
+  - job_name: codetrail
+    dns_sd_configs:
+      - names: ["gateway.codetrail.local"]
+        type: A
+        port: 8080
+    relabel_configs:
+      - target_label: service
+        replacement: gateway
+
+  - job_name: codetrail-indexer
+    metrics_path: /metrics
+    dns_sd_configs:
+      - names: ["indexer.codetrail.local"]
+        type: A
+        port: 9090
+    relabel_configs:
+      # job is relabelled rather than declared, because every rule selects
+      # job="codetrail" and two scrape_configs cannot share a job_name.
+      - target_label: job
+        replacement: codetrail
+      - target_label: service
+        replacement: indexer
