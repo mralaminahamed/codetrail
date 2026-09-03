@@ -69,8 +69,10 @@ func (f *fake) SpanTexts(_ context.Context, _, after string, limit int) ([]TextR
 	return out, "", nil
 }
 
+// arm builds an Arm behind a DSN naming db, because Verify derives the
+// database name itself and a test that handed it one would not exercise that.
 func arm(name, db string, f *fake) Arm {
-	return Arm{Name: name, Database: db, RepoID: "r", Read: f}
+	return Arm{Name: name, DSN: "postgres://u:p@h:5432/" + db + "?sslmode=disable", RepoID: "r", Read: f}
 }
 
 func spansAt(ids ...string) []metric.Span {
@@ -101,7 +103,9 @@ func TestTwoDsnsNamingOneDatabaseAreRefused(t *testing.T) {
 	if one == two {
 		t.Fatal("the fixture's two DSNs are textually identical and cannot discriminate")
 	}
-	_, err := Verify(context.Background(), arm("ast", testdb.Name(one), a), arm("window", testdb.Name(two), b), src)
+	_, err := Verify(context.Background(),
+		Arm{Name: "ast", DSN: one, RepoID: "r", Read: a},
+		Arm{Name: "window", DSN: two, RepoID: "r", Read: b}, src)
 	if !errors.Is(err, ErrSameDatabase) {
 		t.Errorf("Verify accepted two DSNs naming database %s: %v; want ErrSameDatabase", testdb.Name(one), err)
 	}
@@ -322,7 +326,7 @@ func TestTheProbeIsScopedToOneRepo(t *testing.T) {
 	f, cases := leakCorpus()
 	f.texts = nil
 	spy := &spyReader{fake: f, seen: &got}
-	if _, err := Probe(context.Background(), Arm{Name: "ast", Database: "d", RepoID: "repo-A", Read: spy}, cases); err != nil {
+	if _, err := Probe(context.Background(), Arm{Name: "ast", DSN: "postgres://h/d", RepoID: "repo-A", Read: spy}, cases); err != nil {
 		t.Fatalf("Probe: %v", err)
 	}
 	if len(got) == 0 {

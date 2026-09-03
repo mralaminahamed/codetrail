@@ -134,7 +134,7 @@ func build(t *testing.T, dsn, name, remote, root string, strategy chunk.Strategy
 	if err != nil {
 		t.Fatalf("indexing %s: %v", name, err)
 	}
-	return Arm{Name: name, Database: testdb.Name(dsn), RepoID: repoID, Read: FromStore(s)}
+	return Arm{Name: name, DSN: dsn, RepoID: repoID, Read: FromStore(s)}
 }
 
 // cases generates the golden set from the same checkout the corpus was built

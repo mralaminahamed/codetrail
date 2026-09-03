@@ -15,6 +15,8 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/mralaminahamed/codetrail/packages/shared/testdb"
+
 	"github.com/mralaminahamed/codetrail/apps/evalrunner/internal/metric"
 )
 
@@ -38,17 +40,32 @@ type TextRow struct {
 	Text   string `json:"text"`
 }
 
-// Arm is one side of the comparison: a name, the database it lives in, the
+// Arm is one side of the comparison: a name, the DSN it lives behind, the
 // repository row inside it, and a way to read them.
 //
-// Database is testdb.Name(dsn) and never the DSN: a DSN carries a password and
-// this value reaches the artefact.
+// Verify derives the database name itself rather than taking one. Two DSNs
+// differing only in sslmode or a pool parameter name one database, so a
+// caller that compared the strings would admit two arms that overwrite each
+// other — and P2 proved live that the second arm then silently replaces the
+// first. The DSN never reaches the artefact; Database() is what does.
 type Arm struct {
-	Name     string
-	Database string
-	RepoID   string
-	Read     Reader
+	Name   string
+	DSN    string
+	RepoID string
+	Read   Reader
 }
+
+// Database is the database this arm's DSN names, which is what the artefact
+// records: a DSN carries a password.
+//
+// testdb.Name is host-blind — verified, it parses the URL and returns the path
+// — so two databases with the same name on different hosts compare equal and
+// are refused. That is a false refusal and it is the safe direction: it
+// refuses a legal configuration rather than admitting an illegal one, and the
+// operator can rename. It also returns "" for a DSN it cannot parse, which
+// makes two unparseable DSNs compare equal — also a refusal, also safe, and
+// store.New would have failed on them first.
+func (a Arm) Database() string { return testdb.Name(a.DSN) }
 
 // Report is what Verify establishes, for the artefact.
 type Report struct {
@@ -98,12 +115,8 @@ var (
 func Verify(ctx context.Context, a, b Arm, src map[string]string) (Report, error) {
 	var rep Report
 
-	// testdb.Name is host-blind, so two databases with the same name on
-	// different hosts compare equal and are refused. That is a false refusal
-	// and it is the safe direction: it refuses a legal configuration rather
-	// than admitting an illegal one, and the operator can rename.
-	if a.Database == b.Database {
-		return rep, fmt.Errorf("%w: %s", ErrSameDatabase, a.Database)
+	if a.Database() == b.Database() {
+		return rep, fmt.Errorf("%w: %s", ErrSameDatabase, a.Database())
 	}
 
 	ac, err := a.Read.Commit(ctx, a.RepoID)
