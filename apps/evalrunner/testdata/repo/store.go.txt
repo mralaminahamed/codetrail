@@ -1,0 +1,31 @@
+package repo
+
+import "errors"
+
+// Store is a keyed store of integers.
+type Store struct {
+	m map[string]int
+}
+
+// Get returns the thing named n.
+// It returns an error if n is unknown.
+func (s *Store) Get(n string) (int, error) {
+	v, ok := s.m[n]
+	if !ok {
+		return 0, ErrGone
+	}
+	return v, nil
+}
+
+// get reads without taking the lock and is not part of the API.
+func (s *Store) get(n string) int { return s.m[n] }
+
+func undocumented() int { return 0 }
+
+// Errors this package returns.
+var (
+	// ErrGone is returned when the entry was evicted.
+	ErrGone = errors.New("gone")
+	// errHidden is not part of the API.
+	errHidden = errors.New("hidden")
+)

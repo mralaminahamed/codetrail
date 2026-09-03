@@ -1,4 +1,13 @@
 // Package walk lists the indexable regular files of a checkout.
+//
+// In packages/shared rather than under apps/indexer because two apps now walk
+// a checkout: the indexer, and the eval harness, which generates its questions
+// from the same tree the indexer read (spec §9). Go's internal rule makes
+// apps/indexer/internal/walk unimportable from apps/evalrunner, so the choice
+// was this or a second copy of Files, ReadRegular and Indexable — and a second
+// copy is the drift the source-binding check exists to catch. Spec:45-46 lists
+// packages/shared's contents and does not name walk; neither does it name
+// admit, jobs or testdb, which are already there.
 package walk
 
 import (
@@ -203,4 +212,23 @@ func ReadRegular(p string, max int64) ([]byte, int64, error) {
 		return nil, 0, err
 	}
 	return body, info.Size(), nil
+}
+
+// Indexable reports whether a file's bytes can become spans.
+//
+// The UTF-8 and NUL halves are not taste. Measured against pg17: a span text
+// carrying a NUL is refused with `invalid byte sequence for encoding "UTF8":
+// 0x00` and one carrying an invalid byte with `... 0xff`, and PutSpans writes
+// a repo's spans in one transaction — so a single PNG would fail the whole
+// job rather than cost one file.
+//
+// Exported and shared with apps/evalrunner rather than copied: spec §9's
+// harness generates its questions from the same checkout the indexer read, and
+// a walk that admitted a file the corpus does not contain would key every case
+// to lines nothing indexed.
+//
+// The Lang half is the cost call (Open Question 5): a lockfile or a minified
+// bundle has nothing retrievable in it and costs an embedding call per window.
+func Indexable(f File, body []byte) bool {
+	return f.Lang != "" && utf8.Valid(body) && !bytes.ContainsRune(body, 0)
 }
