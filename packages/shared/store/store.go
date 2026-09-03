@@ -18,6 +18,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/mralaminahamed/codetrail/packages/shared/metrics"
 )
 
 //go:embed migrations/*.sql
@@ -54,7 +56,31 @@ func New(ctx context.Context, dsn string) (*Store, error) {
 		pool.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
+	// After migrate, which is what creates the vector extension. The error is
+	// dropped rather than failing the boot: this is a label, and an absent
+	// codetrail_datastore_info series is itself the signal that it could not be
+	// read. Failing here would trade a working deployment for a gauge.
+	if pg, vec, err := s.Versions(ctx); err == nil {
+		metrics.SetDatastoreInfo(pg, vec)
+	}
 	return s, nil
+}
+
+// Versions reports the PostgreSQL and pgvector versions this connection is
+// actually talking to. Read from the server, not from the image tag that was
+// asked for: compose runs pgvector ahead of what RDS offers, so "the same as
+// dev" is never the expected answer and only the number the server gives says
+// what served a query.
+//
+// pgvector comes back empty rather than as an error when the extension is
+// absent, because that is a fact about the database worth publishing and not a
+// failure to read one.
+func (s *Store) Versions(ctx context.Context) (postgres, pgvector string, err error) {
+	err = s.pool.QueryRow(ctx, `
+		SELECT split_part(current_setting('server_version'), ' ', 1),
+		       coalesce((SELECT extversion FROM pg_extension WHERE extname = 'vector'), '')
+	`).Scan(&postgres, &pgvector)
+	return postgres, pgvector, err
 }
 
 // CheckDim reports whether an embedder of width dim can write to this schema.

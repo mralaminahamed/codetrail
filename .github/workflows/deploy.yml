@@ -1,0 +1,112 @@
+name: Deploy
+
+# [ACCOUNT-REQUIRED] This workflow has never run. There is no AWS account, no
+# OIDC role, no state bucket and no `production` environment behind this
+# repository. Everything below is written to be correct and none of it is
+# proven.
+#
+# workflow_dispatch ONLY. There is deliberately no push trigger: merging to
+# trunk builds images and never touches infrastructure.
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to deploy. Use a commit SHA: it is the only tag that cannot move under a running service."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# queue: max is a real GitHub key and actionlint 1.7.12 does not know it —
+# .github/actionlint.yaml carries the one ignore, with the citation.
+#
+# cancel-in-progress: false alone does NOT queue. GitHub allows one pending run
+# per group by default and a newly queued run CANCELS the pending one it finds,
+# so dispatching three times would run the first and the third and silently
+# discard the second. queue: max is what makes them wait, FIFO.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # The second gate. Dispatch alone only proves the actor has repository write
+    # access; an environment with no required reviewers is a label, not a gate.
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: infra/terraform
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: 1.9.8
+          terraform_wrapper: false
+
+      # No static AWS credentials anywhere in this workflow.
+      - uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      # The backend is a partial configuration; see backend.hcl.example for what
+      # the bucket itself must have. State holds the database password in
+      # cleartext, so the bucket is part of the security boundary.
+      - name: init
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=$TF_BACKEND_BUCKET" \
+            -backend-config="key=codetrail/production.tfstate" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+        env:
+          TF_BACKEND_BUCKET: ${{ secrets.TF_BACKEND_BUCKET }}
+          AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      # plan -out then apply that saved plan, never `aws ecs update-service`.
+      # The task definitions are Terraform-managed: registering one from the CLI
+      # puts the live service permanently ahead of state, and
+      # --force-new-deployment alone redeploys the OLD image. Applying a saved
+      # plan means the change that lands is exactly the change that was planned.
+      #
+      # The plan file and its JSON hold the database password in cleartext. They
+      # stay on the runner: never an artifact, never a log line.
+      - name: plan
+        run: terraform plan -input=false -lock-timeout=5m -out=tfplan
+        env:
+          TF_VAR_alb_allowed_cidrs: ${{ vars.ALB_ALLOWED_CIDRS }}
+          TF_VAR_image_registry: ${{ vars.IMAGE_REGISTRY }}
+          TF_VAR_image_tag: ${{ inputs.image_tag }}
+          TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
+
+      - name: apply
+        run: terraform apply -input=false -lock-timeout=5m tfplan
+
+      # terraform apply returns when ECS ACCEPTS a task definition, not when it
+      # runs. Without this, a crash-looping service is a green workflow.
+      #
+      # Ollama first and alone: the gateway and the indexer both make one real
+      # round trip to the embedder at boot and fatal when it fails, so starting
+      # them alongside an Ollama that is still loading is a first apply the
+      # circuit breaker rolls back on a stack that was about to work. And on a
+      # FIRST deployment the circuit breaker cannot save anything at all —
+      # with no prior COMPLETED deployment it stalls rather than reverting.
+      - name: wait for the embedder
+        run: aws ecs wait services-stable --cluster codetrail --services ollama
+
+      - name: wait for the rollout
+        run: aws ecs wait services-stable --cluster codetrail --services gateway indexer
+
+      # The last step, and the one that decides whether this deployment works.
+      # Of its assertions the one that matters most is edges_resolved > 0:
+      # that is the only signal saying the image shipped a Go toolchain.
+      - name: smoke
+        working-directory: .
+        run: ./infra/smoke.sh --target deployed "http://$(terraform -chdir=infra/terraform output -raw alb_dns_name)"

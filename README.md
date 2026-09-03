@@ -682,7 +682,7 @@ inferred.
 | **P5** | React console | done; the floor it reports refusals against is still a mechanism at −1 |
 | **P6** | Eval harness: generated golden set, AST versus window | not started |
 | **P7** | LLM tool loop, hybrid retrieval fusion, incremental re-index | not started |
-| **P8** | Terraform, CD, deploy | not started |
+| **P8** | Terraform, CD, deploy | done; **never applied** — see [Deployment](#deployment) |
 
 Nothing above is deployed. There is no live instance, no cloud account behind this repository, and
 no benchmark result to quote yet — when there is one, it will come with the numbers that produced
@@ -693,6 +693,139 @@ fusing the two arms beats either alone, the score floor is a knob at `-1` rather
 threshold, and just under one edge in eight resolving is a measurement rather than a target. All of
 them are P6, and all of them are questions this repository is built to answer with evidence rather
 than to assert.
+
+## Deployment
+
+**Nothing is deployed.** There is no AWS account behind this repository, no OIDC
+role, no state bucket and no `production` environment. `terraform apply` has
+never run; no image has ever been pushed; `deploy.yml` has never been dispatched
+once.
+
+What P8 delivers is everything that can be *proved* without one, on every pull
+request:
+
+| | Verified with no cloud account | Needs a live account |
+| --- | --- | --- |
+| **Images** | Both application images build and are asserted by `infra/image_test.sh`: one `go` on `PATH` at `/usr/local/go/bin/go`, no `GO*`/`GIT_*`/`*_PROXY` in either `Config.Env`, uid 65532 under a read-only root filesystem answering `/health`, `/ready` and `/metrics`, the RDS trust store readable by the runtime user, and `git clone https://…` succeeding from inside the indexer. | Every push to a registry. The Ollama image has never been built at all. |
+| **Terraform** | `fmt`, `validate`, an offline `plan` under mock credentials on empty state, and 26 assertions over the plan JSON. Two plans of one configuration are identical. | `apply`. Every resource identifier. The destroy → apply → empty-plan cycle. |
+| **Alerts** | `promtool check rules`, `check config` on both scrape files, and `test rules` over 20 cases — every conjunct proved to decide its outcome, and every state alert proved to fire with no traffic at all. | That Prometheus in the deployed VPC can discover either service. |
+| **Smoke test** | All nine assertions, against the built images over `docker compose`, including an end-to-end index of `rs/zerolog`. | The same script against a deployed URL. |
+| **Workflows** | `actionlint` with shellcheck; every third-party action pinned to a resolved commit SHA. | One run. Of anything. |
+
+### What the smoke test actually observed
+
+Against the built images over compose, all nine pass, and step 7 is the one that
+matters:
+
+```
+ok   6 https://github.com/rs/zerolog indexed end to end
+ok   7 edges_resolved is 945 (syntactic 6950): the image shipped a toolchain
+ok   8 the answer cites the indexed commit dfd11cca1143
+```
+
+945 of 7,895 edges is 11.98%, against the just-under-12.5% this project measured
+on the same repository outside a container. And against an indexer image built
+with the toolchain `COPY` removed, the same run reports:
+
+```
+ok   6 https://github.com/rs/zerolog indexed end to end
+FAIL 7 edges_resolved is 0: every edge is syntactic, so no usable go is on PATH
+ok   8 the answer cites the indexed commit dfd11cca1143
+```
+
+Every other assertion still passes. That is the silent downgrade
+[the graph section](#the-symbol-graph-and-its-honesty) warns about — seen, not
+argued.
+
+### The shape, and what it costs
+
+Two ECS Fargate services under `awsvpc`, so two ENIs and **two security
+groups**: §2's claim that the sandbox is a deployment boundary rather than a
+code convention is a set of resources rather than a paragraph. The indexer
+accepts no connection but a scrape from the scraper's own security group, is
+behind no load balancer, has **no IAM task role**, and can write exactly two
+paths. Its task-definition environment is asserted as a closed set, so a future
+`HTTPS_PROXY` — which would reach `git` even though it cannot reach the compiler
+— is a red build.
+
+**Egress is as wide on the gateway as on the indexer, and that is a limit rather
+than an oversight.** A Fargate task pulls its image, reads its secrets and ships
+its logs through its own ENI, and there is no AWS-managed prefix list for ECR,
+Secrets Manager or CloudWatch Logs to scope 443 with. Both are enumerated to
+443, 5432, 11434 and DNS rather than `protocol = "-1"`, which is a control on
+both rather than a difference between them. Interface VPC endpoints would earn
+the stronger claim at roughly $29/month and are not built.
+
+**The network layer does not enforce the host allowlist and does not pretend
+to.** Ports are enumerated, hosts never are: `github.com` resolves into a large
+changing CDN range, an IP allowlist is either stale or meaningless, and a
+TLS-terminating egress proxy is a second trust boundary in a project whose point
+is having few. The host decision stays in `admit.Policy`, and `ALLOWED_HOSTS` is
+written explicitly into the task definition so widening it is a reviewed diff.
+
+List prices, us-east-1, on-demand, 730 hours — **arithmetic over a published
+rate, never checked against a bill**:
+
+| Line | Shape | $/month |
+| --- | --- | --- |
+| Fargate — gateway | 0.25 vCPU / 0.5 GiB | 9.01 |
+| Fargate — indexer | 1 vCPU / 2 GiB | 36.04 |
+| Fargate — ollama | 2 vCPU / 4 GiB | 72.08 |
+| Fargate ephemeral storage — indexer | 40 GiB | 1.62 |
+| ALB + its two public IPv4 | 1 LCU | 29.57 |
+| Public IPv4 — tasks | 3 × $0.005/hr | 10.95 |
+| RDS `db.t4g.micro` single-AZ + 20 GiB gp3 | PostgreSQL 17 | 13.98 |
+| Secrets Manager, CloudWatch Logs, ECR | | 2.76 |
+| **Total, always on, no console** | | **≈ $176** |
+
+**The embedder is 42% of that**, and it is there because
+`packages/shared/embed` has exactly two providers and one of them is a fake. A
+Terraform `validation` block refuses `fake` in the cloud, because meaningless
+retrieval behind a wall of 200s is precisely the silent downgrade this project
+exists to refuse. A hosted embedder would cost cents and is a code change P8 may
+not make; it needs 768 dimensions natively, which `store.EmbeddingDim` fixes.
+
+Three ways to stop paying, in increasing order of what they give up:
+
+1. **`desired_count = 0`.** The ALB and the database stay, so the URL and the
+   corpus survive. **≈ $40/month.** Note that eviction and the job-history sweep
+   run on a timer *inside the indexer*, so a parked stack stops doing both —
+   which is safe, because nothing grows while nothing is being submitted.
+2. **Destroy the edge as well.** Would save the ALB's $29.57 and change the DNS
+   name when it returns. **Not built:** it needs an `edge_enabled` variable, and
+   every load-balancer assertion would then index through a `count` for an
+   operating mode nobody can exercise without an account.
+3. **`terraform destroy`.** Keep the state bucket and the ECR repositories.
+   **≈ $0.60/month**, and recreation takes twelve to fifteen minutes. This is
+   defensible here because *the corpus is disposable by design*: eviction is
+   LRU, `RepoID = hash(remote, commit)` makes re-indexing converge, and a
+   resubmitted URL rebuilds everything.
+
+**Everything that needs an account is listed**, one row per unproven claim with
+the command that would close it, in
+[`infra/terraform/README.md`](infra/terraform/README.md#the-account-required-ledger).
+
+### Alerts
+
+Twelve rules in `infra/prometheus/alerts.yml`, in four categories: four state
+alerts that carry no minimum-traffic conjunct and are proved to fire with no
+traffic at all, one count rule that is neither, five ratios each carrying a
+conjunct proved to decide its outcome, and one quantile. **No Alertmanager is
+deployed and nothing pages anyone** — the rules evaluate and are visible in
+Prometheus, and that is the whole claim.
+
+`promtool check rules` cannot tell a real metric from a typo, so
+`infra/prometheus/metric_names.sh` carries that separately: every `codetrail_`
+name in the rules must exist in `metrics.go`, with three written exceptions.
+
+### `POST /api/repos` is unauthenticated, and the deployment says so
+
+It has no auth and no rate limit and what it does is `git clone` a stranger's
+URL on your bill. The per-job caps bound one job; nothing bounds the arrival
+rate. So `alb_allowed_cidrs` **has no default and the plan fails without it**.
+`["0.0.0.0/0"]` is a legitimate answer for a public demo — it just has to be an
+answer somebody wrote down.
+
 
 ## Running what exists
 

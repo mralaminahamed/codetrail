@@ -344,7 +344,7 @@ func (h *Handler) ask(c echo.Context) error {
 	}
 
 	floor := floorView{Value: h.Floor.Value, Calibrated: h.Floor.Calibrated, Applicable: out.VectorRan}
-	outcome, reason := rag.Decide(h.Floor, len(out.Hits), out.TopScore, out.VectorRan)
+	outcome, reason := out.Decide(h.Floor)
 	if outcome == rag.OutcomeRefused {
 		metrics.CountAnswer("refused")
 		metrics.CountRefusal(string(reason))

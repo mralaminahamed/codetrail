@@ -1,6 +1,20 @@
 # Env / secrets
 .env
 
+# Terraform. Three artifacts hold secrets in cleartext, not one: the plan file,
+# the show -json output CI generates from it (which carries the assembled
+# DATABASE_URL, password included, as a planned attribute), and state, which
+# holds aws_db_instance.password and every secret version for as long as the
+# stack exists. None of them is ever a workflow artifact or a log line.
+*.tfvars
+*.tfvars.json
+*.tfstate
+*.tfstate.*
+.terraform/
+tfplan
+tfplan.json
+backend.hcl
+
 # Build output
 /bin/
 /out/
@@ -24,3 +38,7 @@ docs/plan-*.md
 
 # SDD workspace (git-ignored scratch)
 .superpowers/
+backend_override.tf
+
+# Eval artefacts (mechanics runs are not measurements)
+docs/eval/mechanics/

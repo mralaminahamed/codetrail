@@ -1,0 +1,11 @@
+package grouped
+
+import "errors"
+
+// Errors this package returns.
+var (
+	// ErrGone is returned when the repo was evicted.
+	ErrGone = errors.New("gone")
+	// errHidden is not part of the API.
+	errHidden = errors.New("hidden")
+)
