@@ -32,6 +32,11 @@ terraform {
 }
 HCL
 
+# Removed before planning, not after: a plan that fails leaves the previous
+# JSON on disk, and the policy suite would then assert over a stale artifact and
+# report ok. Measured while running C7.
+rm -f tfplan tfplan.json
+
 export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-mock}
 export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-mock}
 export AWS_REGION=${AWS_REGION:-us-east-1}
