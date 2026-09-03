@@ -471,3 +471,32 @@ func TestGatewayRefusesAnIntegerKnobThatIsNotAnInteger(t *testing.T) {
 		t.Fatalf("the defaults must boot: %+v, %v", b, err)
 	}
 }
+
+// The flag says *codetrail* measured this number. An operator's own value is
+// not one this project has evidence for, whatever the shipped default becomes.
+//
+// The environment is set on purpose: with none the default is correct by
+// construction, so a no-environment test — which is what this suite had —
+// cannot discriminate. Today DefaultFloor().Calibrated is false and this passes
+// either way; the day a floor is measured, it is the only thing between a
+// hand-typed number and a gauge claiming it was measured. Observed under a
+// calibrated default of {0.62, true} with the old spelling: floor is
+// {Value:0.5 Calibrated:true}, want {Value:0.5 Calibrated:false}.
+func TestAnOperatorsFloorIsNeverLabelledCalibrated(t *testing.T) {
+	t.Setenv("ANSWER_SCORE_FLOOR", "0.5")
+	got, err := scoreFloor()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (rag.Floor{Value: 0.5, Calibrated: false}); got != want {
+		t.Errorf("floor is %+v, want %+v", got, want)
+	}
+}
+
+// And codetrail's own number keeps whatever label DefaultFloor gives it, so
+// the two cannot be confused.
+func TestTheUnsetFloorIsTheShippedDefaultWhole(t *testing.T) {
+	if got, err := scoreFloor(); err != nil || got != rag.DefaultFloor() {
+		t.Errorf("with no environment the floor is %+v (%v), want %+v", got, err, rag.DefaultFloor())
+	}
+}

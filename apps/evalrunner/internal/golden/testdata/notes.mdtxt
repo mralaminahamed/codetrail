@@ -1,0 +1,7 @@
+# Notes
+
+Get returns the thing named n.
+It returns an error if n is unknown.
+
+That prose is repeated here on purpose: StripDocs passes a non-Go file through
+unchanged, so this is the leak class stripping cannot close.

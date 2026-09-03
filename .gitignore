@@ -39,3 +39,6 @@ docs/plan-*.md
 # SDD workspace (git-ignored scratch)
 .superpowers/
 backend_override.tf
+
+# Eval artefacts (mechanics runs are not measurements)
+docs/eval/mechanics/

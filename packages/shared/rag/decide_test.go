@@ -74,3 +74,47 @@ func TestFloorValidateRefusesWhatCosineCannotProduce(t *testing.T) {
 		}
 	}
 }
+
+// Result.Decide is the rule the gateway runs, applied to a whole result. The
+// assertion is that the two agree on every branch, not that the wrapper
+// compiles: a copy of a rule is correct on the day it is made.
+func TestResultDecideIsTheSameRuleTheHandlerRuns(t *testing.T) {
+	f := Floor{Value: 0.5}
+	for _, r := range []Result{
+		{Hits: nil, TopScore: math.NaN(), VectorRan: true},
+		{Hits: []Fused{{SpanID: "s1"}}, TopScore: math.NaN(), VectorRan: true},
+		{Hits: []Fused{{SpanID: "s1"}}, TopScore: 0.4, VectorRan: true},
+		{Hits: []Fused{{SpanID: "s1"}}, TopScore: 0.5, VectorRan: true},
+		{Hits: []Fused{{SpanID: "s1"}}, TopScore: 0.9, VectorRan: true},
+		{Hits: []Fused{{SpanID: "s1"}}, TopScore: math.NaN(), VectorRan: false},
+	} {
+		wo, wr := Decide(f, len(r.Hits), r.TopScore, r.VectorRan)
+		go_, gr := r.Decide(f)
+		if go_ != wo || gr != wr {
+			t.Errorf("%d hits, top %v, vectorRan %v: Result.Decide says (%s,%s), Decide says (%s,%s)",
+				len(r.Hits), r.TopScore, r.VectorRan, go_, gr, wo, wr)
+		}
+	}
+}
+
+// The branch a default-mode suite never enters. In lexical mode there is no
+// cosine similarity at all: ts_rank_cd is unbounded and corpus-dependent, and
+// comparing it to a cosine floor is a category error that typechecks.
+func TestResultDecideRefusesUnscoredInHybridAndAnswersInLexical(t *testing.T) {
+	f := Floor{Value: 0.5}
+	hybrid := Result{Hits: []Fused{{SpanID: "s1"}}, TopScore: math.NaN(), VectorRan: true}
+	if o, r := hybrid.Decide(f); o != OutcomeRefused || r != ReasonUnscored {
+		t.Errorf("hybrid result with a NaN top decided (%s, %s), want (refused, unscored)", o, r)
+	}
+	lexical := Result{Hits: []Fused{{SpanID: "s1"}}, TopScore: math.NaN(), VectorRan: false, Mode: ModeLexical}
+	if o, r := lexical.Decide(f); o != OutcomeAnswered || r != "" {
+		t.Errorf("lexical result decided (%s, %s), want (answered, \"\")", o, r)
+	}
+	// And the floor does not apply there at any value: the short circuit is
+	// before the comparison, so a sweep in lexical mode sweeps nothing.
+	for _, v := range []float64{-1, 0, 0.5, 1} {
+		if o, _ := lexical.Decide(Floor{Value: v}); o != OutcomeAnswered {
+			t.Errorf("lexical result refused at floor %v", v)
+		}
+	}
+}
