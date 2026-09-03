@@ -1,0 +1,391 @@
+# Twelve rules in four categories, and each category is tested for the property
+# that defines it.
+#
+# For the six rules that carry a minimum-traffic conjunct, each gets two cases:
+# a series at *exactly* the conjunct's sample size, with the numerator ratio
+# well past the threshold, asserting no alert; and one sample more, asserting it
+# fires. That converts "the conjunct is there" into "the conjunct decides the
+# outcome". The conjuncts are strict, so the first case sits on the excluded
+# boundary and the second is the first admissible sample.
+#
+# The input interval per test is chosen so the boundary lands exactly on N/w
+# rather than near it: an integer increment per interval makes rate() produce
+# the threshold bit for bit. Measured with `> bool` before these were written,
+# because a boundary case that is accidentally a hair under proves nothing.
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # ---------------------------------------------------------------- state ---
+  # Four rules, one case each, all asserting the alert fires with no traffic
+  # whatsoever. That is the property a state alert has and a rate over a counter
+  # does not, and nothing else in this file checks it.
+
+  - name: GatewayDown fires on a failing scrape with no traffic at all
+    interval: 1m
+    input_series:
+      - series: 'up{job="codetrail", service="gateway", instance="gw:8080"}'
+        values: "0x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: GatewayDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: codetrail
+              service: gateway
+              instance: gw:8080
+            exp_annotations:
+              summary: "gateway is not scrapeable"
+              description: "Prometheus cannot reach the gateway (gw:8080) for 2m."
+
+  - name: IndexerDown fires when there is a target and it will not answer
+    interval: 1m
+    input_series:
+      - series: 'up{job="codetrail", service="indexer", instance="ix:9090"}'
+        values: "0x20"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: IndexerDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: codetrail
+              service: indexer
+              instance: ix:9090
+            exp_annotations:
+              summary: "indexer is not scrapeable"
+              description: "An indexer target has not answered a scrape for 5m. Jobs are queueing."
+      # And the other half of the pair does not fire, because there IS a target.
+      - eval_time: 10m
+        alertname: IndexerAbsent
+        exp_alerts: []
+
+  - name: IndexerAbsent fires when service discovery returns no target
+    interval: 1m
+    # Deliberately no indexer series: under dns_sd_configs a service scaled to
+    # zero has no target and no series, so `up == 0` cannot match and only
+    # absent() can speak.
+    input_series:
+      - series: 'up{job="codetrail", service="gateway", instance="gw:8080"}'
+        values: "1x20"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: IndexerAbsent
+        exp_alerts:
+          # absent() synthesises the matcher's own labels onto its result.
+          - exp_labels:
+              severity: critical
+              job: codetrail
+              service: indexer
+            exp_annotations:
+              summary: "no indexer is running"
+              description: "Service discovery has returned no indexer target for 10m. Submissions still succeed and nothing is indexing them."
+      - eval_time: 15m
+        alertname: IndexerDown
+        exp_alerts: []
+
+  - name: NotReady fires on the gauge alone, with no traffic
+    interval: 1m
+    input_series:
+      - series: 'codetrail_ready{job="codetrail", service="gateway", instance="gw:8080"}'
+        values: "0x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: NotReady
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: codetrail
+              service: gateway
+              instance: gw:8080
+            exp_annotations:
+              summary: "gateway is up but not ready"
+              description: "A readiness dependency has been unreachable for 2m behind a process that is still listening."
+
+  - name: ScoreFloorUncalibrated fires once, for the gateway only
+    interval: 1m
+    # Both processes export this gauge, because both link packages/shared/metrics
+    # and both register on the default registry — but only the gateway ever
+    # calls SetFloor, so the indexer's is a permanent 0. Two series here, one
+    # expected alert: with the {service="gateway"} scope removed the rule fires
+    # twice and this case fails, which is the whole reason the scope exists.
+    input_series:
+      - series: 'codetrail_score_floor_calibrated{job="codetrail", service="gateway", instance="gw:8080"}'
+        values: "0x30"
+      - series: 'codetrail_score_floor_calibrated{job="codetrail", service="indexer", instance="ix:9090"}'
+        values: "0x30"
+      - series: 'codetrail_score_floor{job="codetrail", service="gateway", instance="gw:8080"}'
+        values: "-1x30"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: ScoreFloorUncalibrated
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: codetrail
+              service: gateway
+              instance: gw:8080
+            exp_annotations:
+              summary: "the answer score floor is not calibrated"
+              description: "codetrail_score_floor is -1 and nothing this project measured produced it. Expected while P6 is unlanded; afterwards it means the deployment is not serving the calibrated value."
+
+  # ---------------------------------------------------------------- count ---
+  # One rule, and it is deliberately NOT given a no-traffic case. It reads like
+  # a state alert and is a rate() over a counter, so it is identically zero when
+  # no job has run and cannot fire on an idle system. Its pair is fires /
+  # does-not-fire instead.
+
+  - name: TypecheckHasNoToolchain fires on jobs that found no go binary
+    interval: 1m
+    input_series:
+      - series: 'codetrail_typecheck_total{job="codetrail", service="indexer", reason="no_toolchain"}'
+        values: "0+1x40"
+      - series: 'codetrail_typecheck_total{job="codetrail", service="indexer", reason="ok"}'
+        values: "0x40"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: TypecheckHasNoToolchain
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "the indexer has no Go toolchain"
+              description: "Jobs are completing with reason=no_toolchain. The graph is all-syntactic and nothing else reports it."
+
+  - name: TypecheckHasNoToolchain is silent while jobs are type-checking
+    interval: 1m
+    input_series:
+      - series: 'codetrail_typecheck_total{job="codetrail", service="indexer", reason="no_toolchain"}'
+        values: "0x40"
+      - series: 'codetrail_typecheck_total{job="codetrail", service="indexer", reason="ok"}'
+        values: "0+1x40"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: TypecheckHasNoToolchain
+        exp_alerts: []
+
+  # --------------------------------------------------------------- ratios ---
+  # Five rules, two cases each. The comment on each rule names both numbers.
+
+  # 8 jobs per 15m is the excluded boundary: 2 per 225s is 8/900 exactly.
+  # Half of them failing is 50%, well past >0.25, so only the conjunct can be
+  # deciding this.
+  - name: JobFailureRateHigh will not speak from eight jobs in fifteen minutes
+    interval: 225s
+    input_series:
+      - series: 'codetrail_job_total{job="codetrail", service="indexer", outcome="failed"}'
+        values: "0+1x40"
+      - series: 'codetrail_job_total{job="codetrail", service="indexer", outcome="done"}'
+        values: "0+1x40"
+      - series: 'codetrail_job_total{job="codetrail", service="indexer", outcome="retried"}'
+        values: "0x40"
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: JobFailureRateHigh
+        exp_alerts: []
+
+  # 9 per 15m: 2.25 per 225s. The first admissible sample.
+  - name: JobFailureRateHigh fires at nine
+    interval: 225s
+    input_series:
+      - series: 'codetrail_job_total{job="codetrail", service="indexer", outcome="failed"}'
+        values: "0+2.25x40"
+      - series: 'codetrail_job_total{job="codetrail", service="indexer", outcome="done"}'
+        values: "0x40"
+      - series: 'codetrail_job_total{job="codetrail", service="indexer", outcome="retried"}'
+        values: "0x40"
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: JobFailureRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "100% of indexing jobs are failing terminally"
+              description: "Over 15m. Terminal failures only; retries are counted separately."
+
+  # 20 answers per 5m is the excluded boundary: 4 per minute is 20/300 exactly.
+  # One error in four is 25%, five times the threshold.
+  - name: AnswerErrorRateHigh will not speak from twenty answers in five minutes
+    interval: 1m
+    input_series:
+      - series: 'codetrail_answer_total{job="codetrail", service="gateway", outcome="error"}'
+        values: "0+1x40"
+      - series: 'codetrail_answer_total{job="codetrail", service="gateway", outcome="answered"}'
+        values: "0+3x40"
+      - series: 'codetrail_answer_total{job="codetrail", service="gateway", outcome="refused"}'
+        values: "0x40"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: AnswerErrorRateHigh
+        exp_alerts: []
+
+  - name: AnswerErrorRateHigh fires at twenty-one
+    interval: 1m
+    input_series:
+      - series: 'codetrail_answer_total{job="codetrail", service="gateway", outcome="error"}'
+        values: "0+4.2x40"
+      - series: 'codetrail_answer_total{job="codetrail", service="gateway", outcome="answered"}'
+        values: "0x40"
+      - series: 'codetrail_answer_total{job="codetrail", service="gateway", outcome="refused"}'
+        values: "0x40"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: AnswerErrorRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "/ask error rate above 5%"
+              description: "100% of answers errored over 5m. Not the floor — that is a refusal."
+
+  # 20 answers per 30m is the excluded boundary: 2 per 180s is 20/1800 exactly.
+  # Every one of them refused is 100%, well past >0.6.
+  - name: AnswerRefusalRateHigh will not speak from twenty answers in half an hour
+    interval: 180s
+    input_series:
+      - series: 'codetrail_answer_total{job="codetrail", service="gateway", outcome="refused"}'
+        values: "0+2x40"
+      - series: 'codetrail_answer_total{job="codetrail", service="gateway", outcome="answered"}'
+        values: "0x40"
+      - series: 'codetrail_answer_total{job="codetrail", service="gateway", outcome="error"}'
+        values: "0x40"
+    alert_rule_test:
+      - eval_time: 66m
+        alertname: AnswerRefusalRateHigh
+        exp_alerts: []
+
+  - name: AnswerRefusalRateHigh fires at twenty-one
+    interval: 180s
+    input_series:
+      - series: 'codetrail_answer_total{job="codetrail", service="gateway", outcome="refused"}'
+        values: "0+2.1x40"
+      - series: 'codetrail_answer_total{job="codetrail", service="gateway", outcome="answered"}'
+        values: "0x40"
+      - series: 'codetrail_answer_total{job="codetrail", service="gateway", outcome="error"}'
+        values: "0x40"
+    alert_rule_test:
+      - eval_time: 66m
+        alertname: AnswerRefusalRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "/ask is refusing over 60% of questions"
+              description: "100% refused over 30m. Check codetrail_refusal_total's reason split before touching the floor."
+
+  # 10 submissions per 10m is the excluded boundary: 1 per minute is 10/600
+  # exactly. All of them refused is 100%, twice the threshold.
+  - name: AdmissionRejectionRateHigh will not speak from ten submissions in ten minutes
+    interval: 1m
+    input_series:
+      - series: 'codetrail_admission_total{job="codetrail", service="gateway", outcome="rejected"}'
+        values: "0+1x40"
+      - series: 'codetrail_admission_total{job="codetrail", service="gateway", outcome="accepted"}'
+        values: "0x40"
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: AdmissionRejectionRateHigh
+        exp_alerts: []
+
+  - name: AdmissionRejectionRateHigh fires at eleven
+    interval: 1m
+    input_series:
+      - series: 'codetrail_admission_total{job="codetrail", service="gateway", outcome="rejected"}'
+        values: "0+1.1x40"
+      - series: 'codetrail_admission_total{job="codetrail", service="gateway", outcome="accepted"}'
+        values: "0x40"
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: AdmissionRejectionRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "100% of repository submissions are being refused"
+              description: "Over 10m. codetrail_admission_rejected_total names which rule."
+
+  # 500 edges per hour is the excluded boundary: 25 per 180s is 500/3600
+  # exactly. Nothing resolving at all is 0%, well under <0.02 — and it is also
+  # literally the failure this rule exists for.
+  - name: GraphResolvedRatioLow will not speak from one repository's worth of edges
+    interval: 180s
+    input_series:
+      - series: 'codetrail_graph_edges_total{job="codetrail", service="indexer", provenance="resolved"}'
+        values: "0x60"
+      - series: 'codetrail_graph_edges_total{job="codetrail", service="indexer", provenance="syntactic"}'
+        values: "0+25x60"
+    alert_rule_test:
+      - eval_time: 129m
+        alertname: GraphResolvedRatioLow
+        exp_alerts: []
+
+  - name: GraphResolvedRatioLow fires at five hundred and one
+    interval: 180s
+    input_series:
+      - series: 'codetrail_graph_edges_total{job="codetrail", service="indexer", provenance="resolved"}'
+        values: "0x60"
+      - series: 'codetrail_graph_edges_total{job="codetrail", service="indexer", provenance="syntactic"}'
+        values: "0+25.05x60"
+    alert_rule_test:
+      - eval_time: 129m
+        alertname: GraphResolvedRatioLow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "almost no call edges are resolving (0%)"
+              description: "The graph is effectively all-syntactic while a toolchain is present. Read codetrail_typecheck_total by reason."
+
+  # ------------------------------------------------------------- quantile ---
+  # The must-fire case here is load-bearing beyond its conjunct: it is the only
+  # thing that would have caught a missing `and on()`. An unfireable rule passes
+  # promtool check rules, passes every must-not-fire case there is, and fails
+  # only here.
+
+  # Every observation lands in the (2.5, 5] bucket, so p95 interpolates to
+  # 4.875s, comfortably past >2. 20 retrievals per 5m is the excluded boundary.
+  - name: RetrievalLatencyHigh will not speak from twenty retrievals in five minutes
+    interval: 1m
+    input_series:
+      - series: 'codetrail_retrieval_seconds_bucket{job="codetrail", service="gateway", mode="hybrid", le="1"}'
+        values: "0x40"
+      - series: 'codetrail_retrieval_seconds_bucket{job="codetrail", service="gateway", mode="hybrid", le="2.5"}'
+        values: "0x40"
+      - series: 'codetrail_retrieval_seconds_bucket{job="codetrail", service="gateway", mode="hybrid", le="5"}'
+        values: "0+4x40"
+      - series: 'codetrail_retrieval_seconds_bucket{job="codetrail", service="gateway", mode="hybrid", le="+Inf"}'
+        values: "0+4x40"
+      - series: 'codetrail_retrieval_seconds_count{job="codetrail", service="gateway", mode="hybrid"}'
+        values: "0+4x40"
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: RetrievalLatencyHigh
+        exp_alerts: []
+
+  - name: RetrievalLatencyHigh fires at twenty-one, which is what proves it can fire at all
+    interval: 1m
+    input_series:
+      - series: 'codetrail_retrieval_seconds_bucket{job="codetrail", service="gateway", mode="hybrid", le="1"}'
+        values: "0x40"
+      - series: 'codetrail_retrieval_seconds_bucket{job="codetrail", service="gateway", mode="hybrid", le="2.5"}'
+        values: "0x40"
+      - series: 'codetrail_retrieval_seconds_bucket{job="codetrail", service="gateway", mode="hybrid", le="5"}'
+        values: "0+4.2x40"
+      - series: 'codetrail_retrieval_seconds_bucket{job="codetrail", service="gateway", mode="hybrid", le="+Inf"}'
+        values: "0+4.2x40"
+      - series: 'codetrail_retrieval_seconds_count{job="codetrail", service="gateway", mode="hybrid"}'
+        values: "0+4.2x40"
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: RetrievalLatencyHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              mode: hybrid
+            exp_annotations:
+              summary: "retrieval p95 above 2s on mode=hybrid"
+              description: "p95 is 4.875s over 5m."

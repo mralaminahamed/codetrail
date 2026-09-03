@@ -1,0 +1,211 @@
+groups:
+  - name: codetrail
+    rules:
+      # --- State: a gauge or a scrape, readable with no traffic at all. No
+      # minimum-traffic conjunct, deliberately (spec:275-276). ---
+
+      # Do: the gateway is the whole API; this is an outage, not a monitoring gap.
+      - alert: GatewayDown
+        expr: up{job="codetrail", service="gateway"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "gateway is not scrapeable"
+          description: "Prometheus cannot reach the gateway ({{ $labels.instance }}) for 2m."
+
+      # Do: nothing is being indexed. Submissions still succeed and jobs pile up
+      # in a table nothing is leasing from. This is the "there is a target and it
+      # will not answer" half; IndexerAbsent below is the other half, and which
+      # of the two can fire depends on the scrape file.
+      # Under compose's static_configs a PARKED indexer fires THIS rule, forever;
+      # silence it, or do not park under static discovery.
+      - alert: IndexerDown
+        expr: up{job="codetrail", service="indexer"} == 0
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "indexer is not scrapeable"
+          description: "An indexer target has not answered a scrape for 5m. Jobs are queueing."
+
+      # Do: no indexer exists at all — no task is running, or service discovery
+      # has stopped returning one. `up == 0` cannot see this: under dns_sd_configs
+      # a service scaled to zero has no target and no series, so the only thing
+      # that can speak is absent(). This is the rule that fires in the cloud, and
+      # it is the one an operator silences while the stack is deliberately parked.
+      - alert: IndexerAbsent
+        expr: absent(up{job="codetrail", service="indexer"})
+        for: 10m
+        labels: { severity: critical }
+        annotations:
+          summary: "no indexer is running"
+          description: "Service discovery has returned no indexer target for 10m. Submissions still succeed and nothing is indexing them."
+
+      # Do: the process is listening and Postgres is not answering it. `up` cannot
+      # see this and /health answers 200 by design (health.go). The log names
+      # the dependency.
+      - alert: NotReady
+        expr: codetrail_ready == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.service }} is up but not ready"
+          description: "A readiness dependency has been unreachable for 2m behind a process that is still listening."
+
+      # Do: this is spec:275-276's "unconfigured" state alert, and which side of
+      # P6 the deployment is on decides what it means. Before P6 the floor is a
+      # -1 placeholder and this fires by design. After P6 it means a deployment
+      # is serving an operator's own ANSWER_SCORE_FLOOR, or the placeholder,
+      # rather than the value docs/eval/runs/ measured — which is the failure
+      # nothing else reports, because every answer is still a 200.
+      #
+      # Scoped to the gateway because both processes share the default registry:
+      # the indexer exports this gauge at a permanent 0 that only the gateway
+      # ever sets, so an unscoped rule could never stop firing.
+      - alert: ScoreFloorUncalibrated
+        expr: codetrail_score_floor_calibrated{service="gateway"} == 0
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "the answer score floor is not calibrated"
+          description: "codetrail_score_floor is {{ with query \"codetrail_score_floor\" }}{{ . | first | value }}{{ end }} and nothing this project measured produced it. Expected while P6 is unlanded; afterwards it means the deployment is not serving the calibrated value."
+
+      # --- Counts: not ratios, so no conjunct — but note they are rates over a
+      # counter and therefore, unlike the state rules above, CANNOT fire with no
+      # traffic. They are a third category and are tested as one. ---
+
+      # Do: the indexer cannot find a go binary, so every edge it writes is
+      # syntactic and every HTTP response is still a 200 — the silent downgrade
+      # README:540 warns P8 about. Check the image, then `command -v go` in the
+      # running task. A count and not a ratio, so no conjunct: one job that
+      # cannot type-check is already the whole story.
+      #
+      # for: 10m against a [15m] window is deliberate — at for: 15m a single
+      # job's rate stays non-zero for exactly the window length and the rule
+      # sits on its own boundary, so it would take two jobs to fire reliably.
+      - alert: TypecheckHasNoToolchain
+        expr: sum(rate(codetrail_typecheck_total{reason="no_toolchain"}[15m])) > 0
+        for: 10m
+        labels: { severity: critical }
+        annotations:
+          summary: "the indexer has no Go toolchain"
+          description: "Jobs are completing with reason=no_toolchain. The graph is all-syntactic and nothing else reports it."
+
+      # --- Ratios. Every one carries its minimum-traffic conjunct.
+      #
+      # Unscoped, deliberately: the other process contributes a constant zero to
+      # every one of these counters and rate() of a constant is zero. ---
+
+      # Do: check the indexer log for the failure reason, then the clone caps and
+      # the deadline. Traffic: more than 8 jobs per 15m, roughly a saturated
+      # worker at the ~2.5 minutes README measures for rs/zerolog. The conjunct
+      # is strict, so eight is excluded outright and nine is the first sample
+      # this rule will speak from: at nine, two failures is 22.2% and does not
+      # clear >0.25; three is 33.3% and does.
+      - alert: JobFailureRateHigh
+        expr: |
+          sum(rate(codetrail_job_total{outcome="failed"}[15m]))
+            / sum(rate(codetrail_job_total[15m])) > 0.25
+          and sum(rate(codetrail_job_total[15m])) > 8 / 900
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of indexing jobs are failing terminally"
+          description: "Over 15m. Terminal failures only; retries are counted separately."
+
+      # Do: this is infrastructure, not a corpus gap — refusals are a separate
+      # outcome (spec:262-263). Check Postgres and the embedder.
+      # Traffic: more than 20 answers per 5m. The conjunct is strict, so the
+      # first admissible sample is 21, where one error is 4.8% and does not
+      # clear >0.05; two is 9.5% and does. No single failed answer can page.
+      - alert: AnswerErrorRateHigh
+        expr: |
+          sum(rate(codetrail_answer_total{outcome="error"}[5m]))
+            / sum(rate(codetrail_answer_total[5m])) > 0.05
+          and sum(rate(codetrail_answer_total[5m])) > 20 / 300
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "/ask error rate above 5%"
+          description: "{{ $value | humanizePercentage }} of answers errored over 5m. Not the floor — that is a refusal."
+
+      # Do: read codetrail_refusal_total's reason split first. Until P6 the floor
+      # is a placeholder, so below_floor should be zero and every refusal should
+      # be no_spans or unscored — a corpus gap, not a threshold. After P6 the
+      # split tells floor drift from a missing corpus.
+      # Traffic: more than 20 answers per 30m — a majority-refusal reading has
+      # to be more than two questions before it means anything. First
+      # admissible sample 21, where twelve refusals is 57.1% and does not clear
+      # >0.6 and thirteen is 61.9% and does.
+      - alert: AnswerRefusalRateHigh
+        expr: |
+          sum(rate(codetrail_answer_total{outcome="refused"}[30m]))
+            / sum(rate(codetrail_answer_total[30m])) > 0.6
+          and sum(rate(codetrail_answer_total[30m])) > 20 / 1800
+        for: 30m
+        labels: { severity: warning }
+        annotations:
+          summary: "/ask is refusing over 60% of questions"
+          description: "{{ $value | humanizePercentage }} refused over 30m. Check codetrail_refusal_total's reason split before touching the floor."
+
+      # Do: someone is submitting URLs the allowlist refuses. rule=host at volume
+      # is either a client pointed at the wrong forge or somebody probing for an
+      # SSRF (spec:126-130). Check the rule split before assuming either.
+      # Traffic: more than 10 submissions per 10m. First admissible sample 11,
+      # where five rejections is 45.5% and does not clear >0.5 and six is 54.5%
+      # and does.
+      - alert: AdmissionRejectionRateHigh
+        expr: |
+          sum(rate(codetrail_admission_total{outcome="rejected"}[10m]))
+            / sum(rate(codetrail_admission_total[10m])) > 0.5
+          and sum(rate(codetrail_admission_total[10m])) > 10 / 600
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of repository submissions are being refused"
+          description: "Over 10m. codetrail_admission_rejected_total names which rule."
+
+      # Do: the toolchain is present but resolving almost nothing. Check
+      # codetrail_typecheck_total's reason split — load_error and no_module are
+      # ordinary for repositories with third-party imports under GOPROXY=off, and
+      # deadline means the job budget is too small.
+      # The floor is 2% against a measured baseline of just under 12.5% on
+      # rs/zerolog. That baseline is a measurement, not a target (README).
+      # Traffic: more than 500 edges per hour, roughly one repository's worth.
+      # First admissible sample 501, where ten resolved edges is 2.0% and does
+      # not clear <0.02 and nine is 1.8% and does.
+      - alert: GraphResolvedRatioLow
+        expr: |
+          sum(rate(codetrail_graph_edges_total{provenance="resolved"}[1h]))
+            / sum(rate(codetrail_graph_edges_total[1h])) < 0.02
+          and sum(rate(codetrail_graph_edges_total[1h])) > 500 / 3600
+        for: 1h
+        labels: { severity: warning }
+        annotations:
+          summary: "almost no call edges are resolving ({{ $value | humanizePercentage }})"
+          description: "The graph is effectively all-syntactic while a toolchain is present. Read codetrail_typecheck_total by reason."
+
+      # --- A quantile: a fourth category, and it gets a conjunct anyway. Note
+      # `and on()`: the left side carries a `mode` label and the right side is a
+      # bare sum with none, and PromQL's `and` matches on the FULL label set — so
+      # without `on()` the intersection is always empty and the rule can never
+      # fire. It parses, and promtool check rules passes, which is exactly why
+      # the must-fire case in alerts_test.yml is what actually proves this rule
+      # works. ---
+
+      # Do: retrieval is one embed plus one or two SQL arms. Compare against the
+      # mode label: hybrid running long while lexical is fast is the vector arm
+      # or the embedder.
+      # The conjunct is here for a different reason than the ratios': the alert
+      # is not a proportion, but histogram_quantile interpolates within the
+      # highest bucket that moved, so on two observations in five minutes it
+      # reports a bucket boundary rather than a latency.
+      - alert: RetrievalLatencyHigh
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le, mode) (rate(codetrail_retrieval_seconds_bucket[5m]))) > 2
+          and on() sum(rate(codetrail_retrieval_seconds_count[5m])) > 20 / 300
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "retrieval p95 above 2s on mode={{ $labels.mode }}"
+          description: "p95 is {{ $value | humanizeDuration }} over 5m."
