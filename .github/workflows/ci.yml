@@ -113,6 +113,26 @@ jobs:
       - name: image assertions
         run: ./infra/image_test.sh
 
+      # The whole path, against the images built above: admission refuses an
+      # unlisted forge, a real public repository indexes end to end, call edges
+      # resolve, and a citation names the commit that was indexed.
+      #
+      # EMBED_PROVIDER=fake, said explicitly. Step 6 indexes a real repository
+      # and something has to embed it; the alternative under compose is an
+      # Ollama plus a ~274 MB model pull on every pull request. It is the same
+      # choice the live suites already make, and it is banned only in the cloud,
+      # where meaningless retrieval would sit behind a wall of 200s. Nothing
+      # this asserts depends on embedding quality: edges_resolved depends on the
+      # Go toolchain and the citation check on the commit, not on the ranking.
+      - name: smoke test over compose
+        env:
+          EMBED_PROVIDER: fake
+        run: |
+          docker tag codetrail/gateway:test codetrail/gateway:dev
+          docker tag codetrail/indexer:test codetrail/indexer:dev
+          docker compose -f infra/docker-compose.yml --profile apps up -d --no-build
+          ./infra/smoke.sh --target compose http://localhost:8080
+
       - name: live datastore tests
         env:
           EMBED_PROVIDER: fake
