@@ -138,7 +138,7 @@ func TestTheArtefactSaysWhatItIsOnEverySurface(t *testing.T) {
 			banner  string
 			dir     string
 			name    string
-		}{tc.quality, "", tc.dir, "2026-09-03-rs-zerolog-" + tc.model + ".json"}
+		}{tc.quality, "", tc.dir, "2026-09-03-rs-zerolog-hybrid-" + tc.model + ".json"}
 		if tc.banner {
 			want.banner = Banner
 		}
@@ -382,5 +382,28 @@ func TestTheTopScoreQuantilesAreTheDistributionTheFloorIsReadOff(t *testing.T) {
 	empty := quantiles(nil)
 	if empty.N != 0 || empty.Min != nil || empty.Max != nil {
 		t.Errorf("an empty distribution gave %+v", empty)
+	}
+}
+
+// One repository produces one run per mode on one day, and spec:316 makes the
+// three modes the experiment. A filename without the mode has them overwrite
+// each other — found by running the measurement, where three runs left one
+// file.
+func TestTheFilenameSeparatesTheThreeModes(t *testing.T) {
+	seen := map[string]string{}
+	for _, m := range []rag.Mode{rag.ModeHybrid, rag.ModeVector, rag.ModeLexical} {
+		r := sampleRun()
+		r.Retrieval.Mode = m
+		name := r.Name()
+		if prev, dup := seen[name]; dup {
+			t.Fatalf("mode %q and mode %q both write %s", m, prev, name)
+		}
+		seen[name] = string(m)
+		if !strings.Contains(name, string(m)) {
+			t.Errorf("the filename for mode %q is %s", m, name)
+		}
+	}
+	if len(seen) != 3 {
+		t.Errorf("three modes produced %d filenames", len(seen))
 	}
 }

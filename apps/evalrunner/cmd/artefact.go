@@ -128,11 +128,16 @@ func (r Run) Dir() string {
 	return DirMechanics
 }
 
-// Name is the fourth: the embed model is in the filename, because it is the
-// single fact that decides whether the file is a measurement.
+// Name is the fourth surface: the embed model is in the filename, because it
+// is the single fact that decides whether the file is a measurement.
+//
+// The mode is in it too, and that is not decoration — spec:316 makes the three
+// modes an experiment, so one repository produces three runs on one day, and a
+// name without the mode would have them overwrite each other. Found by running
+// the measurement, not by reading the code.
 func (r Run) Name() string {
-	return fmt.Sprintf("%s-%s-%s.json",
-		r.StartedAt.UTC().Format("2006-01-02"), slug(r.Remote), r.Retrieval.EmbedModel)
+	return fmt.Sprintf("%s-%s-%s-%s.json",
+		r.StartedAt.UTC().Format("2006-01-02"), slug(r.Remote), r.Retrieval.Mode, r.Retrieval.EmbedModel)
 }
 
 // Write seals the run and writes it under out.
