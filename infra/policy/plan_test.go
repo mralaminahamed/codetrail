@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -15,7 +16,7 @@ import (
 // The resource count is a literal a reviewer has to change deliberately. A
 // resource added without noticing is then a failing test with a number in it,
 // which is the cheapest guard there is against a hand-edited stack.
-const plannedResources = 10
+const plannedResources = 34
 
 func TestNoSecurityGroupIngressIsOpenToTheWorld(t *testing.T) {
 	p := load(t)
@@ -84,6 +85,13 @@ func TestThePlanIsCreateOnlyFromEmptyState(t *testing.T) {
 	p := load(t)
 	var create, other int
 	for _, c := range p.ResourceChanges {
+		// A data source is read at plan time, not created. The only one here is
+		// aws_iam_policy_document, which the provider renders locally;
+		// TestThePlanContainsNoDataSourceThatCallsTheAWSAPI is what keeps that
+		// true.
+		if c.Mode == "data" {
+			continue
+		}
 		switch {
 		case slices.Equal(c.Change.Actions, []string{"create"}):
 			create++
@@ -131,16 +139,22 @@ func TestTwoPlansOfTheSameConfigurationAreIdentical(t *testing.T) {
 	}
 }
 
-// canonical is the plan with the two sections Terraform itself does not emit
-// deterministically removed, re-marshalled so map ordering cannot matter.
+// canonical is the plan reduced to what this configuration actually decides.
 //
-// Both exclusions are measured rather than assumed, and neither is a loose
-// diff: `timestamp` is when show ran, and `relevant_attributes` — which records
-// which attributes the plan depends on and which nothing here reads — came back
-// in a different order on two consecutive runs of the same configuration on
-// terraform 1.9.8. Everything an assertion in this package reads is compared in
-// full, so a second non-deterministic field is a failure rather than an
-// exemption.
+// `terraform show -json` is NOT byte-stable across two plans of one
+// configuration on terraform 1.9.8, in three places, all measured rather than
+// assumed:
+//
+//   - timestamp is when show ran.
+//   - relevant_attributes, which records which attributes the plan depends on
+//     and which nothing here reads, comes back reordered.
+//   - configuration.*.expressions.*.references comes back reordered — three
+//     consecutive plans gave three different orders for one ingress block. That
+//     one is inside a section these assertions DO read, so it is normalised by
+//     sorting rather than dropped.
+//
+// Everything else is compared in full, so a fourth non-deterministic field is a
+// failure rather than an exemption.
 func canonical(t *testing.T, raw []byte) string {
 	t.Helper()
 	var m map[string]any
@@ -149,11 +163,35 @@ func canonical(t *testing.T, raw []byte) string {
 	}
 	delete(m, "timestamp")
 	delete(m, "relevant_attributes")
+	sortReferences(m)
 	out, err := json.Marshal(m)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return string(out)
+}
+
+func sortReferences(v any) {
+	switch t := v.(type) {
+	case map[string]any:
+		for k, child := range t {
+			if k == "references" {
+				if list, ok := child.([]any); ok {
+					sort.Slice(list, func(i, j int) bool {
+						a, _ := list[i].(string)
+						b, _ := list[j].(string)
+						return a < b
+					})
+					continue
+				}
+			}
+			sortReferences(child)
+		}
+	case []any:
+		for _, child := range t {
+			sortReferences(child)
+		}
+	}
 }
 
 // Three artifacts hold this stack's secrets in cleartext: the plan file, the
