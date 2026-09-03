@@ -3,9 +3,6 @@
 @theme {
   --color-ink: oklch(0.22 0.02 260);
   --color-paper: oklch(0.99 0.003 260);
-  --color-rule: oklch(0.88 0.01 260);
-  --color-quiet: oklch(0.45 0.02 260);
-  --color-alarm: oklch(0.45 0.19 25);
 }
 
 /* Off-screen until focused: a skip link that is always visible is a link
@@ -22,4 +19,26 @@
 }
 .skip:focus {
   left: 0;
+}
+
+/* WCAG 1.4.10 reflow. Measured at 320px before this existed: scrollWidth 3409
+   against a 320px viewport, from 40-char commit SHAs, 64-char digests and the
+   git show | sha256sum command. The body must never scroll horizontally; wide
+   content scrolls inside its own box instead. */
+pre {
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+/* An inline code span is a digest or a SHA — one unbreakable token. It wraps,
+   because a horizontal scrollbar per digest is worse than a wrapped digest,
+   and copy-paste is unaffected by where it wraps. */
+:not(pre) > code {
+  overflow-wrap: anywhere;
+}
+
+/* The tuple's values are the long ones and they sit in a dd. */
+dd {
+  overflow-wrap: anywhere;
+  min-width: 0;
 }
