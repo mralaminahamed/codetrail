@@ -1,0 +1,15 @@
+package exported
+
+// Store is a keyed store.
+type Store struct{}
+
+// Get returns the value at k.
+func (s *Store) Get(k string) int { return 0 }
+
+// get reads without the lock and is not part of the API.
+func (s *Store) get(k string) int { return 0 }
+
+type cache struct{}
+
+// Helper is exported but its receiver is not, so neither check admits it.
+func (c *cache) Helper() int { return 0 }
