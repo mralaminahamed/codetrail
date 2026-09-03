@@ -14,6 +14,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -45,6 +46,12 @@ type flags struct {
 	// takes one: §9 asks for a deterministic run, and two runs over one corpus
 	// have to be comparable byte for byte rather than only in their averages.
 	now time.Time
+	// log is where the per-arm progress lines go. A seam, because "the runner
+	// refused before it retrieved" is otherwise unobservable: a mutant that
+	// probes after retrieving but before writing leaves no artefact either, so
+	// an assertion on the missing file cannot tell the two apart. Measured —
+	// that mutant survived until this existed.
+	log io.Writer
 }
 
 func main() {
@@ -65,7 +72,7 @@ func main() {
 	flag.StringVar(&f.astCounters, "ast-counters", "", "the AST arm's indexer counters, e.g. vanished=0,unstrippable=0,tokenless=3,unparsed=0")
 	flag.StringVar(&f.windowCounters, "window-counters", "", "the window arm's indexer counters")
 	flag.Parse()
-	f.now = time.Now().UTC()
+	f.now, f.log = time.Now().UTC(), os.Stderr
 
 	if err := run(context.Background(), f); err != nil {
 		fmt.Fprintln(os.Stderr, "evalrunner: "+err.Error())
@@ -74,6 +81,9 @@ func main() {
 }
 
 func run(ctx context.Context, f flags) error {
+	if f.log == nil {
+		f.log = io.Discard
+	}
 	for _, req := range []struct{ name, v string }{
 		{"-ast-dsn", f.astDSN}, {"-window-dsn", f.windowDSN},
 		{"-repo", f.repo}, {"-src", f.src}, {"-commit", f.commit},
@@ -179,7 +189,7 @@ func run(ctx context.Context, f flags) error {
 			return cerr
 		}
 		run.ArmConfig = append(run.ArmConfig, ac)
-		fmt.Fprintf(os.Stderr, "%s: %d cases, %d unscoreable, MRR %v, spans %d\n",
+		fmt.Fprintf(f.log, "%s: %d cases, %d unscoreable, MRR %v, spans %d\n",
 			res.Name, res.Summary.Cases, res.Summary.Unscoreable, res.Summary.MRR, res.Summary.Spans)
 	}
 
@@ -187,7 +197,7 @@ func run(ctx context.Context, f flags) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(os.Stderr, "wrote "+path)
+	fmt.Fprintln(f.log, "wrote "+path)
 	return nil
 }
 
