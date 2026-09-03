@@ -145,10 +145,12 @@ func Verify(ctx context.Context, a, b Arm, src map[string]string) (Report, error
 		return rep, err
 	}
 	// The same evidence, pointed at the third party nobody was checking.
+	//
+	// Against one arm, not both: the comparison above proves the two arms hold
+	// identical (path, blob) maps, so src == A implies src == B. A second call
+	// here is a check no fixture can fail — measured, deleting it left every
+	// test green — and a check that proves nothing is worse than none.
 	if err := sameBytes("-src", src, a.Name, af, ErrSourceMismatch); err != nil {
-		return rep, err
-	}
-	if err := sameBytes("-src", src, b.Name, bf, ErrSourceMismatch); err != nil {
 		return rep, err
 	}
 

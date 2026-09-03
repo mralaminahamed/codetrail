@@ -406,3 +406,83 @@ func TestAFailedArtefactWriteIsReportedAndNotSwallowed(t *testing.T) {
 		t.Error("Write into a path that is a file returned no error")
 	}
 }
+
+// The lenient and strict ranks are different quantities, and every fixture
+// with one gold span per case makes them agree by accident. Measured: with
+// gold sets of size one everywhere, computing the lenient MRR from the strict
+// rank left every test green.
+func TestTheLenientAndStrictRanksAreDifferentQuantities(t *testing.T) {
+	cs, spans := ladder()
+	// Lines 5-29 clip s1 (5 lines of overlap) and cover s2 and s3 (9 each), so
+	// the lenient gold set is {s1,s2,s3} at ranks 1,2,3 and the strict one is
+	// s2 — the largest overlap, ties broken by the lower start line.
+	res := runOne(t, arm(t, "ast", rag.ModeHybrid, &searcher{vector: cs}, spans),
+		[]golden.Case{caseAt("c", 5, 29)}, cfg())
+	r := res.Cases[0]
+	if len(r.GoldLenient) != 3 {
+		t.Fatalf("the lenient gold set is %v, want three spans", r.GoldLenient)
+	}
+	if r.GoldStrict != "s2" {
+		t.Fatalf("the strict gold span is %q, want s2", r.GoldStrict)
+	}
+	if r.GoldRank != 1 || r.GoldRankStrict != 2 {
+		t.Errorf("ranks are lenient %d and strict %d, want 1 and 2", r.GoldRank, r.GoldRankStrict)
+	}
+	if res.Summary.MRR != 1 || res.Summary.MRRStrict != 0.5 {
+		t.Errorf("MRR is %v lenient and %v strict, want 1 and 0.5", res.Summary.MRR, res.Summary.MRRStrict)
+	}
+	want := []HitRate{{K: 1, Lenient: 1, Strict: 0}, {K: 5, Lenient: 1, Strict: 1}, {K: 10, Lenient: 1, Strict: 1}}
+	if !reflect.DeepEqual(res.Summary.HitAt, want) {
+		t.Errorf("hit rates are %+v, want %+v", res.Summary.HitAt, want)
+	}
+	if res.Summary.MeanGoldLenient != 3 {
+		t.Errorf("the mean lenient gold-set size is %v, want 3", res.Summary.MeanGoldLenient)
+	}
+}
+
+// A short result records a short length. Without this the recorded length is a
+// side effect nothing reads back, and a truncated list is indistinguishable
+// from a corpus that had nothing more to give.
+func TestARecordsRankedLengthIsTheListAndNotTheLimit(t *testing.T) {
+	cs, spans := ladder()
+	res := runOne(t, arm(t, "ast", rag.ModeHybrid, &searcher{vector: cs[:3]}, spans),
+		[]golden.Case{caseAt("a", 1, 9)}, cfg())
+	r := res.Cases[0]
+	if r.Limit != 10 {
+		t.Fatalf("the limit is %d; this fixture needs a limit the corpus cannot fill", r.Limit)
+	}
+	if r.RankedLen != 3 || len(r.Ranked) != 3 {
+		t.Errorf("ranked length is %d over a list of %d, want 3 and 3", r.RankedLen, len(r.Ranked))
+	}
+}
+
+// The sweep's floor list has to be able to land on the value the criterion
+// selects. A step that skipped most of the cosine range would make the
+// calibration unable to recommend a number the code could then ship.
+func TestTheDefaultFloorListCoversTheCosineRangeAtAHundredth(t *testing.T) {
+	got, err := parseFloors("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 201 {
+		t.Errorf("the default sweep has %d floors, want 201: -1 to 1 at a hundredth", len(got))
+	}
+	if got[0] != -1 || got[len(got)-1] != 1 {
+		t.Errorf("the sweep runs from %v to %v, want -1 to 1", got[0], got[len(got)-1])
+	}
+	have := map[float64]bool{}
+	for _, f := range got {
+		have[f] = true
+	}
+	// Every hundredth in the range a real cosine distribution falls in.
+	for _, want := range []float64{-1, 0, 0.5, 0.61, 0.66, 0.7, 0.74, 1} {
+		if !have[want] {
+			t.Errorf("the sweep never lands on %v", want)
+		}
+	}
+	// And an explicit list is taken verbatim.
+	explicit, err := parseFloors("0.1, 0.2")
+	if err != nil || !reflect.DeepEqual(explicit, []float64{0.1, 0.2}) {
+		t.Errorf("parseFloors(\"0.1, 0.2\") gave %v, %v", explicit, err)
+	}
+}

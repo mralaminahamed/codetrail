@@ -321,3 +321,66 @@ func caseCount(r Run) int {
 	}
 	return n
 }
+
+// The recorded cosine is the quantity the floor is calibrated on, so the
+// artefact has to carry it to the last digit. Measured: rounding it to four
+// significant figures left every other test green, and two runs differing in
+// the fifth digit would then compare equal.
+func TestTheArtefactRoundTripsEveryScoreExactly(t *testing.T) {
+	r := sampleRun()
+	// A float32 cosine widened to float64, and a fused score that is a sum of
+	// two reciprocals: neither is a short decimal.
+	top := float64(float32(0.72))
+	fused := 1.0/61.0 + 1.0/62.0
+	r.Arms[0].Cases[0].TopScore = &top
+	r.Arms[0].Cases[0].FusedTop = &fused
+	_, b, back := write(t, r)
+
+	got := back.Arms[0].Cases[0]
+	if got.TopScore == nil || *got.TopScore != top {
+		t.Errorf("top score came back %v, want %v exactly", got.TopScore, top)
+	}
+	if got.FusedTop == nil || *got.FusedTop != fused {
+		t.Errorf("fused score came back %v, want %v exactly", got.FusedTop, fused)
+	}
+	// And the digits are in the file, not merely recovered by chance.
+	for _, want := range []string{"0.7200000286102295", "0.03252247488101533"} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("the artefact does not contain %s; a shortened float is a run two others cannot be compared against", want)
+		}
+	}
+}
+
+// The quantiles are what a reader reads the floor off, and nothing else in the
+// harness reads them back.
+func TestTheTopScoreQuantilesAreTheDistributionTheFloorIsReadOff(t *testing.T) {
+	// Eleven values, so every quantile lands on a distinct one: min 0.10,
+	// p10 0.20, median 0.60, p90 1.00, max 1.10. Index = p*(n-1), so p10 is
+	// index 1 and p90 is index 9.
+	var xs []float64
+	for i := 1; i <= 11; i++ {
+		xs = append(xs, float64(i)/10)
+	}
+	got := quantiles(xs)
+	for _, c := range []struct {
+		name string
+		got  *float64
+		want float64
+	}{
+		{"min", got.Min, 0.1}, {"p10", got.P10, 0.2}, {"median", got.Median, 0.6},
+		{"p90", got.P90, 1.0}, {"max", got.Max, 1.1},
+	} {
+		if c.got == nil || *c.got != c.want {
+			t.Errorf("%s is %v, want %v", c.name, c.got, c.want)
+		}
+	}
+	if got.N != 11 {
+		t.Errorf("N is %d, want 11", got.N)
+	}
+	// An empty distribution has no quantiles rather than five zeros: zero is a
+	// real cosine similarity.
+	empty := quantiles(nil)
+	if empty.N != 0 || empty.Min != nil || empty.Max != nil {
+		t.Errorf("an empty distribution gave %+v", empty)
+	}
+}
