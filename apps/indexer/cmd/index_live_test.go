@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/mralaminahamed/codetrail/apps/indexer/internal/clone"
-	"github.com/mralaminahamed/codetrail/apps/indexer/internal/walk"
 	"github.com/mralaminahamed/codetrail/packages/shared/chunk"
 	"github.com/mralaminahamed/codetrail/packages/shared/embed"
 	"github.com/mralaminahamed/codetrail/packages/shared/jobs"
@@ -25,6 +24,7 @@ import (
 	"github.com/mralaminahamed/codetrail/packages/shared/store"
 	"github.com/mralaminahamed/codetrail/packages/shared/symbols"
 	"github.com/mralaminahamed/codetrail/packages/shared/testdb"
+	"github.com/mralaminahamed/codetrail/packages/shared/walk"
 )
 
 // scratchDSN names a database this suite creates for itself.
@@ -530,7 +530,7 @@ func TestIndexProducesTheExpectedSpansLive(t *testing.T) {
 		if got.Path != w.Path || got.Lang != w.Lang || got.Lines != w.Lines {
 			t.Errorf("file row %d: got %+v, want %+v", i, got, w)
 		}
-		if want := blobHash(fixtureBytes(t, w.Path)); got.Blob != want {
+		if want := store.BlobHash(fixtureBytes(t, w.Path)); got.Blob != want {
 			t.Errorf("%s: blob %s, want git's %s", w.Path, got.Blob, want)
 		}
 	}

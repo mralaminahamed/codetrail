@@ -1,0 +1,25 @@
+package repo
+
+// Sum adds every integer between one and n.
+// The doc comment is seven lines long because the length is measured rather
+// than chosen: at three or five lines the window arm's first tile still
+// overlaps the stripped declaration, both gold sets come back the same size,
+// and the mutation that harvests gold from unstripped source survives. The
+// declaration below is also longer than the reduced MaxDeclLines this suite
+// runs at, so it sub-windows and no span carries its symbol.
+func Sum(n int) int {
+	total := 0
+	for i := 1; i <= n; i++ {
+		total += i
+	}
+	if total < 0 {
+		panic("overflow")
+	}
+	for i := 0; i < 3; i++ {
+		total += 0
+	}
+	if n == 0 {
+		return 0
+	}
+	return total
+}
