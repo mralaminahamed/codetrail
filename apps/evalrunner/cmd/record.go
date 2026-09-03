@@ -102,12 +102,17 @@ type Quantiles struct {
 // because a smaller haystack is easier; the unscoreable count, because those
 // cases are in no denominator.
 type Summary struct {
-	Cases           int     `json:"cases"`
-	Unscoreable     int     `json:"unscoreable"`
-	Spans           int     `json:"spans"`
-	FilesWithSpans  int     `json:"files_with_spans"`
+	Cases          int `json:"cases"`
+	Unscoreable    int `json:"unscoreable"`
+	Spans          int `json:"spans"`
+	FilesWithSpans int `json:"files_with_spans"`
+	// MeanGoldLenient is beside every metric because the lenient rule is not
+	// neutral: a 100-line declaration is one AST span and three windows, so it
+	// hands a tiling arm three chances. There is no strict counterpart — the
+	// strict gold set is exactly one span whenever the lenient one is
+	// non-empty, so its mean is 1 by construction and would be a field that
+	// cannot vary.
 	MeanGoldLenient float64 `json:"mean_gold_lenient"`
-	MeanGoldStrict  float64 `json:"mean_gold_strict"`
 	MovedCases      int     `json:"moved_cases"`
 	GroupedCases    int     `json:"grouped_cases"`
 
@@ -138,7 +143,7 @@ type Summary struct {
 func summarise(records []CaseRecord, ks []int, floor rag.Floor, floors []float64, applicable bool) Summary {
 	s := Summary{Cases: len(records), FloorApplicable: applicable}
 	var rr, rrStrict []float64
-	var goldLen, goldStrict []float64
+	var goldLen []float64
 	var tops []float64
 	hits := make([]struct{ lenient, strict int }, len(ks))
 
@@ -154,9 +159,6 @@ func summarise(records []CaseRecord, ks []int, floor rag.Floor, floors []float64
 			continue
 		}
 		goldLen = append(goldLen, float64(len(r.GoldLenient)))
-		if r.GoldStrict != "" {
-			goldStrict = append(goldStrict, 1)
-		}
 		rr = append(rr, reciprocal(r.GoldRank))
 		rrStrict = append(rrStrict, reciprocal(r.GoldRankStrict))
 		if v := value(r.TopScore); !math.IsNaN(v) {
@@ -191,7 +193,6 @@ func summarise(records []CaseRecord, ks []int, floor rag.Floor, floors []float64
 	s.MRR = metric.MeanOverAll(rr)
 	s.MRRStrict = metric.MeanOverAll(rrStrict)
 	s.MeanGoldLenient = metric.MeanOverAll(goldLen)
-	s.MeanGoldStrict = metric.MeanOverAll(goldStrict)
 	s.TopScore = quantiles(tops)
 
 	outcomes := make([]metric.Outcome, 0, len(records))
