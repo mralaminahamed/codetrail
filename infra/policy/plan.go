@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -254,6 +255,12 @@ func (c ConfigResource) references(field string) []string {
 		if !ok {
 			continue
 		}
+		// Resource references only: an expression that also reads a local or a
+		// variable records those here too, and they are not what "which
+		// security group does this name" is asking about.
+		if !strings.HasPrefix(s, "aws_") && !strings.HasPrefix(s, "data.aws_") {
+			continue
+		}
 		if strings.Count(s, ".") >= 2 {
 			s = s[:strings.LastIndex(s, ".")]
 		}
@@ -261,6 +268,11 @@ func (c ConfigResource) references(field string) []string {
 			out = append(out, s)
 		}
 	}
+	// Sorted, because Terraform does not emit this list in a stable order.
+	// Measured across three consecutive plans of one configuration: the same
+	// ingress block's references came back in three different orders. An
+	// assertion comparing an unsorted slice would flake.
+	sort.Strings(out)
 	return out
 }
 
@@ -289,4 +301,138 @@ func (p *Plan) stringList(t *testing.T, name string) []string {
 		out = append(out, s)
 	}
 	return out
+}
+
+// Container is one entry of a task definition's container_definitions. The
+// whole reason it is readable at plan time is that local.image is built from
+// variables: one unknown field inside the jsonencode makes the entire string
+// unknown, and then nothing below can be asserted at all.
+type Container struct {
+	Name                   string            `json:"name"`
+	Image                  string            `json:"image"`
+	User                   string            `json:"user"`
+	ReadonlyRootFilesystem bool              `json:"readonlyRootFilesystem"`
+	Environment            []NameValue       `json:"environment"`
+	Secrets                []NameValueFrom   `json:"secrets"`
+	MountPoints            []MountPoint      `json:"mountPoints"`
+	PortMappings           []PortMapping     `json:"portMappings"`
+	HealthCheck            *HealthCheck      `json:"healthCheck"`
+	LinuxParameters        *LinuxParameters  `json:"linuxParameters"`
+	LogConfiguration       *LogConfiguration `json:"logConfiguration"`
+}
+
+type NameValue struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+type NameValueFrom struct {
+	Name      string `json:"name"`
+	ValueFrom string `json:"valueFrom"`
+}
+
+type MountPoint struct {
+	SourceVolume  string `json:"sourceVolume"`
+	ContainerPath string `json:"containerPath"`
+	ReadOnly      bool   `json:"readOnly"`
+}
+
+type PortMapping struct {
+	ContainerPort int    `json:"containerPort"`
+	Protocol      string `json:"protocol"`
+}
+
+type HealthCheck struct {
+	Command []string `json:"command"`
+}
+
+type LinuxParameters struct {
+	Capabilities struct {
+		Drop []string `json:"drop"`
+	} `json:"capabilities"`
+	InitProcessEnabled bool `json:"initProcessEnabled"`
+}
+
+type LogConfiguration struct {
+	LogDriver string            `json:"logDriver"`
+	Options   map[string]string `json:"options"`
+}
+
+// TaskDefinition is one aws_ecs_task_definition, with its containers decoded.
+type TaskDefinition struct {
+	Address string
+	Service string
+	// TaskRoleARN is read from planned_values and is a top-level field, so it
+	// is visible even when container_definitions is not. It is the ambient
+	// credential no environment assertion could ever see: ECS injects
+	// AWS_CONTAINER_CREDENTIALS_RELATIVE_URI at runtime, not here.
+	TaskRoleARN any
+	Containers  []Container
+	Volumes     []string
+}
+
+// taskDefinitions decodes every task definition in the plan, failing rather
+// than skipping when container_definitions came back unknown — an assertion
+// that silently has nothing to read is the defect this package exists to catch.
+func (p *Plan) taskDefinitions(t *testing.T) []TaskDefinition {
+	t.Helper()
+	var out []TaskDefinition
+	for _, r := range p.resources("aws_ecs_task_definition") {
+		td := TaskDefinition{Address: r.Address, TaskRoleARN: r.Values["task_role_arn"]}
+		if s, ok := r.Values["family"].(string); ok {
+			td.Service = s[strings.LastIndex(s, "-")+1:]
+		}
+		raw, ok := r.Values["container_definitions"].(string)
+		if !ok {
+			t.Fatalf("%s container_definitions is unknown at plan time; every assertion about what is inside this container would be vacuous. Something in it interpolates an attribute apply decides.", r.Address)
+		}
+		if err := json.Unmarshal([]byte(raw), &td.Containers); err != nil {
+			t.Fatalf("%s container_definitions is not JSON: %v", r.Address, err)
+		}
+		for _, v := range asSlice(r.Values["volume"]) {
+			if m, ok := v.(map[string]any); ok {
+				if n, ok := m["name"].(string); ok {
+					td.Volumes = append(td.Volumes, n)
+				}
+			}
+		}
+		out = append(out, td)
+	}
+	if len(out) == 0 {
+		t.Fatal("the plan has no task definitions")
+	}
+	return out
+}
+
+func (t TaskDefinition) envNames() []string {
+	var out []string
+	for _, c := range t.Containers {
+		for _, e := range c.Environment {
+			out = append(out, e.Name)
+		}
+	}
+	return out
+}
+
+func (t TaskDefinition) env(name string) (string, bool) {
+	for _, c := range t.Containers {
+		for _, e := range c.Environment {
+			if e.Name == name {
+				return e.Value, true
+			}
+		}
+	}
+	return "", false
+}
+
+// taskDefinition returns the one task definition for a service, or fails.
+func (p *Plan) taskDefinition(t *testing.T, service string) TaskDefinition {
+	t.Helper()
+	for _, td := range p.taskDefinitions(t) {
+		if td.Service == service {
+			return td
+		}
+	}
+	t.Fatalf("no task definition for %s", service)
+	return TaskDefinition{}
 }

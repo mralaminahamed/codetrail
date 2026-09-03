@@ -92,3 +92,179 @@ resource "aws_security_group" "alb" {
 
   tags = { Name = "${var.name}-alb" }
 }
+
+# The gateway and the indexer have different security groups, and that is the
+# resource §2's sentence becomes: "splitting it makes the sandbox a deployment
+# boundary rather than a code convention" is only true if the two do not share
+# one set of firewall rules.
+#
+# What actually differs, enumerated rather than gestured at: ingress, whether
+# there is a target group, whether there is a task role, and the writable
+# surface. What does NOT differ is egress, and that is a real limit rather than
+# an oversight — a Fargate task pulls its own image, reads its own secrets and
+# ships its own logs through its task ENI, and there is no AWS-managed prefix
+# list for ECR, Secrets Manager or CloudWatch Logs to scope 443 with. Interface
+# VPC endpoints would earn the stronger claim at about $29/month and are not
+# built here.
+
+resource "aws_security_group" "gateway" {
+  name        = "${var.name}-gateway"
+  description = "Gateway tasks: the public API, reachable only through the load balancer."
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    description     = "The service port, from the load balancer only"
+    from_port       = local.gateway_port
+    to_port         = local.gateway_port
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
+  }
+
+  # Enumerated, never protocol = "-1". A single -1 rule to 0.0.0.0/0 is what
+  # every ECS example ships and it opens tcp/22, tcp/9418 and every UDP port.
+  #
+  # This restricts direction and port and says nothing about which HOSTS are
+  # reachable, and it must not be read as if it did: §4 puts the host decision
+  # in admit.Policy, in the process, and states that codetrail claims no
+  # DNS-rebinding protection. A prefix list built from a forge's published
+  # ranges goes stale silently and a TLS-terminating proxy is a second trust
+  # boundary; neither is shipped.
+  egress {
+    description = "Secrets Manager, ECR and CloudWatch Logs, all reached through this task ENI"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # To the VPC by CIDR and not to the data security group by id, because the
+  # database's own ingress names these two groups and the pair would be a
+  # dependency cycle. The binding restriction is on that side: this one narrows
+  # the port, and aws_security_group.data decides who may connect.
+  egress {
+    description = "Postgres, inside this VPC"
+    from_port   = 5432
+    to_port     = 5432
+    protocol    = "tcp"
+    cidr_blocks = [var.vpc_cidr]
+  }
+
+  # Both destinations, because the resolver's address differs between the VPC
+  # .2 address and the link-local Route 53 endpoint, and a task that cannot
+  # resolve a name fails with something that reads like a network outage.
+  egress {
+    description = "DNS over UDP"
+    from_port   = 53
+    to_port     = 53
+    protocol    = "udp"
+    cidr_blocks = [var.vpc_cidr, "169.254.169.253/32"]
+  }
+
+  egress {
+    description = "DNS over TCP"
+    from_port   = 53
+    to_port     = 53
+    protocol    = "tcp"
+    cidr_blocks = [var.vpc_cidr, "169.254.169.253/32"]
+  }
+
+  tags = { Name = "${var.name}-gateway" }
+}
+
+resource "aws_security_group" "indexer" {
+  name        = "${var.name}-indexer"
+  description = "Indexer tasks: spec 2's untrusted-input boundary. Accepts nothing but a scrape."
+  vpc_id      = aws_vpc.main.id
+
+  # The only thing that may open a connection to this process is the scraper,
+  # and only on the probe port. There is no load balancer in front of it and
+  # there is no rule admitting a CIDR.
+  ingress {
+    description     = "The probe port, from the scraper only"
+    from_port       = local.probe_port
+    to_port         = local.probe_port
+    protocol        = "tcp"
+    security_groups = [aws_security_group.observability.id]
+  }
+
+  egress {
+    description = "git clone over https, plus the image, the secrets and the logs"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # To the VPC by CIDR and not to the data security group by id, because the
+  # database's own ingress names these two groups and the pair would be a
+  # dependency cycle. The binding restriction is on that side: this one narrows
+  # the port, and aws_security_group.data decides who may connect.
+  egress {
+    description = "Postgres, inside this VPC"
+    from_port   = 5432
+    to_port     = 5432
+    protocol    = "tcp"
+    cidr_blocks = [var.vpc_cidr]
+  }
+
+  egress {
+    description = "DNS over UDP"
+    from_port   = 53
+    to_port     = 53
+    protocol    = "udp"
+    cidr_blocks = [var.vpc_cidr, "169.254.169.253/32"]
+  }
+
+  egress {
+    description = "DNS over TCP"
+    from_port   = 53
+    to_port     = 53
+    protocol    = "tcp"
+    cidr_blocks = [var.vpc_cidr, "169.254.169.253/32"]
+  }
+
+  tags = { Name = "${var.name}-indexer" }
+}
+
+# Created whether or not Prometheus runs, because the indexer's one ingress rule
+# names it: a group that exists and holds no member admits nothing, which is the
+# correct behaviour when observability is off.
+resource "aws_security_group" "observability" {
+  name        = "${var.name}-observability"
+  description = "The scraper. The only thing allowed to open a connection to the indexer."
+  vpc_id      = aws_vpc.main.id
+
+  egress {
+    description = "Scrape both services"
+    from_port   = 0
+    to_port     = 65535
+    protocol    = "tcp"
+    cidr_blocks = [var.vpc_cidr]
+  }
+
+  tags = { Name = "${var.name}-observability" }
+}
+
+resource "aws_security_group" "data" {
+  name        = "${var.name}-data"
+  description = "Postgres. Reachable from the two application security groups and from nothing else."
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    description     = "Postgres from the gateway"
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [aws_security_group.gateway.id]
+  }
+
+  ingress {
+    description     = "Postgres from the indexer"
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [aws_security_group.indexer.id]
+  }
+
+  tags = { Name = "${var.name}-data" }
+}
