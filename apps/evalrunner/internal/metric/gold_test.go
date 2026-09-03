@@ -114,8 +114,11 @@ func TestTheGoldSetIsTheSpansThatOverlapTheDeclaration(t *testing.T) {
 		t.Fatalf("the fixture produced %d cases, want 1", len(cases))
 	}
 	c := cases[0]
+	// Errorf, not Fatalf: under a harness that harvested gold from unstripped
+	// source this is the first thing to go, and stopping here would leave the
+	// gold-set assertion below — the behavioural half — unrun.
 	if c.Start != 10 || c.End != 33 || c.RawStart != 3 || c.RawEnd != 33 {
-		t.Fatalf("the fixture's geometry moved: %d..%d stripped, %d..%d raw", c.Start, c.End, c.RawStart, c.RawEnd)
+		t.Errorf("the fixture's geometry moved: %d..%d stripped, %d..%d raw; want 10..33 and 3..33", c.Start, c.End, c.RawStart, c.RawEnd)
 	}
 	strippedSrc, err := chunk.StripDocs("long.go", src)
 	if err != nil {
