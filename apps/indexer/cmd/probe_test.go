@@ -137,8 +137,10 @@ func movedJobSeries(t *testing.T, before map[string]float64) map[string]float64 
 }
 
 func TestEveryJobOutcomeMovesExactlyOneCounter(t *testing.T) {
-	// tries is 4 in testIndexer, so attempts 1 retries and attempts 4 is the
-	// last one jobs.Fail marks terminal.
+	// tries is 4 in testIndexer. jobs.Fail decides terminality in SQL with
+	// `attempts >= maxAttempts`, so the boundary is 3 against 4 and the two
+	// cases below sit on either side of it — a pair one apart, because a
+	// mutant that moves the comparison by one survives any wider gap.
 	cases := []struct {
 		name string
 		run  func(t *testing.T)
@@ -156,12 +158,12 @@ func TestEveryJobOutcomeMovesExactlyOneCounter(t *testing.T) {
 			},
 		},
 		{
-			name: "a job with attempts left",
+			name: "a job on the last attempt that still retries",
 			run: func(t *testing.T) {
 				ix, _ := fakeIndexer(t)
 				ix.clone = failingClone
 				job := aJob()
-				job.Attempts = 1
+				job.Attempts = 3
 				ix.runJob(context.Background(), job)
 			},
 			want: map[string]float64{
@@ -170,7 +172,7 @@ func TestEveryJobOutcomeMovesExactlyOneCounter(t *testing.T) {
 			},
 		},
 		{
-			name: "a job that has spent its attempts",
+			name: "a job one attempt further, which jobs.Fail marks terminal",
 			run: func(t *testing.T) {
 				ix, _ := fakeIndexer(t)
 				ix.clone = failingClone
