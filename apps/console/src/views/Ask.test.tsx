@@ -15,6 +15,9 @@ import searchHybrid from "../api/fixtures/search-hybrid.json";
 import searchLexical from "../api/fixtures/search-lexical.json";
 import error500 from "../api/fixtures/error-500.json";
 import repoDetail from "../api/fixtures/repo.json";
+import error410 from "../api/fixtures/error-410-repo.json";
+import error404 from "../api/fixtures/error-404-repo.json";
+import { stubUnreachable } from "../test/msw";
 
 const ASK = "/api/repos/:repo/ask";
 const SEARCH = "/api/repos/:repo/search";
@@ -157,6 +160,51 @@ describe("asking", () => {
     expect(screen.queryByRole("status", { name: "Answer outcome" })).toBeNull();
     expect(container.textContent).not.toContain("has never been calibrated");
     for (const r of REASONS) expect(container.textContent).not.toContain(r);
+  });
+});
+
+describe("the outcomes a question can end in", () => {
+  test("an evicted repository is an error that says it was evicted, not a refusal", async () => {
+    stub("post", ASK, 410, error410);
+    const { container } = renderAsk();
+    await askQuestion();
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("this repository was indexed and has since been evicted");
+    // Not a refusal: no status region, no floor, no reason.
+    expect(screen.queryByRole("status", { name: "Answer outcome" })).toBeNull();
+    expect(container.textContent).not.toContain("has never been calibrated");
+    for (const r of REASONS) expect(container.textContent).not.toContain(r);
+  });
+
+  test("an unknown repository is an error that says so, and is not a refusal", async () => {
+    stub("post", ASK, 404, error404);
+    const { container } = renderAsk();
+    await askQuestion();
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("no such repository");
+    expect(screen.queryByRole("status", { name: "Answer outcome" })).toBeNull();
+    expect(container.textContent).not.toContain("has never been calibrated");
+  });
+
+  test("an unreachable gateway is an error with no request id, and is not a refusal", async () => {
+    stubUnreachable("post", ASK);
+    const { container } = renderAsk();
+    await askQuestion();
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("codetrail could not be reached.");
+    expect(alert.textContent).toContain("codetrail did not return a request id for this failure.");
+    expect(screen.queryByRole("status", { name: "Answer outcome" })).toBeNull();
+    expect(container.textContent).not.toContain("has never been calibrated");
+  });
+
+  test("focus moves to the result region after asking", async () => {
+    stub("post", ASK, 200, noSpans);
+    renderAsk();
+    await askQuestion();
+    const panel = await screen.findByRole("status", { name: "Answer outcome" });
+    const region = panel.closest("div[tabindex]");
+    expect(region).not.toBeNull();
+    expect(document.activeElement).toBe(region);
   });
 });
 

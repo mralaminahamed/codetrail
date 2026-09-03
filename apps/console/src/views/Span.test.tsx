@@ -5,6 +5,8 @@ import Span from "./Span";
 import { stub } from "../test/msw";
 import span from "../api/fixtures/span.json";
 import error404 from "../api/fixtures/error-404-repo.json";
+import error410 from "../api/fixtures/error-410-repo.json";
+import { stubUnreachable } from "../test/msw";
 
 const PATH = "/api/repos/:repo/spans/:span";
 
@@ -33,6 +35,23 @@ describe("the span reader", () => {
     expect(pre?.textContent).toBe(span.span.text);
     expect(container.textContent).toContain(span.citation.digest);
     expect(screen.getByRole("link")).toHaveAttribute("href", span.citation.permalink);
+  });
+
+  test("an evicted repository says it was indexed and evicted, not that it never existed", async () => {
+    // 410, not 404: it existed, and that is a different fact (spec §10). The
+    // two bodies differ in words and the console renders the server's.
+    stub("get", PATH, 410, error410);
+    renderSpan();
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("this repository was indexed and has since been evicted");
+    expect(alert.textContent).not.toContain("no such repository");
+  });
+
+  test("an unreachable gateway renders an error with no request id", async () => {
+    stubUnreachable("get", PATH);
+    renderSpan();
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("codetrail did not return a request id for this failure.");
   });
 
   test("a missing span renders an error rather than an empty page", async () => {
