@@ -35,6 +35,11 @@ jobs:
       # hand. This costs no model and no server: it type-checks and returns.
       - name: vet (ollama tag)
         run: go vet -tags=ollama ./...
+      # Same argument, one tag over, and here the suite it guards costs money:
+      # -tags=llm sends a real request to a real provider, so CI vets it and
+      # never runs it. Without this step nothing would compile the file at all.
+      - name: vet (llm tag)
+        run: go vet -tags=llm ./...
       - name: build
         run: go build ./...
       - name: test
