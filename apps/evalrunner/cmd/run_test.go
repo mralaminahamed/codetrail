@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
@@ -345,4 +348,61 @@ func outcomes(res ArmResult) []metric.Outcome {
 		out = append(out, r.Outcomes())
 	}
 	return out
+}
+
+// The fakes ledger: every fake in this phase with the test that sets its
+// error. P3's sweep found the shape "an error branch behind a fake nobody
+// wired", and what the runner does with a failure has to be a value, not "it
+// does not crash".
+func TestEachRetrievalFailureStopsTheArmAndNamesIt(t *testing.T) {
+	cs, spans := ladder()
+	boom := errors.New("boom")
+	a := arm(t, "ast", rag.ModeHybrid, &searcher{vector: cs, err: boom}, spans)
+	_, err := RunArm(context.Background(), a, []golden.Case{caseAt("a", 1, 9)}, cfg())
+	if !errors.Is(err, boom) {
+		t.Errorf("a failing store gave %v, want the underlying error", err)
+	}
+
+	// A repository with nothing to rank is store.ErrNotFound, and the gateway
+	// answers that as a refusal. The eval reads it the same way: an outcome,
+	// not a failure, or a corpus that is merely empty would fail the run.
+	empty := arm(t, "ast", rag.ModeHybrid, &searcher{err: store.ErrNotFound}, spans)
+	res, err := RunArm(context.Background(), empty, []golden.Case{caseAt("a", 1, 9)}, cfg())
+	if err != nil {
+		t.Fatalf("an empty corpus gave %v, want a recorded refusal", err)
+	}
+	if res.Cases[0].Reason != rag.ReasonNoSpans {
+		t.Errorf("an empty corpus decided %q, want no_spans", res.Cases[0].Reason)
+	}
+}
+
+func TestAFailingEmbedderStopsTheArm(t *testing.T) {
+	cs, spans := ladder()
+	a := arm(t, "ast", rag.ModeHybrid, &searcher{vector: cs}, spans)
+	boom := errors.New("model unreachable")
+	a.Retriever.Emb = failingEmbedder{boom}
+	_, err := RunArm(context.Background(), a, []golden.Case{caseAt("a", 1, 9)}, cfg())
+	if !errors.Is(err, boom) {
+		t.Errorf("a failing embedder gave %v, want the underlying error", err)
+	}
+}
+
+type failingEmbedder struct{ err error }
+
+func (f failingEmbedder) Model() string { return FakeModel }
+func (f failingEmbedder) Dim() int      { return store.EmbeddingDim }
+func (f failingEmbedder) Embed(context.Context, []string) ([][]float32, error) {
+	return nil, f.err
+}
+
+func TestAFailedArtefactWriteIsReportedAndNotSwallowed(t *testing.T) {
+	// A directory that cannot be created: the artefact is the whole output of
+	// the phase, and a write that failed quietly is a run with no evidence.
+	blocked := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(blocked, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Write(sampleRun(), blocked); err == nil {
+		t.Error("Write into a path that is a file returned no error")
+	}
 }
