@@ -5,6 +5,8 @@ import Submit from "./views/Submit";
 import Job from "./views/Job";
 import Ask from "./views/Ask";
 import Span from "./views/Span";
+import Symbols from "./views/Symbols";
+import SymbolView from "./views/Symbol";
 
 function Corpus() {
   return (
@@ -35,6 +37,8 @@ export default function AppRoutes() {
         <Route path="jobs/:id" element={<Job />} />
         <Route path="repos/:repo" element={<Ask />} />
         <Route path="repos/:repo/spans/:span" element={<Span />} />
+        <Route path="repos/:repo/symbols" element={<Symbols />} />
+        <Route path="repos/:repo/symbols/:symbol" element={<SymbolView />} />
         <Route path="*" element={<NotFound />} />
       </Route>
     </Routes>

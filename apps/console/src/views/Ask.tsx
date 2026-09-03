@@ -1,12 +1,14 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useParams } from "react-router";
-import { ask, search } from "../api/client";
-import type { AskResult, Outcome, SearchResult } from "../api/types";
+import { ask, getRepo, search } from "../api/client";
+import type { AskResult, Outcome, RepoDetail, SearchResult } from "../api/types";
 import PageTitle from "../ui/PageTitle";
 import Answer from "../ui/Answer";
 import Refusal from "../ui/Refusal";
 import Hits from "../ui/Hits";
 import ErrorPanel from "../ui/ErrorPanel";
+import GraphCounts from "../ui/GraphCounts";
+import Staleness from "../ui/Staleness";
 
 type Result =
   | { of: "ask"; outcome: Outcome<AskResult> }
@@ -16,7 +18,19 @@ export default function Ask() {
   const { repo = "" } = useParams();
   const [result, setResult] = useState<Result | null>(null);
   const [inFlight, setInFlight] = useState(false);
+  const [detail, setDetail] = useState<RepoDetail | null>(null);
   const region = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const out = await getRepo(repo);
+      if (!cancelled && out.kind === "ok") setDetail(out.value);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [repo]);
 
   // Two buttons on one form, not a mode dropdown. They are two endpoints, and
   // calling the toggle "mode" beside a response field literally named `mode` —
@@ -42,6 +56,16 @@ export default function Ask() {
   return (
     <>
       <PageTitle>Ask this repository</PageTitle>
+      {detail !== null && (
+        <>
+          <p>
+            <code>{detail.remote}</code> at <code>{detail.commit}</code>
+          </p>
+          <p>{`${detail.files} files, ${detail.files_with_spans} with spans, ${detail.spans} spans.`}</p>
+          <GraphCounts repo={detail} />
+          <Staleness staleness={detail.staleness} />
+        </>
+      )}
       <form onSubmit={onSubmit}>
         <p>
           <label htmlFor="q">Question</label>

@@ -14,6 +14,7 @@ import unscored from "../api/fixtures/ask-refused-unscored.json";
 import searchHybrid from "../api/fixtures/search-hybrid.json";
 import searchLexical from "../api/fixtures/search-lexical.json";
 import error500 from "../api/fixtures/error-500.json";
+import repoDetail from "../api/fixtures/repo.json";
 
 const ASK = "/api/repos/:repo/ask";
 const SEARCH = "/api/repos/:repo/search";
@@ -24,6 +25,11 @@ const SEARCH = "/api/repos/:repo/search";
 const REASONS = [noSpans.detail, belowFloor.detail, unscored.detail];
 
 function renderAsk() {
+  // The repo page reads its own detail on mount. Wired in every render,
+  // because MSW is set to error on an unhandled request and 17 of them were
+  // being swallowed as `unreachable` while the tests still passed — an error
+  // branch behind a fake nobody had wired.
+  stub("get", "/api/repos/:repo", 200, repoDetail);
   return render(
     <MemoryRouter initialEntries={["/repos/r1"]}>
       <Routes>
@@ -151,6 +157,32 @@ describe("asking", () => {
     expect(screen.queryByRole("status", { name: "Answer outcome" })).toBeNull();
     expect(container.textContent).not.toContain("has never been calibrated");
     for (const r of REASONS) expect(container.textContent).not.toContain(r);
+  });
+});
+
+describe("the repository's own facts", () => {
+  test("the graph counts are four numbers and a sentence, never a percentage badge", async () => {
+    stub("post", ASK, 200, answered);
+    const { container } = renderAsk();
+    await screen.findByText(
+      `${repoDetail.symbols} definitions, ${repoDetail.edges} call edges: ${repoDetail.edges_resolved} resolved and ${repoDetail.edges_syntactic} syntactic.`,
+    );
+    expect(container.textContent).toContain(
+      `${repoDetail.edges_resolved} of ${repoDetail.edges} call edges name a definition in this repository; the rest name something codetrail could not resolve.`,
+    );
+    // P4 Open question 13: the aggregate is a per-repo fact and provenance is
+    // a per-row label, so no ratio, no percentage and no badge.
+    expect(container.textContent).not.toMatch(/\d+%/);
+    expect(container.textContent).not.toMatch(/\d+\s*\/\s*\d+/);
+  });
+
+  test("the repository's staleness sentence is the server's", async () => {
+    stub("post", ASK, 200, answered);
+    const { container } = renderAsk();
+    await screen.findByText(repoDetail.staleness.note);
+    expect(container.textContent).not.toMatch(
+      /may be out of date|possibly stale|might have changed|last updated/i,
+    );
   });
 });
 

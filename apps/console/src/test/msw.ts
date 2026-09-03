@@ -31,6 +31,25 @@ export function stub(method: Method, path: string, status: number, body: unknown
   return record(method, path, () => HttpResponse.json(body as object, { status }));
 }
 
+// A handler that answers by what the request asked for. An unconditional 400
+// cannot separate a client that forwards an out-of-range value from one that
+// clamps it: both receive the same body and render the same sentence.
+export function stubByQuery(
+  method: Method,
+  path: string,
+  param: string,
+  bad: (value: string | null) => boolean,
+  onBad: { status: number; body: unknown },
+  onGood: { status: number; body: unknown },
+): Recorder {
+  return record(method, path, (rec) => {
+    const last = rec.urls[rec.urls.length - 1] ?? "";
+    const value = new URLSearchParams(last.split("?")[1] ?? "").get(param);
+    const pick = bad(value) ? onBad : onGood;
+    return HttpResponse.json(pick.body as object, { status: pick.status });
+  });
+}
+
 // A response that changes with each call, so a poller's sequence of states is
 // drivable without re-registering a handler mid-test.
 export function stubSequence(method: Method, path: string, bodies: unknown[]): Recorder {
