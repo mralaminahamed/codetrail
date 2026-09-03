@@ -36,7 +36,7 @@ describe("routing", () => {
   test("a route change sets document.title to the page's name", async () => {
     const user = userEvent.setup();
     renderApp();
-    expect(document.title).toBe("codetrail — codetrail");
+    expect(document.title).toBe("Submit a repository — codetrail");
     await user.click(screen.getByRole("link", { name: "Corpus" }));
     await screen.findByRole("heading", { level: 1, name: "Corpus" });
     expect(document.title).toBe("Corpus — codetrail");
