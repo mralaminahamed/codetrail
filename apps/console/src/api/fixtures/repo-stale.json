@@ -1,0 +1,22 @@
+{
+  "commit": "7e224ede8c9e5e9811951ff6c57921118d3c1792",
+  "edges": 0,
+  "edges_resolved": 0,
+  "edges_syntactic": 0,
+  "files": 11,
+  "files_with_spans": 7,
+  "id": "1d0f3dcf95c152516e7fa9e427ec27a5",
+  "indexed_at": "2026-08-04T12:00:00Z",
+  "ref": "main",
+  "remote": "https://github.com/codetrail-live/sampler",
+  "spans": 18,
+  "staleness": {
+    "state": "superseded",
+    "forge_checked": false,
+    "indexed_at": "2026-08-04T12:00:00Z",
+    "newer_commit": "61c3d15fb5ccd50fb8c8c2dc6ecb536fb0abbe6f",
+    "newer_indexed_at": "2026-09-01T12:00:00Z",
+    "note": "Correct at commit 7e224ed, indexed 30 days ago. main is also indexed here at the later commit 61c3d15, so this citation is from an older commit. codetrail did not ask the forge, so main may have moved again."
+  },
+  "symbols": 0
+}
