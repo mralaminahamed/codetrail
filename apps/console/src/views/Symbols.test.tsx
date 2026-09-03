@@ -6,6 +6,8 @@ import Symbols from "./Symbols";
 import { stub } from "../test/msw";
 import symbols from "../api/fixtures/symbols.json";
 import symbolsOne from "../api/fixtures/symbols-one.json";
+import error410 from "../api/fixtures/error-410-repo.json";
+import { stubUnreachable } from "../test/msw";
 
 const PATH = "/api/repos/:repo/symbols";
 
@@ -74,6 +76,20 @@ describe("the definitions list", () => {
     const complete = renderSymbols();
     await screen.findAllByRole("listitem");
     expect(complete.container.textContent).not.toContain("This list was truncated");
+  });
+
+  test("an evicted repository renders the server's eviction sentence", async () => {
+    stub("get", PATH, 410, error410);
+    renderSymbols();
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("this repository was indexed and has since been evicted");
+  });
+
+  test("an unreachable gateway renders an error and no rows", async () => {
+    stubUnreachable("get", PATH);
+    renderSymbols();
+    await screen.findByRole("alert");
+    expect(screen.queryByRole("listitem")).toBeNull();
   });
 
   test("the definitions view has no axe violations", async () => {

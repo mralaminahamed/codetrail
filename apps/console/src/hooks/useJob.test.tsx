@@ -159,6 +159,29 @@ describe("the job poller", () => {
   // 31 minutes is 244 awaited timer callbacks, which is slower than the 5s
   // default. Raised rather than shortened: a window that does not cross the
   // ceiling cannot test the ceiling.
+  test("unmounting stops the poller and removes its visibility listener", async () => {
+    const rec = stub("get", PATH, 200, jobPending);
+    const { unmount } = renderHook(() => useJob("j1"));
+    await advance(0);
+    const before = rec.calls;
+    expect(before).toBe(1);
+
+    unmount();
+    // The effect's cleanup is a side effect nothing else reads back: without
+    // this the timer keeps firing after the view is gone and every later test
+    // pays for it.
+    await advance(60_000);
+    expect(rec.calls).toBe(before);
+
+    // And the visibilitychange listener is gone: a resume after unmount would
+    // issue a request for a component that no longer exists.
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+      await Promise.resolve();
+    });
+    expect(rec.calls).toBe(before);
+  });
+
   test("polling stops at the ceiling and the manual check works after it", { timeout: 30_000 }, async () => {
     const rec = stub("get", PATH, 200, jobPending);
     const { result } = renderHook(() => useJob("j1"));

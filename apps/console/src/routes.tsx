@@ -2,20 +2,12 @@ import { Route, Routes } from "react-router";
 import Shell from "./ui/Shell";
 import PageTitle from "./ui/PageTitle";
 import Submit from "./views/Submit";
+import Corpus from "./views/Corpus";
 import Job from "./views/Job";
 import Ask from "./views/Ask";
 import Span from "./views/Span";
 import Symbols from "./views/Symbols";
 import SymbolView from "./views/Symbol";
-
-function Corpus() {
-  return (
-    <>
-      <PageTitle>Corpus</PageTitle>
-      <p>The repositories codetrail has indexed.</p>
-    </>
-  );
-}
 
 // Its own h1, not a blank main: a route that renders nothing is
 // indistinguishable from a view that failed to load.
