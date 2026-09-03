@@ -71,6 +71,19 @@ jobs:
       # leave that test green while it asserted this file instead of the code —
       # and the mutation that flips the default in main.go would survive in CI
       # and die only on a developer's machine.
+      # promtool has no cloud account and needs none: it parses the rules and
+      # replays a synthetic series through them. The test rules are what turn
+      # "the conjunct is there" into "the conjunct decides the outcome" —
+      # `promtool check rules` cannot tell a real metric from a typo, and it
+      # passes an unfireable rule.
+      - name: prometheus rules
+        run: |
+          curl -sSfL "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz" \
+            | tar xz --strip-components=1 -C /usr/local/bin "prometheus-${PROMETHEUS_VERSION}.linux-amd64/promtool"
+          make alerts-test
+        env:
+          PROMETHEUS_VERSION: 3.14.0
+
       # Both images, on every pull request. The properties the sandbox depends
       # on — one go on PATH, no inherited GO*/GIT_*/*_PROXY, non-root under a
       # read-only root filesystem, a readable RDS trust store — are facts about

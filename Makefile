@@ -1,6 +1,6 @@
 BIN := bin
 
-.PHONY: build gateway indexer lint test up down psql images image-test
+.PHONY: build gateway indexer lint test up down psql images image-test alerts-test
 
 DATABASE_URL ?= postgres://codetrail:codetrail@localhost:55432/codetrail?sslmode=disable
 OLLAMA_URL ?= http://localhost:11435
@@ -38,3 +38,12 @@ images:
 
 image-test:
 	./infra/image_test.sh
+
+# Both scrape files, because they share one rule_files entry and a rule
+# selecting service="indexer" against a scrape file that never sets the label
+# is a rule that silently matches nothing.
+alerts-test:
+	promtool check rules infra/prometheus/alerts.yml
+	promtool check config infra/prometheus/prometheus.compose.yml infra/prometheus/prometheus.aws.yml
+	promtool test rules infra/prometheus/alerts_test.yml
+	./infra/prometheus/metric_names.sh
