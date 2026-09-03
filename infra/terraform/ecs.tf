@@ -69,73 +69,13 @@ resource "aws_ecs_task_definition" "svc" {
     }
   }
 
-  container_definitions = jsonencode([{
-    name      = each.key
-    image     = local.image[each.key]
-    essential = true
-
-    portMappings = each.value.port == null ? [] : [{
-      containerPort = each.value.port
-      protocol      = "tcp"
-    }]
-
-    # The whole writable surface: two bind mounts and nothing else.
-    readonlyRootFilesystem = true
-    user                   = "65532:65532"
-
-    linuxParameters = {
-      capabilities = { drop = ["ALL"] }
-      # The indexer forks git and go; with the application as pid 1 an unreaped
-      # child is a zombie per job.
-      initProcessEnabled = true
-    }
-
-    mountPoints = [
-      for p in each.value.writable : {
-        sourceVolume  = replace(trimprefix(p, "/"), "/", "-")
-        containerPath = p
-        readOnly      = false
-      }
-    ]
-
-    environment = [
-      for k in sort(keys(each.value.environment)) : {
-        name  = k
-        value = tostring(each.value.environment[k])
-      }
-    ]
-
-    secrets = [
-      for k in sort(keys(each.value.secrets)) : {
-        name      = k
-        valueFrom = each.value.secrets[k]
-      }
-    ]
-
-    # Liveness, not readiness: health.go answers /health from the process and
-    # /ready from Postgres, and a container check on the latter turns a shared
-    # datastore outage into a rolling restart of every task — killing the one
-    # process that could still serve /metrics and say why.
-    #
-    # The image is distroless with no shell, so the request is made by the
-    # binary's own -probe flag.
-    healthCheck = each.value.probe == null ? null : {
-      command     = ["CMD", each.value.probe, "-probe"]
-      interval    = 30
-      timeout     = 5
-      retries     = 3
-      startPeriod = 30
-    }
-
-    logConfiguration = {
-      logDriver = "awslogs"
-      options = {
-        awslogs-group         = aws_cloudwatch_log_group.svc[each.key].name
-        awslogs-region        = var.region
-        awslogs-stream-prefix = each.key
-      }
-    }
-  }])
+  # From local.container and not written inline, so that the plan-visible
+  # output in outputs.tf is the SAME object rather than a copy of it. That
+  # matters because secrets[].valueFrom is a Secrets Manager ARN — which carries
+  # the account id and a random suffix AWS assigns, so it is unknown at plan
+  # time, and one unknown inside a jsonencode makes this whole string unknown.
+  # The output replaces exactly that one field and nothing else.
+  container_definitions = jsonencode([local.container[each.key]])
 }
 
 resource "aws_ecs_service" "svc" {

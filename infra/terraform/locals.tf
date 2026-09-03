@@ -13,6 +13,7 @@ locals {
     {
       gateway = {}
       indexer = {}
+      ollama  = {}
     },
     var.console_enabled ? { console = {} } : {},
   )
@@ -58,7 +59,7 @@ locals {
     PROBE_PORT           = local.probe_port
     EMBED_PROVIDER       = var.embed_provider
     EMBED_MODEL          = var.embed_model
-    OLLAMA_URL           = "http://ollama.${var.name}.local:11434"
+    OLLAMA_URL           = local.ollama_url
     TYPECHECK            = "true"
     MAX_REPO_BYTES       = var.max_repo_bytes
     MAX_REPO_FILES       = var.max_repo_files
@@ -71,13 +72,32 @@ locals {
     PORT           = local.gateway_port
     EMBED_PROVIDER = var.embed_provider
     EMBED_MODEL    = var.embed_model
-    OLLAMA_URL     = "http://ollama.${var.name}.local:11434"
+    OLLAMA_URL     = local.ollama_url
   }
 
-  # Filled in by secrets.tf. DATABASE_URL never appears in `environment`: a task
-  # definition's environment block is readable by anyone with
-  # ecs:DescribeTaskDefinition and that string carries the database password.
-  app_secrets = {}
+  # NOTE: the DSN itself is written out in secrets.tf rather than here — see the
+  # comment there. This block records what the delivery is and is not.
+  #
+  # The DSN is delivered through Secrets Manager. The
+  # application needs no change and must not get one: config.Get("DATABASE_URL")
+  # reads an environment variable, and Secrets Manager is the delivery and not
+  # the interface — making the app call Secrets Manager would put an AWS SDK
+  # inside a binary whose configuration contract is the environment.
+  #
+  # sslmode and sslrootcert come from variables rather than being written here,
+  # because this string interpolates the database endpoint and is therefore
+  # unknown at plan time: the policy suite reads the variables and asserts that
+  # this expression references them.
+
+  # The names, which is what the secret resources and the IAM grant iterate.
+  secret_names = toset(["database_url"])
+
+  # Never in `environment`: a task definition's environment block is readable by
+  # anyone with ecs:DescribeTaskDefinition and this string carries the database
+  # password.
+  app_secrets = {
+    DATABASE_URL = aws_secretsmanager_secret.app["database_url"].arn
+  }
 
   # One map every task definition, service, log group and IAM grant iterates.
   services = merge(
@@ -113,6 +133,24 @@ locals {
         secrets               = local.app_secrets
       }
     },
+    {
+      # The embedder both binaries boot-or-die on. embed.FromEnv makes one real
+      # round trip at boot with a 30-second deadline, so the model is baked into
+      # the image rather than pulled at start — a 274 MB download would race
+      # that probe and lose.
+      ollama = {
+        cpu                   = 2048
+        memory                = 4096
+        port                  = 11434
+        probe                 = null
+        security_group        = aws_security_group.ollama.id
+        target_group_arn      = null
+        ephemeral_storage_gib = null
+        writable              = ["/tmp", "/.ollama"]
+        environment           = { OLLAMA_HOST = "0.0.0.0:11434" }
+        secrets               = {}
+      }
+    },
     var.console_enabled ? {
       console = {
         cpu                   = 256
@@ -129,10 +167,73 @@ locals {
     } : {},
   )
 
-  # The path both images write the Amazon RDS trust store to. A local used by
-  # the DSN and by nothing else, so changing one without the other is
-  # impossible: every certificate in that bundle is a self-signed RDS root and
-  # sslmode=verify-full against the image's default store cannot validate the
-  # server.
-  rds_ca_path = "/etc/ssl/certs/rds-global-bundle.pem"
+  ollama_url = "http://ollama.${var.name}.local:11434"
+  # One container definition per service, and the single source both the task
+  # definition and outputs.container_shape are built from.
+  container = {
+    for k, v in local.services : k => {
+      name      = k
+      image     = local.image[k]
+      essential = true
+
+      portMappings = v.port == null ? [] : [{
+        containerPort = v.port
+        protocol      = "tcp"
+      }]
+
+      readonlyRootFilesystem = true
+      user                   = "65532:65532"
+
+      linuxParameters = {
+        capabilities = { drop = ["ALL"] }
+        # The indexer forks git and go; with the application as pid 1 an
+        # unreaped child is a zombie per job.
+        initProcessEnabled = true
+      }
+
+      mountPoints = [
+        for p in v.writable : {
+          sourceVolume  = replace(trimprefix(p, "/"), "/", "-")
+          containerPath = p
+          readOnly      = false
+        }
+      ]
+
+      environment = [
+        for n in sort(keys(v.environment)) : {
+          name  = n
+          value = tostring(v.environment[n])
+        }
+      ]
+
+      secrets = [
+        for n in sort(keys(v.secrets)) : {
+          name      = n
+          valueFrom = v.secrets[n]
+        }
+      ]
+
+      # Liveness, not readiness: health.go answers /health from the process and
+      # /ready from Postgres, and a container check on the latter turns one
+      # shared-datastore outage into a rolling restart of every task — killing
+      # the process that could still serve /metrics and say why. The image has
+      # no shell, so the request is the binary's own -probe flag.
+      healthCheck = v.probe == null ? null : {
+        command     = ["CMD", v.probe, "-probe"]
+        interval    = 30
+        timeout     = 5
+        retries     = 3
+        startPeriod = 30
+      }
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          awslogs-group         = "/ecs/${var.name}/${k}"
+          awslogs-region        = var.region
+          awslogs-stream-prefix = k
+        }
+      }
+    }
+  }
 }

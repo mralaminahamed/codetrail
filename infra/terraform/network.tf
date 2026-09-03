@@ -141,6 +141,17 @@ resource "aws_security_group" "gateway" {
   # database's own ingress names these two groups and the pair would be a
   # dependency cycle. The binding restriction is on that side: this one narrows
   # the port, and aws_security_group.data decides who may connect.
+  # The embedder. Both binaries boot-or-die on one real round trip to it
+  # (embed.FromEnv), so an egress set without this port is a stack that cannot
+  # start — which the plan file's enumerated list left out.
+  egress {
+    description = "Ollama, inside this VPC"
+    from_port   = 11434
+    to_port     = 11434
+    protocol    = "tcp"
+    cidr_blocks = [var.vpc_cidr]
+  }
+
   egress {
     description = "Postgres, inside this VPC"
     from_port   = 5432
@@ -199,6 +210,17 @@ resource "aws_security_group" "indexer" {
   # database's own ingress names these two groups and the pair would be a
   # dependency cycle. The binding restriction is on that side: this one narrows
   # the port, and aws_security_group.data decides who may connect.
+  # The embedder. Both binaries boot-or-die on one real round trip to it
+  # (embed.FromEnv), so an egress set without this port is a stack that cannot
+  # start — which the plan file's enumerated list left out.
+  egress {
+    description = "Ollama, inside this VPC"
+    from_port   = 11434
+    to_port     = 11434
+    protocol    = "tcp"
+    cidr_blocks = [var.vpc_cidr]
+  }
+
   egress {
     description = "Postgres, inside this VPC"
     from_port   = 5432
@@ -267,4 +289,52 @@ resource "aws_security_group" "data" {
   }
 
   tags = { Name = "${var.name}-data" }
+}
+
+resource "aws_security_group" "ollama" {
+  name        = "${var.name}-ollama"
+  description = "The embedder. Reachable from the two application security groups and from nothing else."
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    description     = "Embeddings from the gateway"
+    from_port       = 11434
+    to_port         = 11434
+    protocol        = "tcp"
+    security_groups = [aws_security_group.gateway.id]
+  }
+
+  ingress {
+    description     = "Embeddings from the indexer"
+    from_port       = 11434
+    to_port         = 11434
+    protocol        = "tcp"
+    security_groups = [aws_security_group.indexer.id]
+  }
+
+  egress {
+    description = "Its own image, and its own logs"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    description = "DNS over UDP"
+    from_port   = 53
+    to_port     = 53
+    protocol    = "udp"
+    cidr_blocks = [var.vpc_cidr, "169.254.169.253/32"]
+  }
+
+  egress {
+    description = "DNS over TCP"
+    from_port   = 53
+    to_port     = 53
+    protocol    = "tcp"
+    cidr_blocks = [var.vpc_cidr, "169.254.169.253/32"]
+  }
+
+  tags = { Name = "${var.name}-ollama" }
 }

@@ -51,6 +51,9 @@ type Plan struct {
 		Value any `json:"value"`
 	} `json:"variables"`
 	PlannedValues struct {
+		Outputs map[string]struct {
+			Value any `json:"value"`
+		} `json:"outputs"`
 		RootModule struct {
 			Resources []Resource `json:"resources"`
 		} `json:"root_module"`
@@ -308,17 +311,22 @@ func (p *Plan) stringList(t *testing.T, name string) []string {
 // variables: one unknown field inside the jsonencode makes the entire string
 // unknown, and then nothing below can be asserted at all.
 type Container struct {
-	Name                   string            `json:"name"`
-	Image                  string            `json:"image"`
-	User                   string            `json:"user"`
-	ReadonlyRootFilesystem bool              `json:"readonlyRootFilesystem"`
-	Environment            []NameValue       `json:"environment"`
-	Secrets                []NameValueFrom   `json:"secrets"`
-	MountPoints            []MountPoint      `json:"mountPoints"`
-	PortMappings           []PortMapping     `json:"portMappings"`
-	HealthCheck            *HealthCheck      `json:"healthCheck"`
-	LinuxParameters        *LinuxParameters  `json:"linuxParameters"`
-	LogConfiguration       *LogConfiguration `json:"logConfiguration"`
+	Name                   string      `json:"name"`
+	Image                  string      `json:"image"`
+	User                   string      `json:"user"`
+	ReadonlyRootFilesystem bool        `json:"readonlyRootFilesystem"`
+	Environment            []NameValue `json:"environment"`
+	// Names only. AWS requires the full Secrets Manager ARN in valueFrom — the
+	// name is not accepted — and that ARN carries the account id and a random
+	// suffix, so it is unknown at plan time. What can be asserted is which
+	// variables arrive as secrets and, in the environment block, that none of
+	// them arrives in plaintext.
+	Secrets          []string          `json:"secrets"`
+	MountPoints      []MountPoint      `json:"mountPoints"`
+	PortMappings     []PortMapping     `json:"portMappings"`
+	HealthCheck      *HealthCheck      `json:"healthCheck"`
+	LinuxParameters  *LinuxParameters  `json:"linuxParameters"`
+	LogConfiguration *LogConfiguration `json:"logConfiguration"`
 }
 
 type NameValue struct {
@@ -376,6 +384,39 @@ type TaskDefinition struct {
 	Volumes         []string
 }
 
+// containerShape reads one service's container definition from the
+// container_shape output.
+//
+// From the output and not from the task definition's container_definitions,
+// which is a jsonencode carrying a Secrets Manager ARN and is therefore wholly
+// unknown at plan time. The output is local.container with that one field
+// replaced by the secret's NAME, so it is the same object the task definition
+// encodes rather than a copy of it — see outputs.tf.
+func (p *Plan) containerShape(t *testing.T, service string) []Container {
+	t.Helper()
+	out, ok := p.PlannedValues.Outputs["container_shape"]
+	if !ok {
+		t.Fatal("the plan has no container_shape output; every assertion about what is inside a container would be vacuous")
+	}
+	m, ok := out.Value.(map[string]any)
+	if !ok {
+		t.Fatal("container_shape is unknown at plan time")
+	}
+	one, ok := m[service]
+	if !ok {
+		t.Fatalf("container_shape has no entry for %s", service)
+	}
+	raw, err := json.Marshal(one)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var c Container
+	if err := json.Unmarshal(raw, &c); err != nil {
+		t.Fatalf("container_shape[%s]: %v", service, err)
+	}
+	return []Container{c}
+}
+
 // taskDefinitions decodes every task definition in the plan, failing rather
 // than skipping when container_definitions came back unknown — an assertion
 // that silently has nothing to read is the defect this package exists to catch.
@@ -392,13 +433,7 @@ func (p *Plan) taskDefinitions(t *testing.T) []TaskDefinition {
 		if s, ok := r.Values["family"].(string); ok {
 			td.Service = s[strings.LastIndex(s, "-")+1:]
 		}
-		raw, ok := r.Values["container_definitions"].(string)
-		if !ok {
-			t.Fatalf("%s container_definitions is unknown at plan time; every assertion about what is inside this container would be vacuous. Something in it interpolates an attribute apply decides.", r.Address)
-		}
-		if err := json.Unmarshal([]byte(raw), &td.Containers); err != nil {
-			t.Fatalf("%s container_definitions is not JSON: %v", r.Address, err)
-		}
+		td.Containers = p.containerShape(t, td.Service)
 		for _, v := range asSlice(r.Values["volume"]) {
 			if m, ok := v.(map[string]any); ok {
 				if n, ok := m["name"].(string); ok {
@@ -445,4 +480,109 @@ func (p *Plan) taskDefinition(t *testing.T, service string) TaskDefinition {
 	}
 	t.Fatalf("no task definition for %s", service)
 	return TaskDefinition{}
+}
+
+// allReferences collects every reference anywhere under a field's expression,
+// including nested blocks. A data "aws_iam_policy_document" records each
+// `statement` as its own block with its own expressions, so the flat form finds
+// nothing there.
+func (c ConfigResource) allReferences(field string) []string {
+	var out []string
+	var walk func(any)
+	walk = func(v any) {
+		switch t := v.(type) {
+		case map[string]any:
+			for k, child := range t {
+				if k == "references" {
+					for _, r := range asSlice(child) {
+						if s, ok := r.(string); ok && !contains(out, s) {
+							out = append(out, s)
+						}
+					}
+					continue
+				}
+				walk(child)
+			}
+		case []any:
+			for _, child := range t {
+				walk(child)
+			}
+		}
+	}
+	walk(c.Expressions[field])
+	sort.Strings(out)
+	return out
+}
+
+// stringVar reads a plan variable that is a single string.
+func (p *Plan) stringVar(t *testing.T, name string) string {
+	t.Helper()
+	v, ok := p.Variables[name]
+	if !ok {
+		t.Fatalf("the plan records no variable %q", name)
+	}
+	s, ok := v.Value.(string)
+	if !ok {
+		t.Fatalf("variable %q is not a string", name)
+	}
+	return s
+}
+
+// varReferences is like references but keeps variables and locals, which is
+// what an assertion about how a string was assembled has to read.
+func (c ConfigResource) varReferences(field string) []string {
+	m, ok := c.Expressions[field].(map[string]any)
+	if !ok {
+		return nil
+	}
+	var out []string
+	for _, r := range asSlice(m["references"]) {
+		if s, ok := r.(string); ok && !contains(out, s) {
+			out = append(out, s)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// preconditionSources reads the HCL for lifecycle preconditions, keyed by the
+// resource address they guard.
+//
+// From the source and NOT from the plan, and the limit is stated rather than
+// hidden: measured, `terraform show -json` emits no lifecycle block anywhere in
+// the configuration section, so a precondition is invisible to every other
+// assertion in this package. What Terraform itself guarantees is that the
+// precondition is evaluated at plan time; what this checks is that one exists
+// at all.
+func preconditionSources(t *testing.T) map[string]bool {
+	t.Helper()
+	dir := filepath.Join("..", "terraform")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]bool{}
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".tf") {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var current string
+		for _, line := range strings.Split(string(raw), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "resource \"") {
+				parts := strings.Split(trimmed, "\"")
+				if len(parts) >= 4 {
+					current = parts[1] + "." + parts[3]
+				}
+			}
+			if strings.HasPrefix(trimmed, "precondition {") && current != "" {
+				out[current] = true
+			}
+		}
+	}
+	return out
 }

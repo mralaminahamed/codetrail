@@ -41,6 +41,14 @@ data "aws_iam_policy_document" "execution" {
     actions   = ["logs:CreateLogStream", "logs:PutLogEvents"]
     resources = [for g in aws_cloudwatch_log_group.svc : "${g.arn}:*"]
   }
+
+  # Iterates the same map the secrets are created from, so a secret added later
+  # is readable without a second policy that can drift. The sibling project's
+  # registry-credentials bug was a secret created outside that map.
+  statement {
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [for s in aws_secretsmanager_secret.app : s.arn]
+  }
 }
 
 resource "aws_iam_role_policy" "execution" {
