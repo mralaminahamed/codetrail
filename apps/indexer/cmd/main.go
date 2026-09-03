@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"flag"
 	"fmt"
 	"net/http"
 	"os"
@@ -107,7 +108,19 @@ type indexer struct {
 	lastSweep time.Time
 }
 
+// probeMode is the container health check; see health.Probe.
+var probeMode = flag.Bool("probe", false, "check /health on this process's own probe port, then exit 0 or 1")
+
 func main() {
+	flag.Parse()
+	if *probeMode {
+		if err := health.Probe(probeAddr()); err != nil {
+			fmt.Fprintln(os.Stderr, "probe:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	log := logger.New("indexer")
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
