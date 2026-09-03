@@ -55,15 +55,20 @@ read path, which is the egress the design confines to the indexer. The one posit
 corpus can support it does make: when the same ref is *also* indexed here at a later commit, the
 citation says it is superseded and names that commit.
 
-**Retrieval is hybrid, not just vectors.** "Who calls this?" is a graph question that embeddings
-answer badly. "Where is `parseConfig` defined?" is a lexical question they answer worse. So a
-lexical arm runs alongside the vector search and the two are fused by reciprocal rank — both ship
-in P3 — and a symbol graph joins them in P4. That second example is the honest one to hold this to:
-as shipped, that question becomes the `OR` of `where | is | parseconfig | parse | config | defined`
-— every word of it, because the `simple` text-search configuration has no stopword list, plus the
-camel-case parts a widener adds. It is a real arm with a real
-limitation, both written down in [Retrieval](#retrieval), and which combination actually helps is a
-question the eval settles rather than the README asserting.
+**Retrieval has three modes, and the default is the one that measured best.** "Who calls this?" is
+a graph question that embeddings answer badly. "Where is `parseConfig` defined?" is a lexical
+question they answer worse. So a lexical arm runs alongside the vector search and the two can be
+fused by reciprocal rank — both ship in P3 — and a symbol graph joins them in P4. That second
+example is the honest one to hold this to: as shipped, that question becomes the `OR` of
+`where | is | parseconfig | parse | config | defined` — every word of it, because the `simple`
+text-search configuration has no stopword list, plus the camel-case parts a widener adds. It is a
+real arm with a real limitation, both written down in [Retrieval](#retrieval).
+
+**Which combination helps was settled by the eval rather than asserted here, and fusion lost** — on
+one corpus, on doc-comment prose queries, by a wide margin. `RETRIEVAL_MODE` therefore defaults to
+`vector`; fusion still ships and is still one setting away. The numbers, the pre-registered decision
+rule and the limits of the result are in [Retrieval](#retrieval), and the limits matter: that golden
+set contains no `parseConfig`-shaped question at all.
 
 ### Grounded, or refused
 
@@ -314,12 +319,63 @@ and normalising them would invent an exchange rate nobody measured. So a span sc
 `Σ 1/(k + rank)` over the arms that returned it, with `k = 60` — the constant from the paper the
 method comes from, **not a value measured against this corpus**.
 
-**Nothing here claims fusion retrieves better.** Whether it does is the experiment, not the
-premise. `RETRIEVAL_MODE` is `vector`, `lexical` or `hybrid`; `hybrid` is the default because the
-design *defines* retrieval as hybrid, which is a conformance choice and not a quality claim. Every
-hit carries its `vector_rank` and `lexical_rank` (`0` meaning that arm did not return it) so an
-arm's contribution is readable from the data rather than inferred, and `k` and the per-arm
-candidate depth are knobs so P6 can sweep them without a code change.
+**The experiment ran, and fusion lost.** `RETRIEVAL_MODE` is `vector`, `lexical` or `hybrid`;
+`RETRIEVAL_MODE` defaults to `vector`. It used to default to `hybrid` on a conformance argument —
+the design *defines* retrieval as hybrid — and that argument stopped being the best one available
+the moment there was a measurement.
+
+Measured on **one corpus**: `google/uuid` at `2d3c2a9`, 74 mechanically generated cases (every
+exported symbol with a doc comment; the question is the prose, the answer is that symbol's span),
+live `nomic-embed-text`, `k = 60`, 40 candidates per arm, limit 10, identifier splitting on. Only
+`RETRIEVAL_MODE` differed between the three runs. On the AST arm:
+
+| mode | MRR | hit@1 | hit@5 | hit@10 | gold never retrieved |
+| --- | --- | --- | --- | --- | --- |
+| `vector` | **0.7492** | 0.6216 | 0.9054 | 0.9459 | 4 / 74 |
+| `hybrid` | 0.4023 | 0.2432 | 0.6351 | 0.7568 | 18 / 74 |
+| `lexical` | 0.1637 | 0.0676 | 0.2703 | 0.3784 | 46 / 74 |
+
+The rule was written down before the data. MRR is the primary endpoint; the threshold is
+`max(2σ, δ)` with `δ = 0.02` a pre-registered minimum effect size and σ the bootstrap standard error
+of the difference, resampling the 74 questions with replacement `B = 1000` times from the
+per-question ranks. σ = 0.052, so the threshold is 0.104. `MRR(hybrid) − max(MRR(vector),
+MRR(lexical)) = −0.347`, which is 3.3× the threshold in the losing direction. σ is stable: 0.049 to
+0.055 over five seeds and `B` from 200 to 20,000, and the branch is the same in every one. The
+window arm agrees in direction and by a narrower margin (−0.122 against a threshold of 0.098). The
+script is [`docs/eval/bootstrap.py`](docs/eval/bootstrap.py); the runs are under
+[`docs/eval/runs/`](docs/eval/runs).
+
+hit@k and the refusal behaviour were reported and did not decide. They **agree** with MRR in sign
+at every `k`, which is worth saying because a disagreement would have been the more interesting
+finding and would have left the default where it was. The `gold never retrieved` column is the
+mechanism: both arms are searched to a depth of 40 and the fused list is then trimmed to 10, so a
+lexical arm that ranks the gold span poorly pushes it out of the answer entirely — hybrid loses the
+gold span in 18 cases where vector alone loses it in 4.
+
+**What this result does not say.** It is **one corpus** — one small, single-package Go library —
+and P6 declined to calibrate the score floor on one corpus for exactly that reason. The golden set
+is *doc-comment prose → the symbol it documents*, which is close to the best case for embeddings and
+close to the worst case for a lexical arm: it contains no identifier-lookup question at all, and
+"where is `parseConfig` defined" is the question the lexical arm exists for. So the honest claim is
+**fusion does not help on doc-comment prose queries, on this corpus, at these settings** — not
+"fusion does not help". Two of P3's measured limits compound it and are not controlled for: the
+shipped `ts_rank_cd` makes repetition outrank coverage, and the `simple` text-search configuration
+has no stopword list, so "where is X defined" ORs in `where`, `is` and `defined`. If the lexical arm
+is to be judged, it should be judged after a stopword list and a ranking-function sweep, against a
+second golden set of identifier lookups. That is P6-shaped work and it has not been done.
+
+**Nothing was deleted.** Fusion, the per-arm weights and the per-arm ranks all still ship, and they
+are how a later phase re-runs this comparison on a bigger corpus. Every hit carries its
+`vector_rank` and `lexical_rank` (`0` meaning that arm did not return it) so an arm's contribution
+is readable from the data rather than inferred, and `k`, the per-arm candidate depth and the
+per-arm fusion weights are all settable without a code change.
+
+> **Deviation from the design.** §8 states retrieval as "pgvector cosine over spans, filtered by
+> repo, **fused by reciprocal rank with a lexical arm**", which reads as a definition. §14 lists
+> "**whether lexical fusion helps, and by how much**" as an open question to be decided with
+> evidence. A mechanism cannot be both the definition and the open question; this project resolved
+> it toward §14, and the resolution is recorded here rather than taken quietly. The mechanism is
+> still shipped and still switchable — only the default moved.
 
 **The floor is compared against the vector arm's cosine similarity**, not the fused score. After
 reciprocal-rank fusion there is no quality number left: the top hit of any non-empty result scores
@@ -680,7 +736,7 @@ inferred.
 | **P3** | Retrieval, citations, extractive ask, the floor as a mechanism | done; the floor's *value* is P6 |
 | **P4** | Symbol graph, per-edge provenance, graph endpoints | done; the eval that would say whether it helps is P6 |
 | **P5** | React console | done; the floor it reports refusals against is still a mechanism at −1 |
-| **P6** | Eval harness: generated golden set, AST versus window | not started |
+| **P6** | Eval harness: generated golden set, AST versus window | done; ran on `google/uuid`, 74 cases. The floor is still **not** calibrated — one corpus was not enough |
 | **P7** | LLM tool loop, hybrid retrieval fusion, incremental re-index | not started |
 | **P8** | Terraform, CD, deploy | done; **never applied** — see [Deployment](#deployment) |
 

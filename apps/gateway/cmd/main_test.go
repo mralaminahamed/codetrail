@@ -7,6 +7,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -383,17 +385,18 @@ func TestTheFloorGaugeIsSetFromTheConfiguredValue(t *testing.T) {
 	}
 }
 
-// The shipped defaults, all of them, in one place: hybrid because spec §8
-// defines retrieval as hybrid, k=60 from the paper, 40 candidates because that
-// is pgvector's hnsw.ef_search default, and a floor of -1 that cannot exclude
-// anything. If any of these moves, the README moved with it.
-func TestTheDefaultRetrieverIsHybridAtTheUncalibratedFloor(t *testing.T) {
+// The shipped defaults, all of them, in one place: VECTOR since P7, on a
+// measurement rather than on conformance; k=60 from the paper; 40 candidates
+// because that is pgvector's hnsw.ef_search default; unit fusion weights; and a
+// floor of -1 that cannot exclude anything. If any of these moves, the README
+// moved with it — which the test below asserts rather than asks.
+func TestTheDefaultRetrieverIsVectorAtTheUncalibratedFloor(t *testing.T) {
 	bootEnv(t)
 	r, logged, err := boot(t)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Mode != rag.ModeHybrid || r.Fusion != rag.DefaultParams() || r.Candidates != 40 || !r.Split {
+	if r.Mode != rag.ModeVector || r.Fusion != rag.DefaultParams() || r.Candidates != 40 || !r.Split {
 		t.Errorf("mode=%s fusion=%+v candidates=%d split=%v", r.Mode, r.Fusion, r.Candidates, r.Split)
 	}
 	if r.Floor != rag.DefaultFloor() || r.Floor.Value != -1 || r.Floor.Calibrated {
@@ -499,4 +502,62 @@ func TestTheUnsetFloorIsTheShippedDefaultWhole(t *testing.T) {
 	if got, err := scoreFloor(); err != nil || got != rag.DefaultFloor() {
 		t.Errorf("with no environment the floor is %+v (%v), want %+v", got, err, rag.DefaultFloor())
 	}
+}
+
+// A default that moved with no published measurement beside it is the "guess
+// wearing a measurement's clothes" the -1 floor was chosen to prevent, and the
+// README is where a reader checks. A test on the constant alone cannot detect a
+// README that still says hybrid.
+func TestTheDefaultRetrievalModeMatchesWhatTheReadmeRecords(t *testing.T) {
+	bootEnv(t)
+	r, _, err := boot(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readme, err := os.ReadFile(filepath.Join("..", "..", "..", "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sec := section(t, string(readme), "## Retrieval")
+	want := "`RETRIEVAL_MODE` defaults to `" + string(r.Mode) + "`"
+	if !strings.Contains(sec, want) {
+		t.Errorf("boot default %q; the README's Retrieval section does not say %q", r.Mode, want)
+	}
+	// And the numbers that moved it, so the default and its evidence cannot
+	// drift apart. Each of these is a figure from the run, not a rounding
+	// anybody may adjust.
+	for _, n := range []string{"0.7492", "0.4023", "0.1637", "google/uuid", "2d3c2a9", "74"} {
+		if !strings.Contains(sec, n) {
+			t.Errorf("the README's Retrieval section does not carry %q", n)
+		}
+	}
+	// The SCOPED CLAIM itself, verbatim, not a phrase that could appear
+	// incidentally. Measured: asserting only that the words "one corpus" occur
+	// somewhere in the section passed under a mutation that deleted every
+	// hedge, because a different sentence about P6's floor also contains them.
+	// A result stated without its scope is a broader claim than the run
+	// supports, and this is the sentence that carries the scope.
+	for _, claim := range []string{
+		"fusion does not help on doc-comment prose queries, on this corpus, at these settings",
+		"Measured on **one corpus**",
+		"no identifier-lookup question at all",
+	} {
+		if !strings.Contains(sec, claim) {
+			t.Errorf("the README's Retrieval section does not state the limit %q", claim)
+		}
+	}
+}
+
+// section returns one "## " heading's body.
+func section(t *testing.T, doc, heading string) string {
+	t.Helper()
+	i := strings.Index(doc, heading)
+	if i < 0 {
+		t.Fatalf("the README has no %q section", heading)
+	}
+	rest := doc[i+len(heading):]
+	if j := strings.Index(rest, "\n## "); j >= 0 {
+		return rest[:j]
+	}
+	return rest
 }

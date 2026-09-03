@@ -103,7 +103,18 @@ const queryEmbedTimeout = 15 * time.Second
 // The embedder is built last, after every knob that costs nothing to check, so
 // a typo in RETRIEVAL_MODE fails before a round trip rather than after it.
 func newRetriever(ctx context.Context, log zerolog.Logger, st rag.Searcher) (*rag.Retriever, error) {
-	mode, err := rag.ParseMode(config.Get("RETRIEVAL_MODE", string(rag.ModeHybrid)))
+	// vector, not hybrid, and the default moved on a measurement rather than on
+	// a preference. P6 ran all three modes over one corpus (google/uuid @
+	// 2d3c2a9, 74 cases, live nomic-embed-text) and the AST arm's MRR was
+	// vector 0.7492, hybrid 0.4023, lexical 0.1637 — a gap of 0.347 against a
+	// pre-registered threshold of max(2σ, 0.02) = 0.104.
+	//
+	// It is ONE CORPUS, and the golden set is doc-comment prose, which is close
+	// to the vector arm's best case and the lexical arm's worst. The mechanism
+	// stays shipped and RETRIEVAL_MODE still takes all three values. The README
+	// carries the numbers and the limits; do not restate the result here
+	// without them.
+	mode, err := rag.ParseMode(config.Get("RETRIEVAL_MODE", string(rag.ModeVector)))
 	if err != nil {
 		return nil, err
 	}
