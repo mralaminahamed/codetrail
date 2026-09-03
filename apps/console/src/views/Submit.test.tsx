@@ -127,6 +127,20 @@ describe("submitting a repository", () => {
     expect(readRecent()[0]?.remote).toBe(jobPending.remote);
   });
 
+  test("a pasted URL with surrounding whitespace is trimmed before it is sent", async () => {
+    // Without this the trim is unobservable: every other test types a clean
+    // URL. A pasted "  https://...  " reaches url.Parse with a leading space,
+    // fails admit's scheme check, and comes back as a 400 the user cannot act
+    // on.
+    const rec = stub("post", "/api/repos", 202, jobPending);
+    const user = userEvent.setup();
+    renderSubmit();
+    await user.type(screen.getByLabelText("Repository URL"), "  https://github.com/rs/zerolog  ");
+    await user.click(screen.getByRole("button", { name: "Index this repository" }));
+    await waitFor(() => expect(rec.calls).toBe(1));
+    expect(rec.bodies[0]).toEqual({ remote: "https://github.com/rs/zerolog" });
+  });
+
   test("an empty ref is sent as absent, not as HEAD", async () => {
     const rec = stub("post", "/api/repos", 202, jobPending);
     renderSubmit();
