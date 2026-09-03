@@ -24,3 +24,6 @@ docs/plan-*.md
 
 # SDD workspace (git-ignored scratch)
 .superpowers/
+
+# Eval artefacts (mechanics runs are not measurements)
+docs/eval/mechanics/

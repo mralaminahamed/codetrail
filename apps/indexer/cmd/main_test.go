@@ -16,7 +16,6 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/mralaminahamed/codetrail/apps/indexer/internal/clone"
-	"github.com/mralaminahamed/codetrail/apps/indexer/internal/walk"
 	"github.com/mralaminahamed/codetrail/packages/shared/admit"
 	"github.com/mralaminahamed/codetrail/packages/shared/chunk"
 	"github.com/mralaminahamed/codetrail/packages/shared/embed"
@@ -24,6 +23,7 @@ import (
 	"github.com/mralaminahamed/codetrail/packages/shared/models"
 	"github.com/mralaminahamed/codetrail/packages/shared/store"
 	"github.com/mralaminahamed/codetrail/packages/shared/symbols"
+	"github.com/mralaminahamed/codetrail/packages/shared/walk"
 )
 
 type failCall struct {
@@ -423,9 +423,9 @@ func TestRunJobIndexesAndCompletes(t *testing.T) {
 	}
 	want := []models.File{
 		{ID: store.FileID(repoID, "main.go"), RepoID: repoID, Path: "main.go",
-			Blob: blobHash([]byte(mainGo)), Lang: "go", Lines: 3},
+			Blob: store.BlobHash([]byte(mainGo)), Lang: "go", Lines: 3},
 		{ID: store.FileID(repoID, "a/b.md"), RepoID: repoID, Path: "a/b.md",
-			Blob: blobHash([]byte(readmeMD)), Lang: "markdown", Lines: 1},
+			Blob: store.BlobHash([]byte(readmeMD)), Lang: "markdown", Lines: 1},
 	}
 	if len(gotFiles) != len(want) {
 		t.Fatalf("want %d files, got %d", len(want), len(gotFiles))
@@ -1327,7 +1327,7 @@ func TestFileRowsCarryTheBlobHash(t *testing.T) {
 	ix.runJob(context.Background(), aJob())
 
 	for _, f := range rec.files {
-		want := blobHash([]byte(fixtureRepo[f.Path]))
+		want := store.BlobHash([]byte(fixtureRepo[f.Path]))
 		if f.Blob != want {
 			t.Errorf("%s: blob %q, want %q", f.Path, f.Blob, want)
 		}

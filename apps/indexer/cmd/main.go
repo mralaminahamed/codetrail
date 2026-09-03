@@ -20,7 +20,6 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/mralaminahamed/codetrail/apps/indexer/internal/clone"
-	"github.com/mralaminahamed/codetrail/apps/indexer/internal/walk"
 	"github.com/mralaminahamed/codetrail/packages/shared/admit"
 	"github.com/mralaminahamed/codetrail/packages/shared/chunk"
 	"github.com/mralaminahamed/codetrail/packages/shared/config"
@@ -30,6 +29,7 @@ import (
 	"github.com/mralaminahamed/codetrail/packages/shared/models"
 	"github.com/mralaminahamed/codetrail/packages/shared/store"
 	"github.com/mralaminahamed/codetrail/packages/shared/symbols"
+	"github.com/mralaminahamed/codetrail/packages/shared/walk"
 )
 
 // queue is the slice of jobs.Queue this worker uses. An interface so the loop
@@ -531,9 +531,9 @@ func (ix *indexer) index(ctx context.Context, l zerolog.Logger, repoID, root str
 			rows = append(rows, row)
 			continue
 		}
-		row.Blob = blobHash(body)
+		row.Blob = store.BlobHash(body)
 		rows = append(rows, row)
-		if !indexable(f, body) {
+		if !walk.Indexable(f, body) {
 			continue
 		}
 		// The graph pass parses the raw body, and never the stripped src

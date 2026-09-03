@@ -1,0 +1,13 @@
+package other
+
+func Get(n string) (int, error) {
+	// Get returns the thing named n.
+	// It returns an error if n is unknown.
+	//
+	// The prose above is one golden question's, verbatim, and it is inside a
+	// function body on purpose: StripDocs blanks doc comments and keeps every
+	// comment inside a body, so this span carries it in both corpora. That is
+	// what makes a missing repo_id filter change the answer rather than add a
+	// row nobody looks at.
+	return 0, nil
+}

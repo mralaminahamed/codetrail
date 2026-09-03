@@ -1,0 +1,19 @@
+// Package simple carries one of every shape Generate has to tell apart.
+package simple
+
+import "errors"
+
+// Add returns the sum of a and b.
+func Add(a, b int) int { return a + b }
+
+// Get returns the thing named n.
+// It returns an error if n is unknown.
+func Get(n string) (int, error) { return 0, errors.New(n) }
+
+func Undocumented() int { return 0 }
+
+// helper is not part of the API.
+func helper() int { return 1 }
+
+// Deprecated.
+type Legacy struct{}
