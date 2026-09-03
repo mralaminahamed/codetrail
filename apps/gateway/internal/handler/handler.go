@@ -34,6 +34,16 @@ type Handler struct {
 	Rag    Retriever
 	Floor  rag.Floor
 	Budget rag.Budget
+	// LLM is the bounded loop, or nil when LLM_PROVIDER=none. Nil is not a
+	// degraded state: an unconfigured deployment is one that was never asked to
+	// do this, and reporting it as degraded would make every offline deploy
+	// look broken.
+	LLM Answerer
+	// AnswerDefault is what a request that names no answerer gets. It defaults
+	// to extractive EVEN WHEN A PROVIDER IS CONFIGURED, because spec:230 makes
+	// the free path the default and a public demo has to cost nothing per
+	// visitor who does not ask for more.
+	AnswerDefault string
 	// Now dates citations. A field so a test can pin the staleness wording
 	// against a fixed clock.
 	Now func() time.Time

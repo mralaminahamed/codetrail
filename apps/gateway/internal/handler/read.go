@@ -12,6 +12,7 @@ import (
 	"github.com/labstack/echo/v4"
 
 	"github.com/mralaminahamed/codetrail/packages/shared/admit"
+	"github.com/mralaminahamed/codetrail/packages/shared/agent"
 	"github.com/mralaminahamed/codetrail/packages/shared/metrics"
 	"github.com/mralaminahamed/codetrail/packages/shared/models"
 	"github.com/mralaminahamed/codetrail/packages/shared/rag"
@@ -63,11 +64,16 @@ const (
 	defaultRepoLimit   = 20
 )
 
-// answeredBy names what produced an answer. There is exactly one answerer until
-// P7 and the field exists anyway: spec §8 calls a silent downgrade the failure
-// that costs a week, and a client written before the field exists cannot notice
-// one.
-const answeredBy = "extractive"
+// degradedView says that the loop was attempted and did not write the answer.
+//
+// Present IFF answered_by is extractive AND the loop was attempted. Never for
+// an unconfigured deployment — that is not a degradation — and never for a
+// caller who asked for extractive, which would make the default look like a
+// failure.
+type degradedView struct {
+	From   string `json:"from"`
+	Reason string `json:"reason"`
+}
 
 type repoView struct {
 	ID         string    `json:"id"`
@@ -146,11 +152,19 @@ type searchResponse struct {
 }
 
 type answerResponse struct {
-	RepoID     string      `json:"repo_id"`
-	Refused    bool        `json:"refused"`
-	AnsweredBy string      `json:"answered_by"`
-	Answer     string      `json:"answer"`
-	Citations  []rag.Cited `json:"citations"`
+	RepoID  string `json:"repo_id"`
+	Refused bool   `json:"refused"`
+	// AnsweredBy names what wrote the prose the caller is reading — never what
+	// was attempted. One of exactly two values, on every /ask response.
+	AnsweredBy string        `json:"answered_by"`
+	Degraded   *degradedView `json:"degraded,omitempty"`
+	// LLM is present IFF the loop ran, degradation included, so a reader can
+	// see the work done before the fallback. A zero-valued block on every
+	// extractive answer would make "the loop ran and stopped at step 0" and
+	// "the loop never ran" the same payload.
+	LLM       *agent.Trace `json:"llm,omitempty"`
+	Answer    string       `json:"answer"`
+	Citations []rag.Cited  `json:"citations"`
 	// How many ranked spans did not fit the budget. An answer built from 2 of 7
 	// spans is a different claim from one built from all of them.
 	Dropped  int       `json:"dropped"`
@@ -164,13 +178,20 @@ type answerResponse struct {
 // inside every error-rate panel in existence, which is the hiding §10 exists to
 // prevent.
 type refusalResponse struct {
-	RepoID   string     `json:"repo_id"`
-	Refused  bool       `json:"refused"`
-	Reason   rag.Reason `json:"reason"`
-	Detail   string     `json:"detail"`
-	Mode     rag.Mode   `json:"mode"`
-	TopScore *float64   `json:"top_score"`
-	Floor    floorView  `json:"floor"`
+	RepoID  string `json:"repo_id"`
+	Refused bool   `json:"refused"`
+	// P3 put answered_by on the answer and not here, which left a refusal
+	// unable to say which answerer refused — the same failure one route over,
+	// and exactly where a caller most wants to know whether a model was
+	// consulted.
+	AnsweredBy string        `json:"answered_by"`
+	Degraded   *degradedView `json:"degraded,omitempty"`
+	LLM        *agent.Trace  `json:"llm,omitempty"`
+	Reason     rag.Reason    `json:"reason"`
+	Detail     string        `json:"detail"`
+	Mode       rag.Mode      `json:"mode"`
+	TopScore   *float64      `json:"top_score"`
+	Floor      floorView     `json:"floor"`
 }
 
 func (h *Handler) listRepos(c echo.Context) error {
@@ -273,6 +294,13 @@ type searchRequest struct {
 	K        *int     `json:"k"`
 	WVector  *float64 `json:"w_vector"`
 	WLexical *float64 `json:"w_lexical"`
+	// Answerer is the ONE request field this endpoint honours, and it does not
+	// contradict the rule above. mode is refused because Search takes no
+	// argument for it, so no value here could select anything; answerer
+	// genuinely varies per request — the same process serves both — so
+	// accepting it selects something real. It is meaningless on /search, which
+	// refuses it.
+	Answerer *string `json:"answerer"`
 }
 
 // retrievalParamDetail is the 400 a retrieval parameter earns. Spec §10: name
@@ -283,6 +311,13 @@ func (h *Handler) search(c echo.Context) error {
 	var req searchRequest
 	q, limit, ok := h.query(c, &req, defaultSearchLimit)
 	if !ok {
+		return nil
+	}
+	// Refused here and honoured on /ask. Search ranks; it writes no prose, so
+	// there is nothing for an answerer to select — and a field accepted and
+	// ignored is worse than one refused.
+	if req.Answerer != nil {
+		badRequest(c, "answerer is not a search field: search ranks spans and writes no answer")
 		return nil
 	}
 	r, ok, err := h.lookupRepo(c)
@@ -342,6 +377,10 @@ func (h *Handler) ask(c echo.Context) error {
 		// exactly the rate spec §10 wants readable.
 		return nil
 	}
+	want, ok := h.answerer(c, req.Answerer)
+	if !ok {
+		return nil
+	}
 	r, ok, err := h.lookupRepo(c)
 	if !ok {
 		return err
@@ -357,15 +396,56 @@ func (h *Handler) ask(c echo.Context) error {
 
 	floor := floorView{Value: h.Floor.Value, Calibrated: h.Floor.Calibrated, Applicable: out.VectorRan}
 	outcome, reason := out.Decide(h.Floor)
-	if outcome == rag.OutcomeRefused {
-		metrics.CountAnswer("refused")
-		metrics.CountRefusal(string(reason))
-		h.touch(c, r.ID)
-		// 200: a refusal is an outcome, not an error.
-		return c.JSON(http.StatusOK, refusalResponse{
-			RepoID: r.ID, Refused: true, Reason: reason, Detail: detail(reason, h.Floor),
-			Mode: out.Mode, TopScore: number(out.TopScore), Floor: floor,
-		})
+
+	// The loop runs only where the floor did not already settle it, and NEVER on
+	// no_spans: a loop over a corpus with nothing in it is spend with no
+	// possible answer, and spec:230's "costs nothing per visitor" is the reason
+	// to care.
+	tryLoop := want == answererLLM && h.LLM != nil &&
+		(outcome == rag.OutcomeAnswered ||
+			(reason != rag.ReasonNoSpans && h.belowFloorLoop()))
+
+	if outcome == rag.OutcomeRefused && !tryLoop {
+		return h.refuse(c, r, out, floor, reason, answererExtractive, nil, nil)
+	}
+
+	var degraded *degradedView
+	var trace *agent.Trace
+	if tryLoop {
+		a := h.LLM.Ask(ctx, r.ID, q, out)
+		metrics.CountLLMStop(string(a.Trace.Stop))
+		metrics.ObserveLLM(a.Trace.Steps, a.Trace.Usage.InputTokens, a.Trace.Usage.OutputTokens)
+		trace = &a.Trace
+		if a.Trace.Stop == agent.StopFinal {
+			newer, err := h.newer(ctx, r.ID)
+			if err != nil {
+				metrics.CountAnswer("error")
+				return h.fail(c, err, "ask")
+			}
+			metrics.CountAnswer("answered")
+			metrics.CountAnswerBy(answererLLM)
+			h.touch(c, r.ID)
+			return c.JSON(http.StatusOK, answerResponse{
+				RepoID: r.ID, Refused: false, AnsweredBy: answererLLM, LLM: trace,
+				Answer: a.Text, Citations: cited(r, a, newer, h.now()),
+				Mode: out.Mode, TopScore: number(out.TopScore), Floor: floor,
+			})
+		}
+		degraded = &degradedView{From: answererLLM, Reason: string(a.Trace.Stop)}
+		// stop, steps, tool_calls, the repo id and the request id — and nothing
+		// else. Never the question, never the prompt, never what the model
+		// wrote: all three are derived from a stranger's repository or from a
+		// user's prose, and a log aggregator is not a place either belongs.
+		h.Log.Warn().Str("request_id", requestID(c)).Str("repo_id", r.ID).
+			Str("stop", string(a.Trace.Stop)).Int("steps", a.Trace.Steps).
+			Int("tool_calls", a.Trace.ToolCalls).Msg("the answering loop degraded to extractive")
+
+		// The degraded loop does not inherit the floor's permission to be
+		// ignored. Without this, LLM_BELOW_FLOOR=true would turn every
+		// degradation into an answer to a question the floor refused.
+		if outcome == rag.OutcomeRefused {
+			return h.refuse(c, r, out, floor, reason, answererExtractive, degraded, trace)
+		}
 	}
 
 	newer, err := h.newer(ctx, r.ID)
@@ -375,12 +455,87 @@ func (h *Handler) ask(c echo.Context) error {
 	}
 	a := rag.Assemble(r, out.Hits, out.Spans, newer, h.now(), h.Budget)
 	metrics.CountAnswer("answered")
+	metrics.CountAnswerBy(answererExtractive)
 	h.touch(c, r.ID)
 	return c.JSON(http.StatusOK, answerResponse{
-		RepoID: r.ID, Refused: false, AnsweredBy: answeredBy,
+		RepoID: r.ID, Refused: false, AnsweredBy: answererExtractive,
+		Degraded: degraded, LLM: trace,
 		Answer: a.Text, Citations: a.Citations, Dropped: a.Dropped,
 		Mode: out.Mode, TopScore: number(out.TopScore), Floor: floor,
 	})
+}
+
+// refuse is the one place a refusal is written, so answered_by cannot be on one
+// refusal path and missing from another.
+//
+// A degradation counts as answered on codetrail_answer_total and a refusal as
+// refused: the degradation is a fact about HOW, not about WHETHER.
+func (h *Handler) refuse(c echo.Context, r models.Repo, out rag.Result, floor floorView,
+	reason rag.Reason, by string, degraded *degradedView, trace *agent.Trace,
+) error {
+	metrics.CountAnswer("refused")
+	metrics.CountRefusal(string(reason))
+	metrics.CountAnswerBy(by)
+	h.touch(c, r.ID)
+	// 200: a refusal is an outcome, not an error.
+	return c.JSON(http.StatusOK, refusalResponse{
+		RepoID: r.ID, Refused: true, AnsweredBy: by, Degraded: degraded, LLM: trace,
+		Reason: reason, Detail: detail(reason, h.Floor),
+		Mode: out.Mode, TopScore: number(out.TopScore), Floor: floor,
+	})
+}
+
+// belowFloorLoop reports whether the loop may run on a result the floor
+// refused. Off in the shipped configuration; see Loop.BelowFloor.
+func (h *Handler) belowFloorLoop() bool {
+	l, ok := h.LLM.(*Loop)
+	return ok && l.BelowFloor
+}
+
+// cited turns the loop's resolved markers into the same Cited shape the
+// extractive path returns, so a console renders one citation type.
+//
+// Markers are positional and were resolved in agent.Resolve against the spans
+// the loop actually opened; nothing here re-parses the model's text.
+func cited(r models.Repo, a agent.Answer, newer rag.Newer, now time.Time) []rag.Cited {
+	out := make([]rag.Cited, 0, len(a.Cited))
+	for i, pos := range a.Cited {
+		sp := a.Read[pos]
+		out = append(out, rag.Cited{
+			Marker: pos + 1, SpanID: sp.ID, Kind: sp.Kind, Symbol: sp.Symbol,
+			Citation: rag.NewCitation(r, sp, newer, now),
+		})
+		_ = i
+	}
+	return out
+}
+
+// answerer resolves which answerer this request asked for. ok=false means a 400
+// has been written.
+//
+// Asking for llm on a deployment that has none is a 400 NAMING THE RULE, not a
+// silent extractive answer. This is the one place where not degrading is right:
+// the caller asked for something this deployment does not have, which is a
+// different fact from something this deployment tried and could not do.
+func (h *Handler) answerer(c echo.Context, req *string) (string, bool) {
+	want := h.AnswerDefault
+	if want == "" {
+		want = answererExtractive
+	}
+	if req != nil {
+		switch *req {
+		case answererExtractive, answererLLM:
+			want = *req
+		default:
+			badRequest(c, "answerer must be "+answererExtractive+" or "+answererLLM)
+			return "", false
+		}
+	}
+	if want == answererLLM && h.LLM == nil {
+		badRequest(c, "answerer "+answererLLM+" is not available: this deployment has no model provider configured")
+		return "", false
+	}
+	return want, true
 }
 
 // noSpans is the retriever's report that this repository holds nothing to rank:

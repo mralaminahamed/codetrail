@@ -20,10 +20,12 @@ import (
 	"github.com/mralaminahamed/codetrail/apps/gateway/internal/handler"
 	"github.com/mralaminahamed/codetrail/apps/gateway/internal/server"
 	"github.com/mralaminahamed/codetrail/packages/shared/admit"
+	"github.com/mralaminahamed/codetrail/packages/shared/agent"
 	"github.com/mralaminahamed/codetrail/packages/shared/config"
 	"github.com/mralaminahamed/codetrail/packages/shared/embed"
 	"github.com/mralaminahamed/codetrail/packages/shared/health"
 	"github.com/mralaminahamed/codetrail/packages/shared/jobs"
+	"github.com/mralaminahamed/codetrail/packages/shared/llm"
 	"github.com/mralaminahamed/codetrail/packages/shared/logger"
 	"github.com/mralaminahamed/codetrail/packages/shared/metrics"
 	"github.com/mralaminahamed/codetrail/packages/shared/rag"
@@ -56,11 +58,99 @@ func allowedHosts() []string {
 // The floor is copied off the retriever rather than read from the environment a
 // second time: two parses of ANSWER_SCORE_FLOOR could disagree, and then the
 // number in the payload would not be the number the decision used.
-func newHandler(log zerolog.Logger, q handler.Enqueuer, rd handler.Reader, r *rag.Retriever, b rag.Budget) *handler.Handler {
+func newHandler(log zerolog.Logger, q handler.Enqueuer, rd handler.Reader, r *rag.Retriever,
+	b rag.Budget, loop handler.Answerer, answerDefault string,
+) *handler.Handler {
 	return &handler.Handler{
 		Policy: admit.NewPolicy(allowedHosts()), Jobs: q,
 		Repos: rd, Rag: r, Floor: r.Floor, Budget: b, Now: time.Now, Log: log,
+		LLM: loop, AnswerDefault: answerDefault,
 	}
+}
+
+// llmClientTimeout is one HTTP request's own budget, deliberately LONGER than
+// the loop's whole deadline: the loop's context is what should end a call, and
+// a client timeout shorter than it would end one first and report the wrong
+// reason.
+const llmClientTimeout = 90 * time.Second
+
+// answering builds the loop, or returns nil when there is no provider.
+//
+// nil is not a degraded state. LLM_PROVIDER defaults to none, and with none no
+// client is constructed, no key is read and nothing is dialled — spec:230-232
+// makes the extractive path the default and says a public demo costs nothing
+// per visitor.
+//
+// ANSWER_DEFAULT defaults to extractive EVEN WITH A PROVIDER CONFIGURED. A
+// public demo therefore runs LLM_PROVIDER=anthropic with
+// ANSWER_DEFAULT=extractive: a visitor gets the free path, and a caller who
+// spends has to say so.
+func answering(log zerolog.Logger, rd handler.Reader, r *rag.Retriever) (handler.Answerer, string, error) {
+	def := config.Get("ANSWER_DEFAULT", "extractive")
+	if def != "extractive" && def != "llm" {
+		return nil, "", fmt.Errorf("ANSWER_DEFAULT must be extractive or llm, got %q", def)
+	}
+	m, err := llm.FromEnv(llmClientTimeout)
+	if err != nil {
+		return nil, "", err
+	}
+	if m == nil {
+		// A setting an operator believes is in force and is not: refused at
+		// boot, like every other knob in this codebase.
+		if def == "llm" {
+			return nil, "", errors.New("ANSWER_DEFAULT=llm with LLM_PROVIDER=none: there is no model to answer with")
+		}
+		log.Info().Str("answer_default", def).
+			Msg("no model provider configured; every answer is extractive and nothing is a degradation")
+		return nil, def, nil
+	}
+	belowFloor, err := boolEnv("LLM_BELOW_FLOOR", "false")
+	if err != nil {
+		return nil, "", err
+	}
+	concurrent, err := config.GetInt("LLM_MAX_CONCURRENT", 2)
+	if err != nil {
+		return nil, "", err
+	}
+	if concurrent < 1 {
+		return nil, "", fmt.Errorf("LLM_MAX_CONCURRENT must be positive, got %d", concurrent)
+	}
+	// 200,000 is roughly fifteen worst-case requests an hour per process. NOT
+	// MEASURED — chosen to be obviously finite, and named as such. Per process:
+	// with n replicas the real ceiling is n times this, and the only control
+	// that is actually a ceiling is the provider's own account spend cap.
+	perHour, err := config.GetInt("LLM_TOKENS_PER_HOUR", 200_000)
+	if err != nil {
+		return nil, "", err
+	}
+	if perHour < 1 {
+		return nil, "", fmt.Errorf("LLM_TOKENS_PER_HOUR must be positive, got %d", perHour)
+	}
+	b := agent.DefaultBounds()
+	if err := b.Validate(); err != nil {
+		return nil, "", err
+	}
+	lim := agent.DefaultToolLimits()
+	log.Info().
+		Str("llm_model", m.Name()).Str("answer_default", def).
+		Bool("llm_below_floor", belowFloor).Int("llm_max_concurrent", concurrent).
+		Int("llm_tokens_per_hour", perHour).
+		Int("max_steps", b.MaxSteps).Int("max_tool_calls", b.MaxToolCalls).
+		Int("worst_case_tokens", b.MaxInputTokens+b.MaxOutputTokens).
+		Msg("answering loop configured; the token budget is per process and is not shared across replicas")
+	return handler.NewLoop(m, corpusOf(rd, r), b, lim, belowFloor, concurrent, perHour, time.Now), def, nil
+}
+
+// boolEnv parses rather than comparing against "true". The house rule, stated
+// three times in this codebase: a knob an operator believes is in force and is
+// not is the shape of bug this project has already shipped.
+func boolEnv(key, def string) (bool, error) {
+	v := config.Get(key, def)
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("%s must be a boolean, got %q", key, v)
+	}
+	return b, nil
 }
 
 // answerBudget reads what one answer may hold. Both knobs are validated rather
@@ -231,9 +321,32 @@ func scoreFloor() (rag.Floor, error) {
 // make it return, and an os.Stdout swap to see what it logged. That is heavier
 // and flakier machinery than anything else in this suite. The body is uncovered
 // by judgement, not because it cannot be reached.
-func newServer(log zerolog.Logger, st storeHandle, r *rag.Retriever, b rag.Budget) *echo.Echo {
-	return newRouter(health.NewReadiness(log, st.Ping).Ready, newHandler(log, jobs.New(st.Pool()), st, r, b))
+func newServer(log zerolog.Logger, st storeHandle, r *rag.Retriever, b rag.Budget,
+	loop handler.Answerer, answerDefault string,
+) *echo.Echo {
+	return newRouter(health.NewReadiness(log, st.Ping).Ready,
+		newHandler(log, jobs.New(st.Pool()), st, r, b, loop, answerDefault))
 }
+
+// corpus is what the four tools read through: the same Reader the endpoints use
+// and the same Retriever the search route uses.
+//
+// The tools call the STORE, not the gateway's own HTTP API. Routing a tool
+// through POST /api/repos/:repo/search would mean the public process making an
+// outbound request whose path and body a model influences, inside the process
+// that is already the public one. The cost is that a tool and its endpoint are
+// two code paths that can drift, and Task 10's live test is what keeps them
+// honest.
+type corpus struct {
+	handler.Reader
+	rag *rag.Retriever
+}
+
+func (c corpus) Search(ctx context.Context, repoID, q string, limit int) (rag.Result, error) {
+	return c.rag.Search(ctx, repoID, q, limit)
+}
+
+func corpusOf(rd handler.Reader, r *rag.Retriever) agent.Corpus { return corpus{Reader: rd, rag: r} }
 
 // probeMode is the container health check. See health.Probe: the image is
 // distroless, so there is no shell to run a curl in.
@@ -276,8 +389,12 @@ func main() {
 	}
 	log.Info().Int("answer_max_spans", budget.MaxSpans).Int("answer_max_chars", budget.MaxChars).
 		Msg("answer budget configured; spans are dropped whole, never truncated")
+	loop, answerDefault, err := answering(log, st, ret)
+	if err != nil {
+		log.Fatal().Err(err).Msg("bad answering config")
+	}
 
-	e := newServer(log, st, ret, budget)
+	e := newServer(log, st, ret, budget, loop, answerDefault)
 
 	addr := listenAddr()
 	go func() {
