@@ -9,7 +9,6 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -21,66 +20,13 @@ import (
 	"github.com/mralaminahamed/codetrail/packages/shared/admit"
 	"github.com/mralaminahamed/codetrail/packages/shared/config"
 	"github.com/mralaminahamed/codetrail/packages/shared/embed"
+	"github.com/mralaminahamed/codetrail/packages/shared/health"
 	"github.com/mralaminahamed/codetrail/packages/shared/jobs"
 	"github.com/mralaminahamed/codetrail/packages/shared/logger"
 	"github.com/mralaminahamed/codetrail/packages/shared/metrics"
 	"github.com/mralaminahamed/codetrail/packages/shared/rag"
 	"github.com/mralaminahamed/codetrail/packages/shared/store"
 )
-
-// pinger is what readinessFor needs of the store. An interface so the
-// composition can be tested without a Postgres to connect to.
-type pinger interface{ Ping(context.Context) error }
-
-// readiness answers /ready from a live dependency check, cached for ttl.
-//
-// The gateway refuses to boot without Postgres, so the case this exists for is
-// the one boot cannot cover: losing it afterwards. Without this, /ready keeps
-// answering 200 while every query behind it fails. The cache is why a
-// struggling database is not probed hardest exactly when it can least answer.
-type readiness struct {
-	ping    func(context.Context) error
-	timeout time.Duration
-	ttl     time.Duration
-	log     zerolog.Logger
-	now     func() time.Time
-
-	mu      sync.Mutex
-	checked time.Time
-	ok      bool
-}
-
-func readinessFor(log zerolog.Logger, st pinger) *readiness {
-	// The TTL sits under the 30s probe interval an orchestrator uses, so a
-	// probe never reads an answer it could have refreshed; the timeout is well
-	// inside the 5s a container health check allows for the whole command.
-	//
-	// Seeded true, not zero: this is only reached after boot proved Postgres
-	// reachable, and an unset gauge reads 0, which would alert on every start.
-	metrics.SetReady(true)
-	return &readiness{ping: st.Ping, timeout: 2 * time.Second, ttl: 10 * time.Second, log: log, now: time.Now}
-}
-
-func (r *readiness) Ready() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	now := r.now()
-	if !r.checked.IsZero() && now.Sub(r.checked) < r.ttl {
-		return r.ok
-	}
-	was, first := r.ok, r.checked.IsZero()
-	ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
-	err := r.ping(ctx)
-	cancel()
-	r.ok, r.checked = err == nil, now
-	if err != nil {
-		r.log.Warn().Err(err).Str("dependency", "postgres").Msg("not ready")
-	} else if !was && !first {
-		r.log.Info().Msg("ready again")
-	}
-	metrics.SetReady(r.ok)
-	return r.ok
-}
 
 // newRouter builds the router the binary actually serves. A function rather
 // than inline in main so a test can pin the composition.
@@ -266,7 +212,7 @@ func scoreFloor() (rag.Floor, error) {
 // and flakier machinery than anything else in this suite. The body is uncovered
 // by judgement, not because it cannot be reached.
 func newServer(log zerolog.Logger, st storeHandle, r *rag.Retriever, b rag.Budget) *echo.Echo {
-	return newRouter(readinessFor(log, st).Ready, newHandler(log, jobs.New(st.Pool()), st, r, b))
+	return newRouter(health.NewReadiness(log, st.Ping).Ready, newHandler(log, jobs.New(st.Pool()), st, r, b))
 }
 
 func main() {
