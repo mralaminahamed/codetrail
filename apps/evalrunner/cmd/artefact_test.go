@@ -407,3 +407,92 @@ func TestTheFilenameSeparatesTheThreeModes(t *testing.T) {
 		t.Errorf("three modes produced %d filenames", len(seen))
 	}
 }
+
+// The corpora were named and committed before anything was measured, so this
+// reads that ledger and not the runs/ directory. A test that reads the
+// directory agrees with whatever is there, which is the definition of no test
+// at all — and the discipline it enforces is that a repository cannot be
+// dropped for having disagreed.
+//
+// Both directions: a corpus marked published must have a run, and a corpus
+// marked refused must have none. Without the second half, "refused" would be a
+// label anyone could attach to a repository whose numbers they disliked.
+func TestEveryNamedCorpusHasACommittedRun(t *testing.T) {
+	const ledger = "../../../docs/eval/corpora.md"
+	b, err := os.ReadFile(ledger)
+	if err != nil {
+		t.Fatalf("reading the corpora ledger: %v", err)
+	}
+	runs := publishedRemotes(t)
+
+	named := 0
+	for _, line := range strings.Split(string(b), "\n") {
+		remote, result, ok := ledgerRow(line)
+		if !ok {
+			continue
+		}
+		named++
+		switch {
+		case strings.Contains(result, "published"):
+			if !runs[remote] {
+				t.Errorf("%s names %s as published but docs/eval/runs holds no run for it; this phase named it before measuring", ledger, remote)
+			}
+		case strings.Contains(result, "refused"):
+			if runs[remote] {
+				t.Errorf("%s names %s as refused and docs/eval/runs holds a run for it", ledger, remote)
+			}
+			if !strings.Contains(result, "leak") && !strings.Contains(result, "probe") {
+				t.Errorf("%s: %s is refused with no reason named: %q", ledger, remote, result)
+			}
+		default:
+			t.Errorf("%s: %s has result %q, which is neither published nor refused", ledger, remote, result)
+		}
+	}
+	if named < 3 {
+		t.Errorf("the ledger names %d corpora, want the three it was committed with", named)
+	}
+	// Nothing published that the ledger does not name.
+	for remote := range runs {
+		if !strings.Contains(string(b), remote) {
+			t.Errorf("docs/eval/runs holds a run for %s, which the ledger does not name", remote)
+		}
+	}
+}
+
+// ledgerRow reads one repository row: the remote in the first cell and the
+// result in the last.
+func ledgerRow(line string) (string, string, bool) {
+	if !strings.HasPrefix(strings.TrimSpace(line), "| `https://") {
+		return "", "", false
+	}
+	cells := strings.Split(strings.Trim(strings.TrimSpace(line), "|"), "|")
+	if len(cells) < 4 {
+		return "", "", false
+	}
+	return strings.Trim(strings.TrimSpace(cells[0]), "`"), strings.TrimSpace(cells[len(cells)-1]), true
+}
+
+func publishedRemotes(t *testing.T) map[string]bool {
+	t.Helper()
+	out := map[string]bool{}
+	err := filepath.WalkDir(filepath.Join("..", "..", "..", "docs", "eval", DirRuns),
+		func(p string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() || !strings.HasSuffix(p, ".json") {
+				return err
+			}
+			b, rerr := os.ReadFile(p)
+			if rerr != nil {
+				return rerr
+			}
+			var r Run
+			if uerr := json.Unmarshal(b, &r); uerr != nil {
+				return uerr
+			}
+			out[r.Remote] = true
+			return nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
