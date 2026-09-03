@@ -32,10 +32,78 @@ denominator: a case with no right answer here cannot be got wrong here.
 ## Runs
 
 Real runs only, newest first. A mechanics run never appears in this table.
+`docs/eval/corpora.md` accounts for every named corpus, including the two the
+leakage probe refused.
 
 | Date | Repository | Commit | Embedder | Mode | File |
 | --- | --- | --- | --- | --- | --- |
-| _(none yet)_ | | | | | |
+| 2026-09-03 | `google/uuid` | `2d3c2a9` | `nomic-embed-text`/768 | hybrid | [`runs/2026-09-03-google-uuid-hybrid-nomic-embed-text.json`](runs/2026-09-03-google-uuid-hybrid-nomic-embed-text.json) |
+| 2026-09-03 | `google/uuid` | `2d3c2a9` | `nomic-embed-text`/768 | vector | [`runs/2026-09-03-google-uuid-vector-nomic-embed-text.json`](runs/2026-09-03-google-uuid-vector-nomic-embed-text.json) |
+| 2026-09-03 | `google/uuid` | `2d3c2a9` | `nomic-embed-text`/768 | lexical | [`runs/2026-09-03-google-uuid-lexical-nomic-embed-text.json`](runs/2026-09-03-google-uuid-lexical-nomic-embed-text.json) |
+
+## What the one published corpus says
+
+`google/uuid` at `2d3c2a9`, 74 generated cases, 5 duplicate questions, **0
+unscoreable** in either arm, and **74 of 74** cases whose answer range moved
+under stripping — the corpus-scale version of P2's "506 of 1,303". Read every
+figure with the qualifiers beside it; one repository is not a distribution.
+
+MRR, both gold rules, at the shipped defaults (`k=60`, `candidates=40`,
+`split=true`, `MaxSpans=5`):
+
+| Arm | Spans | Mean gold set | vector | hybrid | lexical |
+| --- | --- | --- | --- | --- | --- |
+| AST | 189 | 1.000 | **0.749** / 0.749 | 0.402 / 0.402 | 0.164 / 0.164 |
+| window | 110 | 1.500 | **0.606** / 0.510 | 0.484 / 0.422 | 0.325 / 0.297 |
+
+hit@1 / hit@5 / hit@10, lenient rule:
+
+| Arm | vector | hybrid | lexical |
+| --- | --- | --- | --- |
+| AST | 0.622 / 0.905 / 0.946 | 0.243 / 0.635 / 0.757 | 0.068 / 0.270 / 0.378 |
+| window | 0.432 / 0.851 / 0.946 | 0.351 / 0.676 / 0.811 | 0.216 / 0.500 / 0.608 |
+
+**Spec:316 is answered, and the answer is no.** Hybrid does not beat the vector
+arm on this golden set — it is beaten by it, on both arms and at every k. In
+the AST arm's hybrid run the gold span was found by the vector arm alone in 1
+case, by the lexical arm alone in **0**, and by both in 55: the lexical arm
+contributed no unique find and its ranking dragged the fusion down. This is one
+repository and one question distribution, and the distribution is handicapped
+for the lexical arm by construction — a doc-comment question tokenises to
+mostly stopwords and the `simple` text-search configuration has no stopword
+list — so the honest statement is that **on this question distribution fusion
+costs accuracy**, not that fusion is worthless.
+
+**The two arms are not comparable on gold-set size alone.** The window arm's
+mean lenient gold set is 1.5 spans against the AST arm's 1.0, so the lenient
+rule hands it more chances; under the strict rule its hit@1 falls from 0.351 to
+0.257 in hybrid and from 0.432 to 0.324 in vector, while the AST arm's figures
+are identical under both rules. Its haystack is also smaller — 110 spans
+against 189. Both directions are real and neither is corrected for.
+
+Top cosine similarity, the quantity `rag.Decide` compares:
+
+| Arm | min | p10 | median | p90 | max |
+| --- | --- | --- | --- | --- | --- |
+| AST | 0.6239 | 0.6598 | 0.7479 | 0.8227 | 0.8507 |
+| window | 0.5384 | 0.5866 | 0.7190 | 0.8079 | 0.8386 |
+
+P3 measured 0.664 to 0.744 on `rs/zerolog` over seven hand-written questions
+and called it "a range, not a recommendation". This generated distribution is
+wider on both sides.
+
+**The shipped-floor confusion is the null row, and it is reported as one.**
+`DefaultFloor()` is `{-1, false}` and `Decide` refuses on `top < f.Value`;
+cosine similarity is bounded below by -1, so `below_floor` is unreachable.
+Measured: at floor -1 every run above shows 0 refusals and an empty reason
+tally. §9's "refusal behaviour" is measured by the *sweep*, across floors the
+product does not run at, and every artefact carries the whole curve.
+
+**The floor is not calibrated.** That needs three repositories and this run
+produced one — see `corpora.md`. A floor read off one library's documentation
+style is the thing the "three, named before the run" discipline exists to
+prevent, so `rag.DefaultFloor` is unchanged and every surface that says the
+number is measured in P6 still says so.
 
 ## Recipe
 
