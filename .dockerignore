@@ -1,0 +1,25 @@
+# Here and not in infra/ beside the Dockerfiles, because that would be silently
+# ignored: with the context at the repository root BuildKit reads
+# <dockerfile-path>.dockerignore or this file, never infra/.dockerignore.
+# Measured — with the file in infra/, docs/ and assets/ were still in the
+# context. image_test.sh asserts the exclusion by name for that reason.
+#
+# The build context is the repository root; the module build needs apps/ and
+# packages/ and nothing else here.
+.git/
+.github/
+bin/
+out/
+docs/
+assets/
+.superpowers/
+node_modules/
+dist/
+.cache/
+**/*.tfstate*
+**/.terraform/
+**/tfplan
+**/tfplan.json
+**/*.tfvars
+**/*.tfvars.json
+.env

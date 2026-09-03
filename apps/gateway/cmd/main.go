@@ -4,8 +4,10 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"net/http"
+	"os"
 	"os/signal"
 	"strconv"
 	"strings"
@@ -215,7 +217,24 @@ func newServer(log zerolog.Logger, st storeHandle, r *rag.Retriever, b rag.Budge
 	return newRouter(health.NewReadiness(log, st.Ping).Ready, newHandler(log, jobs.New(st.Pool()), st, r, b))
 }
 
+// probeMode is the container health check. See health.Probe: the image is
+// distroless, so there is no shell to run a curl in.
+var probeMode = flag.Bool("probe", false, "check /health on this process's own port, then exit 0 or 1")
+
+// listenAddr is where this process serves, read in one place so -probe and the
+// server cannot disagree about the port.
+func listenAddr() string { return ":" + config.Get("PORT", "8080") }
+
 func main() {
+	flag.Parse()
+	if *probeMode {
+		if err := health.Probe(listenAddr()); err != nil {
+			fmt.Fprintln(os.Stderr, "probe:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	log := logger.New("gateway")
 	ctx := context.Background()
 
@@ -242,7 +261,7 @@ func main() {
 
 	e := newServer(log, st, ret, budget)
 
-	addr := ":" + config.Get("PORT", "8080")
+	addr := listenAddr()
 	go func() {
 		if err := e.Start(addr); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal().Err(err).Msg("server exited")

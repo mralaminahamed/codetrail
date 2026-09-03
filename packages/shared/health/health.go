@@ -4,6 +4,8 @@ package health
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -79,4 +81,34 @@ func (r *Readiness) Ready() bool {
 	}
 	metrics.SetReady(r.ok)
 	return r.ok
+}
+
+// probeTimeout bounds the container health check's one request. Well inside the
+// 5s an ECS healthCheck allows for the whole command.
+const probeTimeout = 3 * time.Second
+
+// Probe makes the request a container health check would make: one GET of
+// /health on this process's own listener, exiting through the caller.
+//
+// It exists because the gateway's image is distroless and has no shell, so a
+// CMD-SHELL health check cannot work and something has to make the request. A
+// second binary would be a fifth app §2 does not describe; a flag on the one
+// that is already there is not.
+//
+// /health and never /ready: this is liveness. A container health check on
+// readiness turns one shared-datastore outage into a rolling restart of every
+// task, and the process that could still serve /metrics and say why is the one
+// being killed.
+func Probe(addr string) error {
+	c := &http.Client{Timeout: probeTimeout}
+	resp, err := c.Get("http://127.0.0.1" + addr + "/health")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("health answered %d", resp.StatusCode)
+	}
+	return nil
 }
