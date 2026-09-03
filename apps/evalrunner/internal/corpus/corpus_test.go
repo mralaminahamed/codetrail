@@ -232,8 +232,8 @@ func TestEachReadsFailureIsReportedAndNamed(t *testing.T) {
 // StripDocs passed it through and it carries one symbol's prose verbatim.
 func leakCorpus() (*fake, []golden.Case) {
 	cases := []golden.Case{
-		{ID: "store.go:Store.Get:decl", Question: "Get returns the thing named n.\nIt returns an error if n is unknown.\n"},
-		{ID: "store.go:Store.Put:decl", Question: "Put writes v under k.\n"},
+		{ID: "store.go:Store.Get:decl", Path: "store.go", Question: "Get returns the thing named n.\nIt returns an error if n is unknown.\n"},
+		{ID: "store.go:Store.Put:decl", Path: "store.go", Question: "Put writes v under k.\n"},
 	}
 	f := &fake{texts: []TextRow{
 		{SpanID: "s1", Path: "store.go", Text: "func (s *Store) Get(n string) (int, error) { return 0, nil }"},
