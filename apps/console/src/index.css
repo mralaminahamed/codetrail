@@ -1,0 +1,25 @@
+@import "tailwindcss";
+
+@theme {
+  --color-ink: oklch(0.22 0.02 260);
+  --color-paper: oklch(0.99 0.003 260);
+  --color-rule: oklch(0.88 0.01 260);
+  --color-quiet: oklch(0.45 0.02 260);
+  --color-alarm: oklch(0.45 0.19 25);
+}
+
+/* Off-screen until focused: a skip link that is always visible is a link
+   everyone pays for and one person uses. */
+.skip {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  z-index: 100;
+  padding: 0.5rem 1rem;
+  background: var(--color-paper);
+  color: var(--color-ink);
+  border: 2px solid var(--color-ink);
+}
+.skip:focus {
+  left: 0;
+}
