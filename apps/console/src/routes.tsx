@@ -2,6 +2,7 @@ import { Route, Routes } from "react-router";
 import Shell from "./ui/Shell";
 import PageTitle from "./ui/PageTitle";
 import Submit from "./views/Submit";
+import Job from "./views/Job";
 
 function Corpus() {
   return (
@@ -29,6 +30,7 @@ export default function AppRoutes() {
       <Route element={<Shell />}>
         <Route index element={<Submit />} />
         <Route path="repos" element={<Corpus />} />
+        <Route path="jobs/:id" element={<Job />} />
         <Route path="*" element={<NotFound />} />
       </Route>
     </Routes>
