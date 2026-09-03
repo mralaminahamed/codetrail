@@ -41,6 +41,10 @@ type flags struct {
 	floors            string
 	astCounters       string
 	windowCounters    string
+	// now is the run's clock, a parameter for the same reason rag.Assemble
+	// takes one: §9 asks for a deterministic run, and two runs over one corpus
+	// have to be comparable byte for byte rather than only in their averages.
+	now time.Time
 }
 
 func main() {
@@ -61,6 +65,7 @@ func main() {
 	flag.StringVar(&f.astCounters, "ast-counters", "", "the AST arm's indexer counters, e.g. vanished=0,unstrippable=0,tokenless=3,unparsed=0")
 	flag.StringVar(&f.windowCounters, "window-counters", "", "the window arm's indexer counters")
 	flag.Parse()
+	f.now = time.Now().UTC()
 
 	if err := run(context.Background(), f); err != nil {
 		fmt.Fprintln(os.Stderr, "evalrunner: "+err.Error())
@@ -102,7 +107,7 @@ func run(ctx context.Context, f flags) error {
 		return err
 	}
 	cfg.Ks, cfg.Limit, cfg.Floors = ks, limit, floors
-	cfg.Now = time.Now().UTC()
+	cfg.Now = f.now
 
 	// The questions, and the bytes they came from.
 	files, err := source.Read(ctx, f.src, source.Limits())
