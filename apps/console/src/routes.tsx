@@ -1,15 +1,7 @@
 import { Route, Routes } from "react-router";
 import Shell from "./ui/Shell";
 import PageTitle from "./ui/PageTitle";
-
-function Home() {
-  return (
-    <>
-      <PageTitle>codetrail</PageTitle>
-      <p>Cite the code, or say nothing.</p>
-    </>
-  );
-}
+import Submit from "./views/Submit";
 
 function Corpus() {
   return (
@@ -35,7 +27,7 @@ export default function AppRoutes() {
   return (
     <Routes>
       <Route element={<Shell />}>
-        <Route index element={<Home />} />
+        <Route index element={<Submit />} />
         <Route path="repos" element={<Corpus />} />
         <Route path="*" element={<NotFound />} />
       </Route>
