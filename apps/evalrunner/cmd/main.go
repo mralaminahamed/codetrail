@@ -291,11 +291,11 @@ func readConfig(ctx context.Context) (Config, error) {
 		return cfg, err
 	}
 	cfg.Mode = mode
-	if cfg.K, err = config.GetInt("RETRIEVAL_RRF_K", 60); err != nil {
+	if cfg.Fusion.K, err = config.GetInt("RETRIEVAL_RRF_K", 60); err != nil {
 		return cfg, err
 	}
-	if cfg.K < 0 {
-		return cfg, fmt.Errorf("RETRIEVAL_RRF_K must not be negative, got %d", cfg.K)
+	if cfg.Fusion.K < 0 {
+		return cfg, fmt.Errorf("RETRIEVAL_RRF_K must not be negative, got %d", cfg.Fusion.K)
 	}
 	if cfg.Candidates, err = config.GetInt("RETRIEVAL_CANDIDATES", 40); err != nil {
 		return cfg, err
@@ -342,7 +342,7 @@ func readConfig(ctx context.Context) (Config, error) {
 func newRetriever(_ context.Context, s *store.Store, cfg Config) (*rag.Retriever, error) {
 	return &rag.Retriever{
 		Store: s, Emb: cfg.Emb, Mode: cfg.Mode,
-		K: cfg.K, Candidates: cfg.Candidates, Split: cfg.Split, Floor: cfg.Floor,
+		Fusion: cfg.Fusion, Candidates: cfg.Candidates, Split: cfg.Split, Floor: cfg.Floor,
 	}, nil
 }
 

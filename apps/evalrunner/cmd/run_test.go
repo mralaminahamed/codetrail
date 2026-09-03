@@ -82,7 +82,7 @@ func arm(t *testing.T, name string, mode rag.Mode, s *searcher, spans []metric.S
 		Corpus: corpus.Arm{Name: name, DSN: "postgres://h/" + name, RepoID: "r"},
 		Retriever: &rag.Retriever{
 			Store: s, Emb: embed.NewFake(store.EmbeddingDim), Mode: mode,
-			K: 60, Candidates: 40, Split: true, Floor: rag.DefaultFloor(),
+			Fusion: rag.DefaultParams(), Candidates: 40, Split: true, Floor: rag.DefaultFloor(),
 		},
 		Repo:  models.Repo{ID: "r", Remote: "https://github.com/eval/repo", Ref: "main", Commit: "c0ffee"},
 		Spans: spans,
@@ -100,7 +100,7 @@ func caseAt(id string, start, end int) golden.Case {
 
 func cfg() Config {
 	return Config{
-		Mode: rag.ModeHybrid, K: 60, Candidates: 40, Split: true, Emb: embed.NewFake(store.EmbeddingDim),
+		Mode: rag.ModeHybrid, Fusion: rag.DefaultParams(), Candidates: 40, Split: true, Emb: embed.NewFake(store.EmbeddingDim),
 		Ks: []int{1, 5, 10}, Limit: 10, Floor: rag.DefaultFloor(), Budget: rag.DefaultBudget(),
 		Floors: []float64{0.5}, Now: time.Date(2026, 9, 3, 0, 0, 0, 0, time.UTC),
 	}

@@ -548,7 +548,7 @@ func TestARepoWithNoSpansRefusesRatherThanErrors(t *testing.T) {
 			st.embedderErr = fmt.Errorf("%w: repo %s has no spans", store.ErrNotFound, fixtureRepoID)
 			h := hermeticHandler(st, &rag.Retriever{
 				Store: st, Emb: embed.NewFake(fixtureDim), Mode: mode,
-				K: 60, Candidates: 40, Split: true, Floor: rag.DefaultFloor(),
+				Fusion: rag.DefaultParams(), Candidates: 40, Split: true, Floor: rag.DefaultFloor(),
 			})
 
 			before := counters(t)
@@ -750,7 +750,7 @@ func TestAnEmptyOrTokenlessQuestionIsFourHundredNamingTheRule(t *testing.T) {
 			st.vector = []models.Cite{{Span: spanByID("span-c"), Score: 0.9}}
 			real := &rag.Retriever{
 				Store: st, Emb: embed.NewFake(fixtureDim), Mode: rag.ModeHybrid,
-				K: 60, Candidates: 40, Floor: rag.DefaultFloor(),
+				Fusion: rag.DefaultParams(), Candidates: 40, Floor: rag.DefaultFloor(),
 			}
 			q, err := json.Marshal(map[string]string{"q": tc.q})
 			if err != nil {
@@ -1385,5 +1385,49 @@ func TestBothResponseViewsCarryTheSymbol(t *testing.T) {
 		if sym != want[i] {
 			t.Errorf("hit %d symbol %v, want %q", i, sym, want[i])
 		}
+	}
+}
+
+// P3 refused `mode` because Search takes no argument for it. P7 adds per-arm
+// fusion weights, and the same rule extends to them: they are a Go field on the
+// Retriever the process constructs, so a body naming one would change nothing
+// while reading as though it had.
+//
+// A future hand adding `k` to searchRequest fails here rather than shipping a
+// field that does nothing.
+func TestModeIsStillRefusedAndSoAreKAndTheWeights(t *testing.T) {
+	for name, reqBody := range map[string]string{
+		"k":         `{"q":"sampler","k":5}`,
+		"w_vector":  `{"q":"sampler","w_vector":5}`,
+		"w_lexical": `{"q":"sampler","w_lexical":0.5}`,
+		"all three": `{"q":"sampler","k":1,"w_vector":2,"w_lexical":3}`,
+		"zero":      `{"q":"sampler","w_vector":0}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, route := range []string{"search", "ask"} {
+				st := newStore()
+				rt := &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)}
+				rec := do(mount(hermeticHandler(st, rt)), http.MethodPost,
+					"/api/repos/repo-1/"+route, reqBody)
+				if rec.Code != http.StatusBadRequest {
+					t.Fatalf("%s %s answered %d: %s", route, reqBody, rec.Code, rec.Body)
+				}
+				out := body(t, rec)
+				if out["rule"] != "form" || out["error"] != retrievalParamDetail {
+					t.Errorf("%s: body %s does not name the rule that fired", route, rec.Body)
+				}
+				if len(rt.calls) != 0 {
+					t.Errorf("%s: a refused request retrieved anyway: %v", route, rt.calls)
+				}
+			}
+		})
+	}
+	// And a body with none of them still works, so the refusal is not simply
+	// rejecting everything.
+	st := newStore()
+	rt := &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)}
+	rec := do(mount(hermeticHandler(st, rt)), http.MethodPost, "/api/repos/repo-1/ask", `{"q":"sampler"}`)
+	if rec.Code != http.StatusOK {
+		t.Errorf("a clean body answered %d: %s", rec.Code, rec.Body)
 	}
 }

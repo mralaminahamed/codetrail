@@ -265,7 +265,19 @@ type searchRequest struct {
 	// what was asked for. nil is absence, an explicit null included: neither
 	// names a mode.
 	Mode *string `json:"mode"`
+	// The fusion parameters, declared for the same reason and refused by the
+	// same rule. P7 gave Fuse per-arm weights; they are a Go field on the
+	// Retriever the PROCESS constructs, not a setting and not a request field,
+	// and a body that named one would change nothing while looking as though it
+	// had. That is the mode defect, one identifier over.
+	K        *int     `json:"k"`
+	WVector  *float64 `json:"w_vector"`
+	WLexical *float64 `json:"w_lexical"`
 }
+
+// retrievalParamDetail is the 400 a retrieval parameter earns. Spec §10: name
+// which rule failed, never a generic refusal.
+const retrievalParamDetail = "k, w_vector and w_lexical are not request fields: retrieval is configured per process"
 
 func (h *Handler) search(c echo.Context) error {
 	var req searchRequest
@@ -451,6 +463,10 @@ func (h *Handler) query(c echo.Context, req *searchRequest, defLimit int) (strin
 	// one, because which mode that is is not something a caller can know.
 	if req.Mode != nil {
 		badRequest(c, "mode is not a request field: it is configured per process and reported in the response")
+		return "", 0, false
+	}
+	if req.K != nil || req.WVector != nil || req.WLexical != nil {
+		badRequest(c, retrievalParamDetail)
 		return "", 0, false
 	}
 	q := strings.TrimSpace(req.Q)
