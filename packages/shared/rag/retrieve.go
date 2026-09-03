@@ -71,6 +71,19 @@ type Result struct {
 	Mode      Mode
 }
 
+// Decide is the grounded-or-refused rule applied to this result.
+//
+// One derivation, two callers: the gateway's ask handler and the eval's floor
+// sweep. Search deliberately does not call it — only the caller knows whether
+// the request was a search or an ask — but the four arguments are the whole
+// rule, and an eval that assembled them itself would agree on the day it was
+// written and drift on the day the rule changed. P4 measured the difference
+// this makes: one mutation applied to a shared function fails tests in two
+// packages, while a copy leaves both green.
+func (r Result) Decide(f Floor) (Outcome, Reason) {
+	return Decide(f, len(r.Hits), r.TopScore, r.VectorRan)
+}
+
 // Search runs the arms, fuses them and trims to limit.
 //
 // Timing is recorded here and the outcome is not: this is the only thing that
