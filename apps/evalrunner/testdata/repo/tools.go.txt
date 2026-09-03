@@ -1,0 +1,7 @@
+//go:build tools
+
+package repo
+
+import (
+	_ "errors"
+)
