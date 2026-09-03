@@ -176,13 +176,28 @@ func Normalise(s string) string {
 }
 
 // Leaks reports whether a question's prose is findable in a span's text.
-//
-// An empty question never leaks: the empty needle is inside every haystack,
-// and reporting that would make the probe refuse every corpus.
 func Leaks(question, text string) bool {
-	q := Normalise(question)
-	if q == "" {
+	return Contains(Normalise(text), Normalise(question))
+}
+
+// Contains reports whether an already-normalised question appears in
+// already-normalised text as a whole phrase.
+//
+// Delimited, not a raw substring. Measured on sirupsen/logrus: the doc comment
+// on `type Level uint32` is the two words "Level type", and a raw substring
+// search finds them inside `logger.SetLevel(logrus.DebugLevel)\n\ttype ctxKey`,
+// which normalises to "... debuglevel type ctxkey ...". The probe refused a
+// correctly stripped corpus and named a test file that quotes nothing. A short
+// question is not a rare shape — one- and two-word doc comments are a
+// deliberate part of this golden set — so the false positive would have
+// stopped a run on almost any real repository.
+//
+// An empty question never leaks: the empty needle is inside every haystack.
+func Contains(text, question string) bool {
+	if question == "" {
 		return false
 	}
-	return strings.Contains(Normalise(text), q)
+	// Normalise collapses to single spaces, so padding both ends makes a
+	// space the only word delimiter there is.
+	return strings.Contains(" "+text+" ", " "+question+" ")
 }

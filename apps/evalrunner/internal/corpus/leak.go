@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strings"
 
 	"github.com/mralaminahamed/codetrail/apps/evalrunner/internal/golden"
 )
@@ -88,12 +87,6 @@ func Probe(ctx context.Context, a Arm, cases []golden.Case) ([]Leak, error) {
 	return nil, nil
 }
 
-// contains is substring containment over two already-normalised strings. Named
-// so the comparison has one place to be wrong in: normalising the question and
-// not the text is a probe that finds nothing and reports a clean corpus.
-func contains(text, question string) bool {
-	if question == "" {
-		return false
-	}
-	return strings.Contains(text, question)
-}
+// contains delegates rather than spelling the comparison: one derivation, so
+// the probe and golden.Leaks cannot disagree about what a leak is.
+func contains(text, question string) bool { return golden.Contains(text, question) }

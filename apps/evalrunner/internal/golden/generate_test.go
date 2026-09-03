@@ -414,3 +414,39 @@ func equal(a, b []string) bool {
 	}
 	return true
 }
+
+// Measured on sirupsen/logrus, and it stopped a real run: the doc comment on
+// `type Level uint32` is the two words "Level type", and a raw normalised
+// substring search finds them inside a test file that quotes nothing —
+// `logger.SetLevel(logrus.DebugLevel)` followed by `type ctxKey struct{}`
+// normalises to "... debuglevel type ctxkey ...", and "level type" sits inside
+// "debuglevel type".
+//
+// One- and two-word doc comments are a deliberate part of this golden set, so
+// this is not a rare shape: unfixed, the probe refuses almost any real
+// repository and names a file nothing is wrong with.
+func TestAShortQuestionDoesNotLeakIntoALongerWord(t *testing.T) {
+	const question = "Level type\n"
+	const innocent = "func TestHandler(t *testing.T) {\n\tlogger.SetLevel(logrus.DebugLevel)\n\n\ttype ctxKey struct{}\n}"
+	if Leaks(question, innocent) {
+		t.Errorf("%q leaked into %q; the match runs across a word boundary", question, innocent)
+	}
+	// The same two words, actually quoted, still leak.
+	if !Leaks(question, "// Level type\ntype Level uint32") {
+		t.Error("the verbatim prose no longer leaks; the delimiter is too strict")
+	}
+	// At either end of the text, where the padding is doing the work.
+	if !Leaks(question, "Level type") {
+		t.Error("a span whose whole text is the prose does not leak")
+	}
+	if !Leaks("Add returns the sum of a and b.\n", "// Add returns the sum of a and b.\nfunc Add() {}") {
+		t.Error("a one-line doc comment no longer leaks")
+	}
+	// A prefix of a longer word at the start, and a suffix at the end.
+	if Leaks("Add returns\n", "// Readd returns nothing") {
+		t.Error("the needle matched inside a longer leading word")
+	}
+	if Leaks("returns the sum\n", "returns the summary") {
+		t.Error("the needle matched inside a longer trailing word")
+	}
+}
