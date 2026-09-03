@@ -183,9 +183,11 @@ does **not** bound is a flood inside the window; the control for that is a rate 
 
 ### What it does today
 
-All five captures below are real terminal output from the merged phases, not mockups. There is
-no console yet — that is P5 — so there is no UI to screenshot, and inventing one would break the
-rule at the bottom of this file.
+All captures below are real: the terminal output is from the merged phases and the console
+screenshots are of the shipped bundle, served by `vite preview`, talking to a real gateway and a
+real indexer over a live Postgres, against `rs/zerolog` at
+`dfd11cca1143ba03ba0fc0ff14e5dbb4d61f6f0a`. Nothing is staged and nothing is mocked. Where a
+state is only reachable with a configured floor, it is said so beside the picture.
 
 Admission runs before anything is fetched, and a rejection names **which rule** fired:
 
@@ -571,6 +573,103 @@ while CI is not, which is the silent downgrade that costs a week.
   `os.RemoveAll` over it fails with `permission denied` — leaking not the cache but the whole job
   tree — so the scratch remover restores directory permissions and retries.
 
+## The console
+
+React 19, TypeScript and Tailwind v4 in `apps/console`, built by Vite into a static bundle. It
+does the four things §2 names — submit, watch indexing, ask, jump to source — plus the symbol
+graph browsing P4's three endpoints have had no consumer for two phases.
+
+<img src="assets/screenshots/console-ask-answered.png" alt="An answered question, with the extractive answer, its markers and three citations" width="880">
+
+**A refusal is not an error, and the console renders them differently.** A refusal is
+`role="status"` headed *"No answer — and no error."*, and it carries the server's own sentence for
+the reason plus a note about the floor. An error is `role="alert"`, and it carries a request id an
+operator can grep for. Neither can render the other's evidence. That distinction is a **type** in
+the client rather than a convention: `Outcome<T>` has six members and none of them is a refusal,
+so a refusal arrives inside `kind: "ok"` and reaching the error renderer with one means writing
+`{kind: "failed"}` by hand.
+
+<img src="assets/screenshots/console-ask-refused.png" alt="A refusal: no answer and no error, with the reason and the uncalibrated floor stated in words" width="880">
+
+**The score floor is −1 and uncalibrated**, the same banner the rest of this file carries, and the
+console draws **no scale from it at all** — no bar, no meter, no percentage, no "N% above the
+floor" — while `floor.calibrated` is false. A scale drawn from a number nobody measured renders a
+guess as a measurement. The floor is a sentence, and the sentence says it is not a measurement.
+At the shipped default the only reachable refusals are `no_spans` and `unscored`: `Decide` refuses
+when the top score is *below* the floor, and a cosine similarity is never below −1, so
+`below_floor` — the refusal §8 describes as the main event — is the one nobody will see until P6
+sets a number.
+
+**Some citations have no link at all, and that is not a bug.** The permalink table knows two
+forges, `github.com` and `codeberg.org`, because their URL shapes genuinely differ; the *clone*
+allowlist is configured separately. An operator who allowlists a third forge gets a corpus every
+one of whose citations has an empty permalink. The console then renders the whole tuple, a
+`git show … | head -c -1 | sha256sum` command and the digest it should print, and says codetrail
+does not know that forge's URL shape. The tuple is the claim; the link was the convenience.
+
+**The staleness sentence is the server's, verbatim.** codetrail has not checked whether the ref
+moved, and the console does not soften that into "may be out of date" — a claim about the code
+that nobody made and nothing checked. The test asserts the exact sentence *and* that no paraphrase
+of it appears anywhere in the tree.
+
+**codetrail does not report why a job failed.** The gateway withholds the indexer's stderr on
+purpose — it has carried filesystem paths and credential-bearing URLs — and the console says so in
+those words rather than shrugging at it. The gap is real, it contradicts §10, and closing it is a
+migration plus an indexer change plus a gateway change, which is not a UI phase's work.
+
+**No console test hits a live gateway.** Every one runs against MSW over fixtures that a
+`-tags=live` Go test emits from the shipped handlers over a real Postgres, and CI fails when a
+committed fixture stops matching what those handlers produce. That pins the shape and the content
+of what the console renders. It proves nothing about a browser reaching a running process, so that
+was done once by hand and is recorded below.
+
+The console is a static bundle with **no deployment yet**. It is same-origin with the gateway by
+construction — the API base is the relative `/api` and there is no build-time URL — and the
+gateway has no CORS middleware on purpose: `Access-Control-Allow-Origin` on an unauthenticated API
+that clones a stranger's URL would let any page on the internet drive ingestion from a visitor's
+browser. P8 puts one origin in front of both processes.
+
+### One real run, by hand
+
+The whole path once, on one machine, through `vite preview` so every request went through the
+proxy the browser really uses. `EMBED_PROVIDER=fake`, so the indexing time below is **not** the
+~2.5 minutes the retrieval section reports for a real model — nearly all of that is embedding.
+
+```
+POST /api/repos  {"remote":"https://github.com/rs/zerolog"}
+  -> 202 {"id":"666e172a…","ref":"HEAD","status":"pending"}
+t+0s   pending
+t+5s   leased
+t+10s  done   repo_id=bee14320c329c3c67b2786f124cbd74b
+99 files, 87 with spans, 1303 spans, 1234 definitions, 7895 call edges
+```
+
+Asked *"how does the sampler decide to drop an event"*; answered extractively from three spans,
+`top_score` 0.496, `dropped` 0. The first citation, and the check the console printed under it:
+
+```
+README.md:841-860 @ dfd11cca1143ba03ba0fc0ff14e5dbb4d61f6f0a
+git show dfd11cca1143ba03ba0fc0ff14e5dbb4d61f6f0a:README.md | sed -n '841,860p' | head -c -1 | sha256sum
+f1367cf168a232801012ee7ad8143bf5f1d9aa12a6e2cacc83b2c9b1a8d49f16  -   <- computed
+f1367cf168a232801012ee7ad8143bf5f1d9aa12a6e2cacc83b2c9b1a8d49f16      <- claimed
+```
+
+Byte for byte, against a fresh clone at that commit. The permalink resolves (HTTP 200). Dropping
+`head -c -1` from that command gives `234177eb…` instead, which is why it is in there: a span's
+text ends at the last byte of its last line, not at the newline after it.
+
+Mid-run, Postgres went away for a few seconds. The console rendered `role="alert"` with a request
+id, which is the error path working, unplanned and for real.
+
+### What the console does not do
+
+It does not say why a job failed, because the API does not. It does not check whether a ref has
+moved, because nothing does. It cannot link to a forge whose URL shape codetrail does not know. It
+draws no scale from the score floor, because the floor is a mechanism at −1 and not a measured
+threshold. And the accessibility sweep in `apps/console/docs/a11y-sweep-2026-09-03.md` has one
+pass — a screen reader — that was **not run**, which that file says rather than leaving it to be
+inferred.
+
 ## Status
 
 | Phase | Delivers | State |
@@ -580,7 +679,7 @@ while CI is not, which is the silent downgrade that costs a week.
 | **P2** | AST chunking, embeddings, spans, window fallback | done |
 | **P3** | Retrieval, citations, extractive ask, the floor as a mechanism | done; the floor's *value* is P6 |
 | **P4** | Symbol graph, per-edge provenance, graph endpoints | done; the eval that would say whether it helps is P6 |
-| **P5** | React console | not started |
+| **P5** | React console | done; the floor it reports refusals against is still a mechanism at −1 |
 | **P6** | Eval harness: generated golden set, AST versus window | not started |
 | **P7** | LLM tool loop, hybrid retrieval fusion, incremental re-index | not started |
 | **P8** | Terraform, CD, deploy | not started |
