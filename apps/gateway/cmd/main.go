@@ -154,7 +154,8 @@ func newRetriever(ctx context.Context, log zerolog.Logger, st rag.Searcher) (*ra
 
 	return &rag.Retriever{
 		Store: st, Emb: emb, Mode: mode,
-		K: k, Candidates: candidates, Split: split, Floor: floor,
+		Fusion:     rag.Params{K: k, WVector: 1, WLexical: 1},
+		Candidates: candidates, Split: split, Floor: floor,
 	}, nil
 }
 

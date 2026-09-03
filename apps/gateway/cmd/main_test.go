@@ -153,7 +153,7 @@ func TestNewHandlerWiresTheLoggerPolicyAndQueue(t *testing.T) {
 	// logger.New pins production to InfoLevel; a test logger that accepts more
 	// would pass on a line production never writes.
 	st := deadStore{}
-	ret := &rag.Retriever{Store: st, Mode: rag.ModeHybrid, K: 60, Candidates: 40,
+	ret := &rag.Retriever{Store: st, Mode: rag.ModeHybrid, Fusion: rag.DefaultParams(), Candidates: 40,
 		Floor: rag.Floor{Value: 0.25, Calibrated: false}}
 	budget := rag.Budget{MaxSpans: 3, MaxChars: 4096}
 	h := newHandler(zerolog.New(&logged).Level(zerolog.InfoLevel), q, st, ret, budget)
@@ -209,7 +209,7 @@ func TestNewServerAssemblesWhatMainServes(t *testing.T) {
 
 	var logged bytes.Buffer
 	e := newServer(zerolog.New(&logged).Level(zerolog.InfoLevel), deadStore{pool},
-		&rag.Retriever{Store: deadStore{pool}, Mode: rag.ModeHybrid, K: 60, Candidates: 40, Floor: rag.DefaultFloor()},
+		&rag.Retriever{Store: deadStore{pool}, Mode: rag.ModeHybrid, Fusion: rag.DefaultParams(), Candidates: 40, Floor: rag.DefaultFloor()},
 		rag.DefaultBudget())
 
 	// Readiness has to reflect the dependency, not a constant.
@@ -393,8 +393,8 @@ func TestTheDefaultRetrieverIsHybridAtTheUncalibratedFloor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Mode != rag.ModeHybrid || r.K != 60 || r.Candidates != 40 || !r.Split {
-		t.Errorf("mode=%s k=%d candidates=%d split=%v", r.Mode, r.K, r.Candidates, r.Split)
+	if r.Mode != rag.ModeHybrid || r.Fusion != rag.DefaultParams() || r.Candidates != 40 || !r.Split {
+		t.Errorf("mode=%s fusion=%+v candidates=%d split=%v", r.Mode, r.Fusion, r.Candidates, r.Split)
 	}
 	if r.Floor != rag.DefaultFloor() || r.Floor.Value != -1 || r.Floor.Calibrated {
 		t.Errorf("floor %+v, want -1 uncalibrated", r.Floor)

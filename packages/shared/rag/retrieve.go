@@ -35,16 +35,19 @@ var ErrModelMismatch = errors.New("rag: repo was indexed by another embedder")
 // Retriever runs the configured arms over one repository and fuses them.
 //
 // Every field is configuration a deployment sets and P6 sweeps: Mode selects
-// the arms (spec:316 makes fusion's value an experiment), K discounts deep
-// ranks, Candidates is the per-arm depth, Split widens the lexical terms, and
-// Floor travels with the result rather than being applied here — Decide is the
-// handler's call, because only the handler knows whether the request was a
-// search or an ask.
+// the arms (spec:316 makes fusion's value an experiment), Fusion carries the
+// rank discount and the per-arm weights, Candidates is the per-arm depth, Split
+// widens the lexical terms, and Floor travels with the result rather than being
+// applied here — Decide is the handler's call, because only the handler knows
+// whether the request was a search or an ask.
+//
+// A sweep is a struct copy: `r2 := *r1; r2.Fusion.WLexical = 0.5`. Search does
+// not write back into its receiver, so point n never depends on point n-1.
 type Retriever struct {
 	Store      Searcher
 	Emb        embed.Embedder
 	Mode       Mode
-	K          int
+	Fusion     Params
 	Candidates int
 	Split      bool
 	Floor      Floor
@@ -130,7 +133,7 @@ func (r *Retriever) Search(ctx context.Context, repoID, q string, limit int) (Re
 	// of limit would make fusion an intersection test: a span the vector arm
 	// ranks 30th and the lexical arm 1st is the case fusion exists for, and a
 	// depth of limit never sees it.
-	res.Hits = Fuse(r.K, hitsOf(vector), hitsOf(lexical))
+	res.Hits = Fuse(r.Fusion, hitsOf(vector), hitsOf(lexical))
 	if len(res.Hits) > limit {
 		res.Hits = res.Hits[:limit]
 	}
@@ -141,20 +144,22 @@ func (r *Retriever) Search(ctx context.Context, repoID, q string, limit int) (Re
 	return res, nil
 }
 
-// validate fails closed on the configuration Fuse cannot survive.
+// validate fails closed on the configuration retrieval cannot survive.
 //
-// Fuse takes k as an argument and has no guard of its own: k = -1 makes
-// 1/(k+1) an infinity and k <= -2 inverts the ranking, silently. Both binaries
-// validate RETRIEVAL_RRF_K at boot, and this is the second line for a
-// Retriever built in code — which is what spec §9's eval does.
+// Fuse has no guard of its own: k = -1 makes 1/(k+1) an infinity and k <= -2
+// inverts the ranking, silently; a negative weight inverts one arm's
+// contribution the same way, and a Retriever{} with no Fusion set would fuse
+// every span to zero. Both binaries validate RETRIEVAL_RRF_K at boot, and this
+// is the second line for a Retriever built in code — which is what spec §9's
+// eval does, and what a weight sweep is.
 func (r *Retriever) validate(limit int) error {
 	switch r.Mode {
 	case ModeVector, ModeLexical, ModeHybrid:
 	default:
 		return fmt.Errorf("rag: unknown retrieval mode %q", r.Mode)
 	}
-	if r.K < 0 {
-		return fmt.Errorf("rag: fusion k must not be negative, got %d", r.K)
+	if err := r.Fusion.Validate(); err != nil {
+		return err
 	}
 	if r.Candidates < 1 {
 		return fmt.Errorf("rag: candidate depth must be positive, got %d", r.Candidates)
