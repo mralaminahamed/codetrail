@@ -71,6 +71,28 @@ jobs:
       # leave that test green while it asserted this file instead of the code —
       # and the mutation that flips the default in main.go would survive in CI
       # and die only on a developer's machine.
+      # Four Terraform steps, all with no AWS account and no credentials that
+      # resolve to anything. The stack has no data source that calls the API,
+      # which is what makes a plan — and therefore every assertion over it —
+      # something a pull request can run.
+      #
+      # tfplan and tfplan.json hold every secret this stack has in cleartext.
+      # They stay on the runner: never uploaded, never printed.
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: 1.9.8
+          terraform_wrapper: false
+      - name: terraform fmt, validate
+        run: make tf-check
+      - name: terraform plan, offline
+        run: make tf-plan
+      # Vetted under its own tag for the reason the ollama suite is: `go vet
+      # ./...` skips a tagged file, so this suite could rot between runs.
+      - name: plan policy suite
+        run: |
+          go vet -tags=tfplan ./infra/...
+          go test -tags=tfplan -count=1 ./infra/policy/
+
       # promtool has no cloud account and needs none: it parses the rules and
       # replays a synthetic series through them. The test rules are what turn
       # "the conjunct is there" into "the conjunct decides the outcome" —
