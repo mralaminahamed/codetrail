@@ -234,6 +234,12 @@ func splitIdentifiers() (bool, error) {
 // Calibrated is false whatever the value: the flag says *codetrail* measured
 // this number, and spec:315 puts that in P6. An operator's own number is still
 // not one this project has evidence for.
+//
+// Written out rather than inherited from the default. Overwriting only Value
+// is correct exactly while DefaultFloor().Calibrated is false, and the moment
+// P6 measures a floor it silently starts labelling a hand-typed number as
+// measured — a gauge, a boot log line and a user-visible refusal payload all
+// saying codetrail has evidence it does not have.
 func scoreFloor() (rag.Floor, error) {
 	f := rag.DefaultFloor()
 	if v := config.Get("ANSWER_SCORE_FLOOR", ""); v != "" {
@@ -241,7 +247,7 @@ func scoreFloor() (rag.Floor, error) {
 		if err != nil {
 			return rag.Floor{}, fmt.Errorf("ANSWER_SCORE_FLOOR must be a number, got %q", v)
 		}
-		f.Value = n
+		f = rag.Floor{Value: n, Calibrated: false}
 	}
 	if err := f.Validate(); err != nil {
 		return rag.Floor{}, err
