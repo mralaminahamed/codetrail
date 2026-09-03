@@ -378,3 +378,70 @@ func TestTheFixtureOrdersDifferUnderEachOperatorLive(t *testing.T) {
 		}
 	}
 }
+
+// Spec:251 asks CI for a deterministic run. embed.Fake is deterministic and
+// pinned by value upstream; what is not pinned anywhere is that the *rankings*
+// are, and that is a claim about Postgres rather than about Go.
+//
+// vectorSearchSQL ends `ORDER BY embedding <=> $2::vector LIMIT $3` with no
+// tie-break, while LexicalSearch ends `ORDER BY score DESC, path, start_line,
+// id`. Two spans at equal cosine distance therefore come back in an order the
+// planner chooses, and on a corpus of hashed bags of words exact ties are not
+// exotic: two spans with the same token multiset produce the same vector.
+//
+// The two spans below are inserted in the reverse of (path, start_line, id) —
+// P3's fixture rule 2, and P3 measured that an unordered span read comes back
+// in path order via spans_path_idx, so the fixture's paths have to disagree
+// with the expected answer too.
+func TestVectorSearchReturnsTiedSpansInAStableOrderLive(t *testing.T) {
+	ctx := context.Background()
+	s, repoID, _ := seedSpanRepo(t, "vectorties")
+	fileB := FileID(repoID, "b.go")
+	fileA := FileID(repoID, "a.go")
+	if err := s.PutRepo(ctx,
+		models.Repo{ID: repoID, Remote: "https://github.com/spans/vectorties", Ref: "main", Commit: Digest("vectorties")[:40]},
+		[]models.File{
+			{ID: fileB, RepoID: repoID, Path: "b.go", Blob: "b", Lang: "go", Lines: 9},
+			{ID: fileA, RepoID: repoID, Path: "a.go", Blob: "a", Lang: "go", Lines: 9},
+		}); err != nil {
+		t.Fatal(err)
+	}
+	// Byte-identical embeddings: the distance to any query is the same, so
+	// nothing but a tie-break can order them.
+	tied := unit(3)
+	spans := []EmbeddedSpan{
+		mkSpan(repoID, fileB, "b.go", 40, 79, "tied second", tied),
+		mkSpan(repoID, fileA, "a.go", 1, 39, "tied first", tied),
+	}
+	if err := s.PutSpans(ctx, repoID, spans, fakeModel, EmbeddingDim); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := s.VectorSearch(ctx, repoID, unit(3), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 2 {
+		t.Fatalf("VectorSearch returned %d rows, want 2", len(first))
+	}
+	if first[0].Score != first[1].Score {
+		t.Fatalf("the fixture's two spans score %v and %v; they are not tied and cannot discriminate",
+			first[0].Score, first[1].Score)
+	}
+	want := []string{first[0].Path, first[1].Path}
+	for i := range 100 {
+		got, qerr := s.VectorSearch(ctx, repoID, unit(3), 10)
+		if qerr != nil {
+			t.Fatal(qerr)
+		}
+		if got[0].Path != want[0] || got[1].Path != want[1] {
+			t.Fatalf("query %d returned %s,%s and query 0 returned %s,%s; the vector arm has no tie-break and the order is the planner's",
+				i, got[0].Path, got[1].Path, want[0], want[1])
+		}
+	}
+	// Recorded rather than asserted as a guarantee: the order is stable on
+	// this fixture, and that is a fact about a two-row seq scan, not a promise.
+	// A corpus large enough to use spans_embedding_idx has no such promise,
+	// and hnsw.iterative_scan is off by default.
+	t.Logf("100 queries over two tied spans came back %s then %s every time", want[0], want[1])
+}

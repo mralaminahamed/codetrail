@@ -694,3 +694,31 @@ func TestFilesStopsOnceItsContextIsDone(t *testing.T) {
 		t.Fatalf("a cancelled walk still returned %d files", len(got))
 	}
 }
+
+// Measured against pg17, which is what compose runs: a TEXT value holding a
+// NUL is refused with `invalid byte sequence for encoding "UTF8": 0x00` and one
+// holding an invalid byte with `... 0xff`. PutSpans writes a repo's spans in
+// one transaction, so without this a single PNG fails the whole job.
+func TestIndexableRefusesWhatPostgresRefuses(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		lang string
+		body string
+		want bool
+	}{
+		{"go source", "go", "package p\n", true},
+		{"markdown", "markdown", "# hi\n", true},
+		{"utf-8 prose", "markdown", "# héllo ☃\n", true},
+		{"invalid utf8", "go", "package p\xff\xfe\n", false},
+		{"embedded NUL", "go", "package p\x00\n", false},
+		{"unclassified extension", "", "plain text\n", false},
+		// The two halves are independent: a lockfile is valid UTF-8 and still
+		// not worth an embedding call, and a .go file can hold bytes the
+		// column refuses.
+		{"unclassified and binary", "", "\x89PNG\x00", false},
+	} {
+		if got := Indexable(File{Lang: tc.lang}, []byte(tc.body)); got != tc.want {
+			t.Errorf("%s: Indexable = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
