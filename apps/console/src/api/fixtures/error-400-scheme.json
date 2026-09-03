@@ -1,0 +1,4 @@
+{
+  "error": "scheme \"http\"; only https is accepted",
+  "rule": "scheme"
+}

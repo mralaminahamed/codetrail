@@ -1,0 +1,29 @@
+{
+  "count": 3,
+  "repos": [
+    {
+      "id": "cd59b4bbcd4c61d6b8fabf741f3497cb",
+      "remote": "https://gitlab.com/codetrail-live/thirdforge",
+      "ref": "main",
+      "commit": "cff56bbcfc3c2d3dbd4e3572800b101c919fc1b9",
+      "indexed_at": "2026-07-25T12:00:00Z",
+      "last_used_at": "2026-09-03T11:59:00Z"
+    },
+    {
+      "id": "ae4bae98f7440ee9e4c013b6c69be7e4",
+      "remote": "https://github.com/codetrail-live/zerolog",
+      "ref": "main",
+      "commit": "70f51ac8ac469ec5b3beddd7f3b7f4f6b401b034",
+      "indexed_at": "2026-08-31T12:00:00Z",
+      "last_used_at": "2026-09-03T11:58:00Z"
+    },
+    {
+      "id": "269a93ed538d34fd348dd9e2a4064dd6",
+      "remote": "https://codeberg.org/codetrail-live/forgejo-demo",
+      "ref": "main",
+      "commit": "9391656c48c81798d88d9276b6d735467d2360a8",
+      "indexed_at": "2026-08-25T12:00:00Z",
+      "last_used_at": "2026-09-03T11:57:00Z"
+    }
+  ]
+}
