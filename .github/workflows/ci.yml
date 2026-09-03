@@ -71,6 +71,12 @@ jobs:
       # leave that test green while it asserted this file instead of the code —
       # and the mutation that flips the default in main.go would survive in CI
       # and die only on a developer's machine.
+      # Expand-only from P8 forward, enforced rather than written down.
+      # migrate() runs at boot inside the new task while the old one is still
+      # serving, and a rollback moves the task definition and never the schema.
+      - name: migrations are expand-only
+        run: make migrations-lint
+
       # Four Terraform steps, all with no AWS account and no credentials that
       # resolve to anything. The stack has no data source that calls the API,
       # which is what makes a plan — and therefore every assertion over it —

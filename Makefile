@@ -1,6 +1,6 @@
 BIN := bin
 
-.PHONY: build gateway indexer lint test up down psql images image-test alerts-test tf-check tf-plan policy smoke
+.PHONY: build gateway indexer lint test up down psql images image-test alerts-test tf-check tf-plan policy smoke migrations-lint
 
 DATABASE_URL ?= postgres://codetrail:codetrail@localhost:55432/codetrail?sslmode=disable
 OLLAMA_URL ?= http://localhost:11435
@@ -53,6 +53,9 @@ tf-plan:
 policy: tf-plan
 	go vet -tags=tfplan ./infra/...
 	go test -tags=tfplan -count=1 ./infra/policy/
+
+migrations-lint:
+	./infra/migrations_lint.sh
 
 smoke:
 	./infra/smoke.sh --target compose
