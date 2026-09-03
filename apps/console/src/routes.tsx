@@ -3,6 +3,8 @@ import Shell from "./ui/Shell";
 import PageTitle from "./ui/PageTitle";
 import Submit from "./views/Submit";
 import Job from "./views/Job";
+import Ask from "./views/Ask";
+import Span from "./views/Span";
 
 function Corpus() {
   return (
@@ -31,6 +33,8 @@ export default function AppRoutes() {
         <Route index element={<Submit />} />
         <Route path="repos" element={<Corpus />} />
         <Route path="jobs/:id" element={<Job />} />
+        <Route path="repos/:repo" element={<Ask />} />
+        <Route path="repos/:repo/spans/:span" element={<Span />} />
         <Route path="*" element={<NotFound />} />
       </Route>
     </Routes>
