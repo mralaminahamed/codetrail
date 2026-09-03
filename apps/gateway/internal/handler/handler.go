@@ -13,6 +13,7 @@ import (
 
 	"github.com/mralaminahamed/codetrail/packages/shared/admit"
 	"github.com/mralaminahamed/codetrail/packages/shared/jobs"
+	"github.com/mralaminahamed/codetrail/packages/shared/metrics"
 	"github.com/mralaminahamed/codetrail/packages/shared/rag"
 )
 
@@ -141,6 +142,7 @@ func (h *Handler) postRepo(c echo.Context) error {
 		// names this package rather than anything the caller sent. A fixed
 		// message is the only body that cannot be made to carry server state.
 		h.Log.Warn().Err(err).Str("request_id", requestID(c)).Str("op", "bind").Msg("malformed request body")
+		metrics.CountAdmission(false, string(admit.RuleForm))
 		return c.JSON(http.StatusBadRequest, echo.Map{"error": "malformed request body", "rule": string(admit.RuleForm)})
 	}
 	remote, err := h.Policy.Check(req.Remote)
@@ -148,9 +150,13 @@ func (h *Handler) postRepo(c echo.Context) error {
 		var ae *admit.Error
 		if errors.As(err, &ae) {
 			// Name the rule: a generic 400 tells an operator nothing about
-			// what to change.
+			// what to change. The counter carries the same rule, so
+			// codetrail_admission_rejected_total answers the same question a
+			// reader of one 400 gets.
+			metrics.CountAdmission(false, string(ae.Rule))
 			return c.JSON(http.StatusBadRequest, echo.Map{"error": ae.Detail, "rule": string(ae.Rule)})
 		}
+		metrics.CountAdmission(false, string(admit.RuleForm))
 		return c.JSON(http.StatusBadRequest, echo.Map{"error": err.Error(), "rule": string(admit.RuleForm)})
 	}
 	ref := strings.TrimSpace(req.Ref)
@@ -158,11 +164,20 @@ func (h *Handler) postRepo(c echo.Context) error {
 		ref = "HEAD"
 	}
 	if !validRef(ref) {
+		metrics.CountAdmission(false, string(admit.RuleForm))
 		return c.JSON(http.StatusBadRequest, echo.Map{
 			"error": "ref must be a plain git ref name",
 			"rule":  string(admit.RuleForm),
 		})
 	}
+	// Counted here rather than after Enqueue, because what this counts is the
+	// admission decision and not the request's outcome: a queue write that
+	// fails is a 500 the ratio's denominator must still contain.
+	//
+	// Counted here rather than in the indexer, which re-checks the same
+	// allowlist before it clones: counting both would double every submission,
+	// and that re-check failing is a job failure with a reason of its own.
+	metrics.CountAdmission(true, "")
 	// The normalised URL, not the caller's spelling: the dedupe index would
 	// otherwise see a trailing slash and a .git suffix as separate
 	// repositories. The index folds case on top of that, which is the one
