@@ -11,9 +11,14 @@ package rag
 
 import "fmt"
 
-// Mode selects which arms run. Hybrid is the default because spec §8 defines
-// retrieval as hybrid; that is a conformance choice, not a claim that fusion
-// retrieves better, which spec:316 makes an experiment for P6/P7.
+// Mode selects which arms run. All three ship and all three stay switchable.
+//
+// Vector is the default since P7, on evidence rather than on conformance: on
+// google/uuid @ 2d3c2a9, 74 mechanically generated cases, live
+// nomic-embed-text, the AST arm's MRR was vector 0.7492, hybrid 0.4023,
+// lexical 0.1637. That is a deviation from spec:213-215, which defines
+// retrieval as fused; spec:316 scopes the mechanism's VALUE as an experiment
+// and the experiment ran. ONE CORPUS — see the README.
 type Mode string
 
 const (
