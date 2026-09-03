@@ -1,0 +1,19 @@
+{
+  "citation": null,
+  "staleness": {
+    "state": "unknown",
+    "forge_checked": false,
+    "indexed_at": "2026-08-31T12:00:00Z",
+    "note": "Correct at commit 70f51ac, indexed 3 days ago. codetrail has not checked whether main has moved since."
+  },
+  "symbol": {
+    "id": "84728ed37333ab20a4b07d88365a8fb1",
+    "name": "Table",
+    "pkg": "fixture",
+    "kind": "var",
+    "path": "big.go",
+    "start_line": 2,
+    "end_line": 208,
+    "span_id": ""
+  }
+}

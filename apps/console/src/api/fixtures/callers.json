@@ -1,0 +1,149 @@
+{
+  "repo_id": "ae4bae98f7440ee9e4c013b6c69be7e4",
+  "symbol": {
+    "id": "c910a6c9ac0bccc39c96153ccdcb9567",
+    "name": "Machine.Push",
+    "pkg": "calc",
+    "kind": "func",
+    "path": "calc/calc.go",
+    "start_line": 19,
+    "end_line": 23,
+    "span_id": "4f7ade29fb5e0808a5e792a358196130"
+  },
+  "depth": 2,
+  "truncated": false,
+  "callers": [
+    {
+      "symbol": {
+        "id": "01595f73f0019f7d100601aa5f44dfea",
+        "name": "Total",
+        "pkg": "calc",
+        "kind": "func",
+        "path": "calc/use.go",
+        "start_line": 3,
+        "end_line": 10,
+        "span_id": "b07e89a10f7c35cc0869c0b7bc63ba73"
+      },
+      "depth": 1,
+      "provenance": "resolved",
+      "call": {
+        "path": "calc/use.go",
+        "line": 7
+      },
+      "citation": {
+        "repo_id": "ae4bae98f7440ee9e4c013b6c69be7e4",
+        "remote": "https://github.com/codetrail-live/zerolog",
+        "commit": "70f51ac8ac469ec5b3beddd7f3b7f4f6b401b034",
+        "ref": "main",
+        "path": "calc/use.go",
+        "start_line": 3,
+        "end_line": 10,
+        "digest": "8f6b4fbf72c4fb5d2ab72d3a76814da01a54c0fa17c95e5cd4b22c3bb930bd37",
+        "permalink": "https://github.com/codetrail-live/zerolog/blob/70f51ac8ac469ec5b3beddd7f3b7f4f6b401b034/calc/use.go#L3-L10",
+        "staleness": {
+          "state": "unknown",
+          "forge_checked": false,
+          "indexed_at": "2026-08-31T12:00:00Z",
+          "note": "Correct at commit 70f51ac, indexed 3 days ago. codetrail has not checked whether main has moved since."
+        }
+      }
+    },
+    {
+      "symbol": {
+        "id": "84728ed37333ab20a4b07d88365a8fb1",
+        "name": "Table",
+        "pkg": "fixture",
+        "kind": "var",
+        "path": "big.go",
+        "start_line": 2,
+        "end_line": 208,
+        "span_id": ""
+      },
+      "depth": 2,
+      "provenance": "resolved",
+      "call": {
+        "path": "big.go",
+        "line": 6
+      },
+      "citation": null
+    }
+  ],
+  "approximate": {
+    "matched_on": "name",
+    "count": 2,
+    "truncated": false,
+    "failed": false,
+    "callers": [
+      {
+        "symbol": {
+          "id": "01595f73f0019f7d100601aa5f44dfea",
+          "name": "Total",
+          "pkg": "calc",
+          "kind": "func",
+          "path": "calc/use.go",
+          "start_line": 3,
+          "end_line": 10,
+          "span_id": "b07e89a10f7c35cc0869c0b7bc63ba73"
+        },
+        "to_name": "Push",
+        "provenance": "syntactic",
+        "call": {
+          "path": "calc/use.go",
+          "line": 7
+        },
+        "citation": {
+          "repo_id": "ae4bae98f7440ee9e4c013b6c69be7e4",
+          "remote": "https://github.com/codetrail-live/zerolog",
+          "commit": "70f51ac8ac469ec5b3beddd7f3b7f4f6b401b034",
+          "ref": "main",
+          "path": "calc/use.go",
+          "start_line": 3,
+          "end_line": 10,
+          "digest": "8f6b4fbf72c4fb5d2ab72d3a76814da01a54c0fa17c95e5cd4b22c3bb930bd37",
+          "permalink": "https://github.com/codetrail-live/zerolog/blob/70f51ac8ac469ec5b3beddd7f3b7f4f6b401b034/calc/use.go#L3-L10",
+          "staleness": {
+            "state": "unknown",
+            "forge_checked": false,
+            "indexed_at": "2026-08-31T12:00:00Z",
+            "note": "Correct at commit 70f51ac, indexed 3 days ago. codetrail has not checked whether main has moved since."
+          }
+        }
+      },
+      {
+        "symbol": {
+          "id": "b6667c7a4c47c7a2daa232845458259f",
+          "name": "Report",
+          "pkg": "fixture",
+          "kind": "func",
+          "path": "use.go",
+          "start_line": 10,
+          "end_line": 13,
+          "span_id": "6819c73b57cf3213d8a50807d88caa28"
+        },
+        "to_name": "Push",
+        "provenance": "syntactic",
+        "call": {
+          "path": "use.go",
+          "line": 12
+        },
+        "citation": {
+          "repo_id": "ae4bae98f7440ee9e4c013b6c69be7e4",
+          "remote": "https://github.com/codetrail-live/zerolog",
+          "commit": "70f51ac8ac469ec5b3beddd7f3b7f4f6b401b034",
+          "ref": "main",
+          "path": "use.go",
+          "start_line": 10,
+          "end_line": 13,
+          "digest": "a691ba0c07fca7451ede79e8ca7a5a90f8d417b681c9838567c61fe00d4a9fde",
+          "permalink": "https://github.com/codetrail-live/zerolog/blob/70f51ac8ac469ec5b3beddd7f3b7f4f6b401b034/use.go#L10-L13",
+          "staleness": {
+            "state": "unknown",
+            "forge_checked": false,
+            "indexed_at": "2026-08-31T12:00:00Z",
+            "note": "Correct at commit 70f51ac, indexed 3 days ago. codetrail has not checked whether main has moved since."
+          }
+        }
+      }
+    ]
+  }
+}

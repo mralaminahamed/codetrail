@@ -1,0 +1,28 @@
+{
+  "citation": {
+    "repo_id": "cd59b4bbcd4c61d6b8fabf741f3497cb",
+    "remote": "https://gitlab.com/codetrail-live/thirdforge",
+    "commit": "cff56bbcfc3c2d3dbd4e3572800b101c919fc1b9",
+    "ref": "main",
+    "path": "calc/calc.go",
+    "start_line": 19,
+    "end_line": 23,
+    "digest": "7ec50bd744fa5a3cc2e578567dbd1ca077d83f03c4790a4dcf6bcd9c90146547",
+    "permalink": "",
+    "staleness": {
+      "state": "unknown",
+      "forge_checked": false,
+      "indexed_at": "2026-07-25T12:00:00Z",
+      "note": "Correct at commit cff56bb, indexed 40 days ago. codetrail has not checked whether main has moved since."
+    }
+  },
+  "span": {
+    "id": "114dd06efc8e4d92c7c5fd4e9da75da4",
+    "path": "calc/calc.go",
+    "kind": "func",
+    "symbol": "Machine.Push",
+    "start_line": 19,
+    "end_line": 23,
+    "text": "// Push adds n to the running total and returns it. CODETRAILDOC.\nfunc (m *Machine) Push(n int) int {\n\tm.total += n\n\treturn m.total\n}"
+  }
+}

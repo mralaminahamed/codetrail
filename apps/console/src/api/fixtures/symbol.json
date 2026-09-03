@@ -1,0 +1,35 @@
+{
+  "citation": {
+    "repo_id": "ae4bae98f7440ee9e4c013b6c69be7e4",
+    "remote": "https://github.com/codetrail-live/zerolog",
+    "commit": "70f51ac8ac469ec5b3beddd7f3b7f4f6b401b034",
+    "ref": "main",
+    "path": "calc/calc.go",
+    "start_line": 19,
+    "end_line": 23,
+    "digest": "7ec50bd744fa5a3cc2e578567dbd1ca077d83f03c4790a4dcf6bcd9c90146547",
+    "permalink": "https://github.com/codetrail-live/zerolog/blob/70f51ac8ac469ec5b3beddd7f3b7f4f6b401b034/calc/calc.go#L19-L23",
+    "staleness": {
+      "state": "unknown",
+      "forge_checked": false,
+      "indexed_at": "2026-08-31T12:00:00Z",
+      "note": "Correct at commit 70f51ac, indexed 3 days ago. codetrail has not checked whether main has moved since."
+    }
+  },
+  "staleness": {
+    "state": "unknown",
+    "forge_checked": false,
+    "indexed_at": "2026-08-31T12:00:00Z",
+    "note": "Correct at commit 70f51ac, indexed 3 days ago. codetrail has not checked whether main has moved since."
+  },
+  "symbol": {
+    "id": "c910a6c9ac0bccc39c96153ccdcb9567",
+    "name": "Machine.Push",
+    "pkg": "calc",
+    "kind": "func",
+    "path": "calc/calc.go",
+    "start_line": 19,
+    "end_line": 23,
+    "span_id": "4f7ade29fb5e0808a5e792a358196130"
+  }
+}

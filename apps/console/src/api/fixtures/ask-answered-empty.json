@@ -1,0 +1,15 @@
+{
+  "repo_id": "ae4bae98f7440ee9e4c013b6c69be7e4",
+  "refused": false,
+  "answered_by": "extractive",
+  "answer": "",
+  "citations": null,
+  "dropped": 1,
+  "mode": "hybrid",
+  "top_score": 0.42,
+  "floor": {
+    "value": -1,
+    "calibrated": false,
+    "applicable": true
+  }
+}

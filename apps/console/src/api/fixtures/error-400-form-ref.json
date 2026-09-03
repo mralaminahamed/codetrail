@@ -1,0 +1,4 @@
+{
+  "error": "ref must be a plain git ref name",
+  "rule": "form"
+}
