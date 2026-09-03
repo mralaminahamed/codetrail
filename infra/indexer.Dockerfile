@@ -20,7 +20,9 @@ FROM debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc401
 # git is what the indexer forks. ca-certificates is what lets it verify a forge:
 # Debian's git only Recommends it and --no-install-recommends drops it, so
 # without this line every `git clone https://…` fails on the certificate while
-# the image otherwise looks entirely healthy.
+# the image otherwise looks entirely healthy. It is also what creates
+# /etc/ssl/certs — measured, dropping the package left the ADD below to create
+# that directory itself, unreadable by uid 65532.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
