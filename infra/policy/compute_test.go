@@ -90,7 +90,10 @@ func TestTheIndexersEgressPortsAreExactly443And5432AndDNS(t *testing.T) {
 		}
 		got[r.FromPort] = true
 	}
-	for _, want := range []float64{443, 5432, 53} {
+	// 11434 is the embedder. Both binaries make one real round trip to it at
+	// boot and fatal if it fails, so an egress set without it is a stack that
+	// cannot start — which the plan file's enumerated list left out.
+	for _, want := range []float64{443, 5432, 53, 11434} {
 		if !got[want] {
 			t.Errorf("the indexer has no egress on %v", want)
 		}
@@ -305,7 +308,10 @@ func TestNoContainerRunsAsRootOrWithAWritableRootFilesystem(t *testing.T) {
 				if m.ReadOnly {
 					continue
 				}
-				if !slices.Contains([]string{"/scratch", "/tmp", "/var/cache/nginx", "/var/run"}, m.ContainerPath) {
+				// The embedder's model directory is its own; the console's two
+				// are nginx's cache and pidfile. Every entry here is a path
+				// somebody had to write down.
+				if !slices.Contains([]string{"/scratch", "/tmp", "/.ollama", "/var/cache/nginx", "/var/run"}, m.ContainerPath) {
 					t.Errorf("%s container %s can write %s", td.Address, c.Name, m.ContainerPath)
 				}
 			}

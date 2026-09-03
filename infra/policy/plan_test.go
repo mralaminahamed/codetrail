@@ -16,7 +16,7 @@ import (
 // The resource count is a literal a reviewer has to change deliberately. A
 // resource added without noticing is then a failing test with a number in it,
 // which is the cheapest guard there is against a hand-edited stack.
-const plannedResources = 34
+const plannedResources = 45
 
 func TestNoSecurityGroupIngressIsOpenToTheWorld(t *testing.T) {
 	p := load(t)
