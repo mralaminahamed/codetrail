@@ -1,6 +1,6 @@
 BIN := bin
 
-.PHONY: build gateway indexer lint test up down psql images image-test alerts-test tf-check tf-plan policy
+.PHONY: build gateway indexer lint test up down psql images image-test alerts-test tf-check tf-plan policy smoke
 
 DATABASE_URL ?= postgres://codetrail:codetrail@localhost:55432/codetrail?sslmode=disable
 OLLAMA_URL ?= http://localhost:11435
@@ -53,6 +53,9 @@ tf-plan:
 policy: tf-plan
 	go vet -tags=tfplan ./infra/...
 	go test -tags=tfplan -count=1 ./infra/policy/
+
+smoke:
+	./infra/smoke.sh --target compose
 
 alerts-test:
 	promtool check rules infra/prometheus/alerts.yml
