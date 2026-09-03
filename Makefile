@@ -1,6 +1,6 @@
 BIN := bin
 
-.PHONY: build gateway indexer lint test up down psql images image-test alerts-test
+.PHONY: build gateway indexer lint test up down psql images image-test alerts-test tf-check tf-plan policy
 
 DATABASE_URL ?= postgres://codetrail:codetrail@localhost:55432/codetrail?sslmode=disable
 OLLAMA_URL ?= http://localhost:11435
@@ -42,6 +42,18 @@ image-test:
 # Both scrape files, because they share one rule_files entry and a rule
 # selecting service="indexer" against a scrape file that never sets the label
 # is a rule that silently matches nothing.
+tf-check:
+	terraform fmt -check -recursive infra/terraform
+	cd infra/terraform && terraform init -backend=false -input=false >/dev/null && terraform validate
+
+# No AWS account, no credentials that resolve to anything. See the script.
+tf-plan:
+	./infra/terraform/offline_plan.sh
+
+policy: tf-plan
+	go vet -tags=tfplan ./infra/...
+	go test -tags=tfplan -count=1 ./infra/policy/
+
 alerts-test:
 	promtool check rules infra/prometheus/alerts.yml
 	promtool check config infra/prometheus/prometheus.compose.yml infra/prometheus/prometheus.aws.yml
