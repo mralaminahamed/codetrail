@@ -88,9 +88,9 @@ type ToolResult struct {
 // estimator is EstimateTokens and makes no pretence of being a tokeniser, so
 // the budget's provenance is auditable rather than assumed.
 type Usage struct {
-	InputTokens  int
-	OutputTokens int
-	Estimated    bool
+	InputTokens  int  `json:"input_tokens"`
+	OutputTokens int  `json:"output_tokens"`
+	Estimated    bool `json:"estimated"`
 }
 
 // Response is what a model said. Stop is the provider's own stop reason and is
