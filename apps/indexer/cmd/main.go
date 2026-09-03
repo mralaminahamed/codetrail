@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/labstack/echo/v4"
 	"github.com/rs/zerolog"
 
 	"github.com/mralaminahamed/codetrail/apps/indexer/internal/clone"
@@ -25,8 +27,10 @@ import (
 	"github.com/mralaminahamed/codetrail/packages/shared/chunk"
 	"github.com/mralaminahamed/codetrail/packages/shared/config"
 	"github.com/mralaminahamed/codetrail/packages/shared/embed"
+	"github.com/mralaminahamed/codetrail/packages/shared/health"
 	"github.com/mralaminahamed/codetrail/packages/shared/jobs"
 	"github.com/mralaminahamed/codetrail/packages/shared/logger"
+	"github.com/mralaminahamed/codetrail/packages/shared/metrics"
 	"github.com/mralaminahamed/codetrail/packages/shared/models"
 	"github.com/mralaminahamed/codetrail/packages/shared/store"
 	"github.com/mralaminahamed/codetrail/packages/shared/symbols"
@@ -159,9 +163,54 @@ func main() {
 	defer ix.sweepHome()
 
 	ix.logToolchain()
-	log.Info().Str("worker", ix.id).Msg("indexer up")
+
+	// Started before the loop and shut down after it: a draining indexer stops
+	// answering /health, so an orchestrator replaces it rather than waiting.
+	probe := ix.probeServer(st.Ping)
+	addr := probeAddr()
+	go func() {
+		if err := probe.Start(addr); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			// Not fatal. The probe surface is how this worker is observed, not
+			// how it works, and a worker that stops indexing because nothing
+			// could bind a port is a worse outage than an unobserved one.
+			log.Error().Err(err).Str("addr", addr).Msg("probe server exited")
+		}
+	}()
+	log.Info().Str("worker", ix.id).Str("probe_addr", addr).Msg("indexer up")
+
 	ix.run(ctx)
+
+	shCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = probe.Shutdown(shCtx)
 }
+
+// probeServer is the indexer's whole HTTP surface: liveness, readiness and
+// metrics. spec §11 asks for it project-wide and the indexer has never had one,
+// so its three instruments had nowhere to be scraped from.
+//
+// Mounting promhttp here publishes every gateway instrument at zero as well,
+// because both binaries register on the default registry. That is why an alert
+// over a gateway-only *gauge* has to select on the scrape label; a counter is
+// safe unscoped, since rate() of a constant zero is zero.
+//
+// Readiness is Postgres and nothing else. A worker has no other dependency it
+// can lose after boot: the embedder is probed once at boot and a job's embed
+// failure is a job failure, and a missing go toolchain is a downgrade by design
+// (logToolchain) whose alert is TypecheckHasNoToolchain. A method on the worker
+// rather than a free function so that a readiness which started consulting
+// ix.lim is a change a test drives.
+func (ix *indexer) probeServer(ping func(context.Context) error) *echo.Echo {
+	e := echo.New()
+	e.HideBanner, e.HidePort = true, true
+	health.Register(e, health.NewReadiness(ix.log, ping).Ready)
+	return e
+}
+
+// probeAddr is where that surface listens. PROBE_PORT and not PORT: PORT is the
+// gateway's, the two run in one compose network, and a copy-pasted task
+// definition would otherwise serve the wrong process on the right port.
+func probeAddr() string { return ":" + config.Get("PROBE_PORT", "9090") }
 
 // allowedHosts reads the exact-host allowlist the same way the gateway does:
 // ALLOWED_HOSTS, comma-separated, replacing the default rather than extending
@@ -336,6 +385,15 @@ func (ix *indexer) sweepJobs(ctx context.Context) {
 // PutSpans are idempotent so two workers converge on the same rows, and
 // Complete refuses for whoever no longer holds the lease.
 func (ix *indexer) runJob(ctx context.Context, job jobs.Job) {
+	start := ix.now()
+	metrics.CountJob(ix.doJob(ctx, job), ix.now().Sub(start))
+}
+
+// doJob is runJob's body, returning the outcome the counter records. Split so
+// that every exit from a job goes through one CountJob call: an early return
+// that forgot to count is the shape of bug an alert over these counters cannot
+// survive.
+func (ix *indexer) doJob(ctx context.Context, job jobs.Job) string {
 	l := ix.log.With().Str("job", job.ID).Str("remote", job.Remote).Logger()
 
 	// jobs.Fail's attempt cap only binds when someone calls Fail, and a job
@@ -344,8 +402,7 @@ func (ix *indexer) runJob(ctx context.Context, job jobs.Job) {
 	// holds the lease now, so it is the one that can end that.
 	if job.Attempts > ix.lim.tries {
 		l.Warn().Int("attempts", job.Attempts).Msg("abandoned by earlier leases, failing")
-		ix.failFinally(ctx, l, job.ID, fmt.Sprintf("abandoned after %d attempts", job.Attempts))
-		return
+		return ix.failFinally(ctx, l, job.ID, fmt.Sprintf("abandoned after %d attempts", job.Attempts))
 	}
 	// git clone --branch takes a ref name; a full commit hash there is fatal
 	// ("Remote branch <sha> not found in upstream origin", measured against
@@ -354,8 +411,7 @@ func (ix *indexer) runJob(ctx context.Context, job jobs.Job) {
 	// make that clone succeed.
 	if isCommitSHA(job.Ref) {
 		l.Warn().Str("ref", job.Ref).Msg("ref is a commit sha, which cannot be cloned")
-		ix.failFinally(ctx, l, job.ID, "ref must be a branch or tag name: a commit sha cannot be cloned")
-		return
+		return ix.failFinally(ctx, l, job.ID, "ref must be a branch or tag name: a commit sha cannot be cloned")
 	}
 
 	// This binary's doc comment claims it is the component that handles the
@@ -371,11 +427,9 @@ func (ix *indexer) runJob(ctx context.Context, job jobs.Job) {
 		// keeps its attempts.
 		var ae *admit.Error
 		if errors.As(err, &ae) && ae.Rule == admit.RuleHost {
-			ix.fail(ctx, l, job.ID, err.Error())
-		} else {
-			ix.failFinally(ctx, l, job.ID, err.Error())
+			return ix.fail(ctx, l, job, err.Error())
 		}
-		return
+		return ix.failFinally(ctx, l, job.ID, err.Error())
 	}
 
 	dir := filepath.Join(ix.home(), job.ID)
@@ -393,8 +447,7 @@ func (ix *indexer) runJob(ctx context.Context, job jobs.Job) {
 	// survive a descendant that outlived the process-group kill.
 	if err := errors.Join(removeScratch(dir), removeScratch(goHome)); err != nil {
 		l.Error().Err(err).Msg("could not clear the scratch directory")
-		ix.fail(ctx, l, job.ID, err.Error())
-		return
+		return ix.fail(ctx, l, job, err.Error())
 	}
 	defer removeScratch(dir)
 	defer removeScratch(goHome)
@@ -410,14 +463,12 @@ func (ix *indexer) runJob(ctx context.Context, job jobs.Job) {
 	res, err := ix.clone(jobCtx, remote.URL, job.Ref, dir, ix.lim.clone)
 	if err != nil {
 		l.Warn().Err(err).Msg("clone failed")
-		ix.fail(ctx, l, job.ID, err.Error())
-		return
+		return ix.fail(ctx, l, job, err.Error())
 	}
 	files, err := ix.walk(jobCtx, res.Dir, ix.lim.walk)
 	if err != nil {
 		l.Warn().Err(err).Msg("walk failed")
-		ix.fail(ctx, l, job.ID, err.Error())
-		return
+		return ix.fail(ctx, l, job, err.Error())
 	}
 
 	// The repo is keyed by the commit that was actually fetched, not by the ref
@@ -428,21 +479,18 @@ func (ix *indexer) runJob(ctx context.Context, job jobs.Job) {
 	rows, spans, parsed, err := ix.index(jobCtx, l, repoID, res.Dir, files)
 	if err != nil {
 		l.Warn().Err(err).Msg("indexing failed")
-		ix.fail(ctx, l, job.ID, err.Error())
-		return
+		return ix.fail(ctx, l, job, err.Error())
 	}
 	repo := models.Repo{ID: repoID, Remote: job.Remote, Ref: job.Ref, Commit: res.Commit, SizeBytes: res.Bytes}
 	if err := ix.put(jobCtx, repo, rows); err != nil {
 		l.Error().Err(err).Msg("write failed")
-		ix.fail(ctx, l, job.ID, err.Error())
-		return
+		return ix.fail(ctx, l, job, err.Error())
 	}
 	// After the files, not before: spans.file_id references files(id), so this
 	// order is the foreign key's and not a preference.
 	if err := ix.putSpans(jobCtx, repoID, spans, ix.emb.Model(), ix.emb.Dim()); err != nil {
 		l.Error().Err(err).Msg("writing spans failed")
-		ix.fail(ctx, l, job.ID, err.Error())
-		return
+		return ix.fail(ctx, l, job, err.Error())
 	}
 
 	// The writes that close the job out run on their own budget, derived from
@@ -461,8 +509,7 @@ func (ix *indexer) runJob(ctx context.Context, job jobs.Job) {
 		parsed: parsed, files: rows, spans: spans,
 	}); err != nil {
 		l.Error().Err(err).Msg("writing the graph failed")
-		ix.fail(ctx, l, job.ID, err.Error())
-		return
+		return ix.fail(ctx, l, job, err.Error())
 	}
 
 	if err := ix.q.Complete(done, job.ID, ix.id, repoID); err != nil {
@@ -477,7 +524,11 @@ func (ix *indexer) runJob(ctx context.Context, job jobs.Job) {
 		} else {
 			l.Warn().Err(err).Msg("could not complete: the job stays leased until it expires")
 		}
-		return
+		// Retried, not failed: the row stays 'leased' with its work written,
+		// and the next worker to lease it after the lease expires is the one
+		// that ends it. Counting this as terminal would report a failure the
+		// queue never recorded.
+		return metrics.JobRetried
 	}
 	l.Info().Str("commit", res.Commit).Int("files", len(rows)).Int("spans", len(spans)).
 		Int64("bytes", res.Bytes).Msg("indexed")
@@ -491,9 +542,13 @@ func (ix *indexer) runJob(ctx context.Context, job jobs.Job) {
 	// over this one left it.
 	if n, err := ix.evict(done, ix.lim.keepRepos, ix.lim.keepTombstones); err != nil {
 		l.Warn().Err(err).Msg("evict failed")
-	} else if n > 0 {
-		l.Info().Int("evicted", n).Msg("evicted least recently queried repos")
+	} else {
+		metrics.CountEvicted(n)
+		if n > 0 {
+			l.Info().Int("evicted", n).Msg("evicted least recently queried repos")
+		}
 	}
+	return metrics.JobDone
 }
 
 // index reads every walked file a second time, chunks it and embeds the
@@ -637,16 +692,24 @@ func (ix *indexer) embedAll(ctx context.Context, spans []store.EmbeddedSpan) err
 // A var so a test can shorten it; nothing writes it in production.
 var recordDeadline = 30 * time.Second
 
-// fail returns the job to the queue against its attempt budget.
-func (ix *indexer) fail(ctx context.Context, l zerolog.Logger, id, reason string) {
-	ix.recordFailure(ctx, l, id, reason, ix.lim.tries)
+// fail returns the job to the queue against its attempt budget, and reports
+// which outcome that was. jobs.Fail decides terminality in SQL from the same
+// two numbers, so the counter says what the row says rather than a second
+// opinion about it.
+func (ix *indexer) fail(ctx context.Context, l zerolog.Logger, job jobs.Job, reason string) string {
+	ix.recordFailure(ctx, l, job.ID, reason, ix.lim.tries)
+	if job.Attempts >= ix.lim.tries {
+		return metrics.JobFailed
+	}
+	return metrics.JobRetried
 }
 
 // failFinally ends the job now, whatever its attempt count. A cap of zero
 // makes jobs.Fail take the terminal branch, because attempts is at least 1
 // after a lease. It is for the refusals a retry cannot change.
-func (ix *indexer) failFinally(ctx context.Context, l zerolog.Logger, id, reason string) {
+func (ix *indexer) failFinally(ctx context.Context, l zerolog.Logger, id, reason string) string {
 	ix.recordFailure(ctx, l, id, reason, 0)
+	return metrics.JobFailed
 }
 
 // recordFailure logs when the lease was already lost, rather than discarding
