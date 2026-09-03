@@ -270,6 +270,12 @@ func TestNoTaskDefinitionHasATaskRole(t *testing.T) {
 		if td.TaskRoleARN != nil {
 			t.Errorf("%s sets task_role_arn to %v; nothing in this codebase calls an AWS API, so the role would grant something and buy nothing", td.Address, td.TaskRoleARN)
 		}
+		// The half that actually catches it. A role assigned from another
+		// resource's arn is unknown at plan time, so the value above is nil —
+		// exactly as it is when there is no role at all.
+		if td.TaskRoleUnknown {
+			t.Errorf("%s assigns a task_role_arn that apply decides; 169.254.170.2 becomes a live credential endpoint inside the untrusted-input process, over link-local where no security-group rule applies", td.Address)
+		}
 	}
 }
 

@@ -362,13 +362,18 @@ type LogConfiguration struct {
 type TaskDefinition struct {
 	Address string
 	Service string
-	// TaskRoleARN is read from planned_values and is a top-level field, so it
-	// is visible even when container_definitions is not. It is the ambient
-	// credential no environment assertion could ever see: ECS injects
-	// AWS_CONTAINER_CREDENTIALS_RELATIVE_URI at runtime, not here.
+	// TaskRoleARN is the ambient credential no environment assertion could ever
+	// see: ECS injects AWS_CONTAINER_CREDENTIALS_RELATIVE_URI at runtime, not
+	// here.
 	TaskRoleARN any
-	Containers  []Container
-	Volumes     []string
+	// TaskRoleUnknown is the other half, and without it the assertion is
+	// vacuous. Measured while running C10b: task_role_arn set from
+	// aws_iam_role.execution.arn is absent from planned_values and marked true
+	// in after_unknown, so a test reading only the value sees nil — the same
+	// nil that "no task role at all" produces — and passes.
+	TaskRoleUnknown bool
+	Containers      []Container
+	Volumes         []string
 }
 
 // taskDefinitions decodes every task definition in the plan, failing rather
@@ -379,6 +384,11 @@ func (p *Plan) taskDefinitions(t *testing.T) []TaskDefinition {
 	var out []TaskDefinition
 	for _, r := range p.resources("aws_ecs_task_definition") {
 		td := TaskDefinition{Address: r.Address, TaskRoleARN: r.Values["task_role_arn"]}
+		if ch, ok := p.change(r.Address); ok {
+			if m, ok := ch.Change.AfterUnknown.(map[string]any); ok {
+				td.TaskRoleUnknown, _ = m["task_role_arn"].(bool)
+			}
+		}
 		if s, ok := r.Values["family"].(string); ok {
 			td.Service = s[strings.LastIndex(s, "-")+1:]
 		}
