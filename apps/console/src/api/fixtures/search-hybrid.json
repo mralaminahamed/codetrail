@@ -1,0 +1,98 @@
+{
+  "repo_id": "ae4bae98f7440ee9e4c013b6c69be7e4",
+  "mode": "hybrid",
+  "top_score": 0.559502899646759,
+  "count": 3,
+  "hits": [
+    {
+      "span_id": "4f7ade29fb5e0808a5e792a358196130",
+      "path": "calc/calc.go",
+      "kind": "func",
+      "symbol": "Machine.Push",
+      "start_line": 19,
+      "end_line": 23,
+      "text": "// Push adds n to the running total and returns it. CODETRAILDOC.\nfunc (m *Machine) Push(n int) int {\n\tm.total += n\n\treturn m.total\n}",
+      "score": 0.03278688524590164,
+      "vector_score": 0.559502899646759,
+      "vector_rank": 1,
+      "lexical_rank": 1,
+      "citation": {
+        "repo_id": "ae4bae98f7440ee9e4c013b6c69be7e4",
+        "remote": "https://github.com/codetrail-live/zerolog",
+        "commit": "70f51ac8ac469ec5b3beddd7f3b7f4f6b401b034",
+        "ref": "main",
+        "path": "calc/calc.go",
+        "start_line": 19,
+        "end_line": 23,
+        "digest": "7ec50bd744fa5a3cc2e578567dbd1ca077d83f03c4790a4dcf6bcd9c90146547",
+        "permalink": "https://github.com/codetrail-live/zerolog/blob/70f51ac8ac469ec5b3beddd7f3b7f4f6b401b034/calc/calc.go#L19-L23",
+        "staleness": {
+          "state": "unknown",
+          "forge_checked": false,
+          "indexed_at": "2026-08-31T12:00:00Z",
+          "note": "Correct at commit 70f51ac, indexed 3 days ago. codetrail has not checked whether main has moved since."
+        }
+      }
+    },
+    {
+      "span_id": "60f275e3aa755d7deee8734b167fb0e2",
+      "path": "calc/calc.go",
+      "kind": "type",
+      "symbol": "Machine",
+      "start_line": 14,
+      "end_line": 17,
+      "text": "// Machine accumulates a running total. CODETRAILDOC.\ntype Machine struct {\n\ttotal int\n}",
+      "score": 0.016129032258064516,
+      "vector_score": 0.40824824571609497,
+      "vector_rank": 2,
+      "lexical_rank": 0,
+      "citation": {
+        "repo_id": "ae4bae98f7440ee9e4c013b6c69be7e4",
+        "remote": "https://github.com/codetrail-live/zerolog",
+        "commit": "70f51ac8ac469ec5b3beddd7f3b7f4f6b401b034",
+        "ref": "main",
+        "path": "calc/calc.go",
+        "start_line": 14,
+        "end_line": 17,
+        "digest": "4789a75db8cb7661e711662595ce6fd716f479a4a7a81a70b603a2a304223a7c",
+        "permalink": "https://github.com/codetrail-live/zerolog/blob/70f51ac8ac469ec5b3beddd7f3b7f4f6b401b034/calc/calc.go#L14-L17",
+        "staleness": {
+          "state": "unknown",
+          "forge_checked": false,
+          "indexed_at": "2026-08-31T12:00:00Z",
+          "note": "Correct at commit 70f51ac, indexed 3 days ago. codetrail has not checked whether main has moved since."
+        }
+      }
+    },
+    {
+      "span_id": "b07e89a10f7c35cc0869c0b7bc63ba73",
+      "path": "calc/use.go",
+      "kind": "func",
+      "symbol": "Total",
+      "start_line": 3,
+      "end_line": 10,
+      "text": "// Total renders a machine after pushing every n. CODETRAILDOC.\nfunc Total(ns []int) string {\n\tm := \u0026Machine{}\n\tfor _, n := range ns {\n\t\tm.Push(n)\n\t}\n\treturn Render(m)\n}",
+      "score": 0.016129032258064516,
+      "vector_score": null,
+      "vector_rank": 0,
+      "lexical_rank": 2,
+      "citation": {
+        "repo_id": "ae4bae98f7440ee9e4c013b6c69be7e4",
+        "remote": "https://github.com/codetrail-live/zerolog",
+        "commit": "70f51ac8ac469ec5b3beddd7f3b7f4f6b401b034",
+        "ref": "main",
+        "path": "calc/use.go",
+        "start_line": 3,
+        "end_line": 10,
+        "digest": "8f6b4fbf72c4fb5d2ab72d3a76814da01a54c0fa17c95e5cd4b22c3bb930bd37",
+        "permalink": "https://github.com/codetrail-live/zerolog/blob/70f51ac8ac469ec5b3beddd7f3b7f4f6b401b034/calc/use.go#L3-L10",
+        "staleness": {
+          "state": "unknown",
+          "forge_checked": false,
+          "indexed_at": "2026-08-31T12:00:00Z",
+          "note": "Correct at commit 70f51ac, indexed 3 days ago. codetrail has not checked whether main has moved since."
+        }
+      }
+    }
+  ]
+}

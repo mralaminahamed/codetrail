@@ -1,0 +1,24 @@
+{
+  "count": 1,
+  "matched": "exact",
+  "repo_id": "ae4bae98f7440ee9e4c013b6c69be7e4",
+  "staleness": {
+    "state": "unknown",
+    "forge_checked": false,
+    "indexed_at": "2026-08-31T12:00:00Z",
+    "note": "Correct at commit 70f51ac, indexed 3 days ago. codetrail has not checked whether main has moved since."
+  },
+  "symbols": [
+    {
+      "id": "01595f73f0019f7d100601aa5f44dfea",
+      "name": "Total",
+      "pkg": "calc",
+      "kind": "func",
+      "path": "calc/use.go",
+      "start_line": 3,
+      "end_line": 10,
+      "span_id": "b07e89a10f7c35cc0869c0b7bc63ba73"
+    }
+  ],
+  "truncated": false
+}

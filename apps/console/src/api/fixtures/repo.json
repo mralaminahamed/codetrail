@@ -1,0 +1,20 @@
+{
+  "commit": "70f51ac8ac469ec5b3beddd7f3b7f4f6b401b034",
+  "edges": 5,
+  "edges_resolved": 3,
+  "edges_syntactic": 2,
+  "files": 11,
+  "files_with_spans": 7,
+  "id": "ae4bae98f7440ee9e4c013b6c69be7e4",
+  "indexed_at": "2026-08-31T12:00:00Z",
+  "ref": "main",
+  "remote": "https://github.com/codetrail-live/zerolog",
+  "spans": 18,
+  "staleness": {
+    "state": "unknown",
+    "forge_checked": false,
+    "indexed_at": "2026-08-31T12:00:00Z",
+    "note": "Correct at commit 70f51ac, indexed 3 days ago. codetrail has not checked whether main has moved since."
+  },
+  "symbols": 6
+}

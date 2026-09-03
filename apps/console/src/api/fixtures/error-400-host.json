@@ -1,0 +1,4 @@
+{
+  "error": "example.com is not an allowed host",
+  "rule": "host"
+}
