@@ -34,12 +34,16 @@ func (ts *tools) Specs() []llm.ToolSpec {
 	return out
 }
 
+// A tool call opens a span unless the script says otherwise, so a final answer
+// has something to cite: an answer that resolves no citation is discarded, and
+// a fixture whose tools open nothing would exercise that branch by accident in
+// every ceiling test.
 func (ts *tools) Call(_ context.Context, c llm.ToolCall) (Result, error) {
 	ts.calls = append(ts.calls, c)
 	if ts.fn != nil {
 		return ts.fn(len(ts.calls), c)
 	}
-	return Result{Content: `{"ok":true}`}, nil
+	return Result{Content: `{"ok":true}`, Read: []models.Span{{ID: fmt.Sprintf("s%d", len(ts.calls))}}}, nil
 }
 
 func okTools() *tools { return &tools{} }
@@ -173,13 +177,13 @@ func TestTheStepCeilingStopsAtNAndTheTraceSaysWhereItStopped(t *testing.T) {
 }
 
 func TestOneStepUnderTheCeilingStillAnswers(t *testing.T) {
-	turns := append(toolTurns(5), finalTurn("answer"))
+	turns := append(toolTurns(5), finalTurn("answer [1]"))
 	f := llm.NewFake(turns...)
 	b := testBounds()
 	b.MaxSteps = 6
 	a := Run(context.Background(), f, okTools(), b, "q")
 	assertLoop(t, a, f, StopFinal, 6, 6)
-	if a.Text != "answer" {
+	if a.Text != "answer [1]" {
 		t.Errorf("text %q, want the answer: the just-under case must succeed or the ceiling test proves nothing", a.Text)
 	}
 }
@@ -204,7 +208,7 @@ func TestTheToolCallCeilingBindsWhenOneStepRequestsMany(t *testing.T) {
 		{6, StopFinal, 2, 2, 5},
 	} {
 		t.Run(fmt.Sprint(tc.max), func(t *testing.T) {
-			f := llm.NewFake(many, finalTurn("done"))
+			f := llm.NewFake(many, finalTurn("done [1]"))
 			ts := okTools()
 			b := testBounds()
 			b.MaxToolCalls = tc.max
@@ -334,13 +338,18 @@ func TestAToolNotFoundIsDataForTheModelAndNotAStop(t *testing.T) {
 		if n == 1 {
 			return Result{Content: `{"error":"not_found"}`, NotFound: true}, nil
 		}
-		return Result{Content: `{"ok":true}`}, nil
+		return Result{Content: `{"ok":true}`, Read: []models.Span{{ID: "elsewhere"}}}, nil
 	}}
-	f := llm.NewFake(toolTurn(0), finalTurn("found it elsewhere [1]"))
+	// Miss, then a read that succeeds, then an answer: the model routed around
+	// the not-found, which is what makes it data rather than a stop.
+	f := llm.NewFake(toolTurn(0), toolTurn(1), finalTurn("found it elsewhere [1]"))
 	a := Run(context.Background(), f, ts, testBounds(), "q")
-	assertLoop(t, a, f, StopFinal, 2, 2)
+	assertLoop(t, a, f, StopFinal, 3, 3)
 	if a.Text == "" {
 		t.Errorf("answer was empty")
+	}
+	if ids := a.ReadIDs(); len(ids) != 1 || ids[0] != "elsewhere" {
+		t.Errorf("Read = %v, want [elsewhere]: a not-found opens nothing", ids)
 	}
 }
 
@@ -379,7 +388,7 @@ func TestAMalformedToolCallIsCorrectableTwiceAndThenStops(t *testing.T) {
 		if strings.Contains(string(c.Args), `"bad":true`) {
 			return Result{}, fmt.Errorf("%w: unknown key", ErrMalformedCall)
 		}
-		return Result{Content: `{"ok":true}`}, nil
+		return Result{Content: `{"ok":true}`, Read: []models.Span{{ID: "recovered"}}}, nil
 	}
 	badTurn := func(i int) llm.Turn {
 		return llm.Turn{Calls: []llm.ToolCall{{ID: fmt.Sprint(i), Name: "search_code", Args: json.RawMessage(fmt.Sprintf(`{"bad":true,"n":%d}`, i))}}}
@@ -391,10 +400,10 @@ func TestAMalformedToolCallIsCorrectableTwiceAndThenStops(t *testing.T) {
 	}{
 		{1, StopMalformedToolCall, 2},
 		{2, StopMalformedToolCall, 3},
-		{3, StopFinal, 4},
+		{3, StopFinal, 5},
 	} {
 		t.Run(fmt.Sprint(tc.maxErrors), func(t *testing.T) {
-			f := llm.NewFake(badTurn(1), badTurn(2), badTurn(3), finalTurn("done"))
+			f := llm.NewFake(badTurn(1), badTurn(2), badTurn(3), toolTurn(9), finalTurn("done [1]"))
 			b := testBounds()
 			b.MaxToolErrors = tc.maxErrors
 			a := Run(context.Background(), f, &tools{fn: bad}, b, "q")
@@ -456,7 +465,7 @@ func TestTheTraceNeverCarriesToolArguments(t *testing.T) {
 	const canary = "CANARY-QUESTION-TEXT"
 	f := llm.NewFake(
 		llm.Turn{Calls: []llm.ToolCall{{ID: "s", Name: "search_code", Args: json.RawMessage(`{"q":"` + canary + `"}`)}}},
-		finalTurn("done"),
+		finalTurn("done [1]"),
 	)
 	a := Run(context.Background(), f, okTools(), testBounds(), canary)
 	b, err := json.Marshal(a.Trace)
@@ -492,8 +501,8 @@ func TestReadIsOrderedSoAMarkerResolvesInAFixedOrder(t *testing.T) {
 	)
 	a := Run(context.Background(), f, readTools(), testBounds(), "q")
 	want := []string{"read-a", "read-b", "read-a"}
-	if !reflect.DeepEqual(a.Read, want) {
-		t.Errorf("Read = %v, want %v", a.Read, want)
+	if !reflect.DeepEqual(a.ReadIDs(), want) {
+		t.Errorf("Read = %v, want %v", a.ReadIDs(), want)
 	}
 
 	// And the ordering claim itself, over four distinct spans.
@@ -505,8 +514,8 @@ func TestReadIsOrderedSoAMarkerResolvesInAFixedOrder(t *testing.T) {
 	a2 := Run(context.Background(), f2, readTools(), testBounds(), "q")
 	// Insertion order is deliberately the reverse of sorted order, so an
 	// implementation that sorted rather than appended also fails.
-	if want := []string{"read-d", "read-c", "read-b", "read-a"}; !reflect.DeepEqual(a2.Read, want) {
-		t.Errorf("Read = %v, want %v", a2.Read, want)
+	if want := []string{"read-d", "read-c", "read-b", "read-a"}; !reflect.DeepEqual(a2.ReadIDs(), want) {
+		t.Errorf("Read = %v, want %v", a2.ReadIDs(), want)
 	}
 }
 

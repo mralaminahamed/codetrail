@@ -1,10 +1,17 @@
 // Package agent is the bounded tool loop spec:234 asks for.
 //
-// Pure. No store, no HTTP, no echo — and, load-bearing rather than tidy, NO
-// net/http import anywhere in this package. The loop takes an llm.Model and a
-// ToolSet, both interfaces, so the claim that every outbound connection this
-// phase adds is constructed once at boot is checkable by reading one import
-// block rather than by trusting a sentence.
+// The loop takes an llm.Model and a ToolSet, both interfaces, and imports
+// neither net/http nor net/url in any of its own files — so the claim that
+// every outbound connection this phase adds is constructed once at boot is
+// checkable by reading one import block. TestThisPackageDialsNothing is that
+// check.
+//
+// What this package does NOT claim, because it would be false: that no
+// database driver is anywhere in its dependency graph. It imports rag for
+// rag.Result and store for store.Caller, and both pull net/http transitively
+// (rag through prometheus, store through pgx). The enforced property is about
+// this package's own imports and about the types it holds: a Corpus interface,
+// never a concrete store handle, and no HTTP client of any kind.
 //
 // Run returns no error. Every failure of the model, of a bound or of a tool is
 // an outcome the caller must degrade from, and an error in the signature is an
@@ -56,14 +63,29 @@ type ToolSet interface {
 
 // Answer is what one loop produced.
 //
-// Read is an ORDERED slice of span ids, not a set and not a map: markers are
-// positional, [3] means the third span the loop read, and Go randomises map
-// iteration — so a citation resolved through a map would differ between two
-// runs of one process, which is worse than no citation at all.
+// Read is an ORDERED slice, not a set and not a map: markers are positional,
+// [3] means the third span the loop read, and Go randomises map iteration — so
+// a citation resolved through a map would differ between two runs of one
+// process, which is worse than no citation at all. A map also deduplicates,
+// which is wrong whatever order it walks in.
+//
+// Cited is the positions the answer's surviving markers resolved to, in order
+// of first appearance. It indexes Read.
 type Answer struct {
 	Text  string
-	Read  []string
+	Read  []models.Span
+	Cited []int
 	Trace Trace
+}
+
+// ReadIDs is Read's span ids, in the same order. One derivation, so a caller
+// cannot hold a second list that drifts.
+func (a Answer) ReadIDs() []string {
+	out := make([]string, 0, len(a.Read))
+	for _, sp := range a.Read {
+		out = append(out, sp.ID)
+	}
+	return out
 }
 
 // systemPrompt is fixed at compile time and carries no repository text and no
@@ -240,14 +262,25 @@ func (l *loop) spend(u llm.Usage) {
 	l.tr.Usage.Estimated = l.tr.Usage.Estimated || u.Estimated
 }
 
+// stop finishes the loop, and for a final answer it runs the citation gate.
+//
+// The gate is here rather than in the handler because Read is here: spec:5 is
+// "get an answer that cites file:line", and an LLM answer that resolves no
+// citation is strictly worse than the cited extractive one the caller already
+// paid to retrieve.
 func (l *loop) stop(s Stop) Answer {
-	l.tr.Stop = s
-	a := Answer{Trace: l.tr, Read: make([]string, 0, len(l.read))}
-	for _, sp := range l.read {
-		a.Read = append(a.Read, sp.ID)
-	}
+	a := Answer{Read: l.read}
 	if s == StopFinal {
-		a.Text = l.text
+		text, cited, dropped := Resolve(l.text, l.read)
+		l.tr.CitationsDropped = dropped
+		if len(cited) == 0 {
+			s = StopUncited
+		} else {
+			a.Text = text
+			a.Cited = cited
+		}
 	}
+	l.tr.Stop = s
+	a.Trace = l.tr
 	return a
 }
