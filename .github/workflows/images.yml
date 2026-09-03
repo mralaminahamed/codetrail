@@ -1,0 +1,76 @@
+name: Images
+
+# pull_request is not optional: building on every pull request with push: false
+# is the only thing that makes the Dockerfiles verifiable with no cloud account,
+# and two of Task 1's Definition-of-Done items depend on it.
+on:
+  push: { branches: [trunk] }
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Only used on trunk, where the push step runs.
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [gateway, indexer, ollama]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      # No account and no credentials: this proves the Dockerfile builds and
+      # nothing else. Pushing is the account-required half.
+      - name: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: infra/${{ matrix.image }}.Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: codetrail/${{ matrix.image }}:${{ github.sha }}
+
+      # [ACCOUNT-REQUIRED] Everything below has never run. There is no AWS
+      # account, no OIDC role and no ECR registry behind this repository.
+      #
+      # ECR and not GHCR: this repository is private, GHCR packages inherit
+      # repository visibility, and a private GHCR image fails a Fargate pull
+      # with CannotPullContainerError while the circuit breaker rolls the apply
+      # back. ECR is pulled by the execution role through IAM, so there is no
+      # registry credential at all.
+      - name: assume the push role
+        if: github.ref == 'refs/heads/trunk'
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          role-to-assume: ${{ secrets.AWS_IMAGES_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: log in to ECR
+        if: github.ref == 'refs/heads/trunk'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      # The commit SHA always, plus trunk and latest on the default branch only.
+      # The SHA is the only tag that cannot move under a running service; latest
+      # exists solely because var.image_tag defaults to it, and a deploy that
+      # names it is a deploy nobody can reproduce.
+      - name: push
+        if: github.ref == 'refs/heads/trunk'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: infra/${{ matrix.image }}.Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/codetrail/${{ matrix.image }}:${{ github.sha }}
+            ${{ steps.ecr.outputs.registry }}/codetrail/${{ matrix.image }}:trunk
+            ${{ steps.ecr.outputs.registry }}/codetrail/${{ matrix.image }}:latest

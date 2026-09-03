@@ -1,0 +1,26 @@
+# Scrape configuration for `docker compose --profile obs up`. The rule file is
+# shared with the cloud; this file is not, because discovery cannot be: compose
+# has fixed container names, the cloud has tasks with rotating addresses.
+#
+# static_configs has a consequence worth knowing before you park anything: a
+# stopped indexer keeps its target here, so `up` goes to 0 and IndexerDown fires
+# critical for as long as it is parked. IndexerAbsent is the cloud's half and
+# cannot fire under static discovery at all.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - alerts.yml
+
+scrape_configs:
+  - job_name: codetrail
+    static_configs:
+      # The service label is not decoration: GatewayDown, IndexerDown,
+      # IndexerAbsent and ScoreFloorUncalibrated all select on it, and a rule
+      # selecting a label no scrape sets is a rule that silently matches
+      # nothing.
+      - targets: ["gateway:8080"]
+        labels: { service: gateway }
+      - targets: ["indexer:9090"]
+        labels: { service: indexer }

@@ -1,0 +1,24 @@
+# Copy to backend.hcl (git-ignored) and pass at init:
+#   terraform init -backend-config=backend.hcl
+#
+# The bucket is NOT created by this stack — it has to exist before init — so its
+# requirements are written here, where the person who creates it will read them.
+#
+# Terraform state for this stack holds the RDS master password and every
+# secret version in CLEARTEXT. That makes the bucket part of the security
+# boundary rather than incidental plumbing, and it needs, at a minimum:
+#
+#   - default encryption on: SSE-S3 at least, SSE-KMS preferred
+#   - versioning ON. A truncated or corrupted state is otherwise unrecoverable,
+#     and the recovery is not "re-run apply" — apply against lost state would
+#     try to create a stack that already exists
+#   - a public access block with all four settings on
+#   - a bucket policy denying requests where aws:SecureTransport is false
+#
+# use_lockfile replaces the DynamoDB lock table; it needs no second resource.
+
+bucket       = "REPLACE-ME-codetrail-tfstate"
+key          = "codetrail/production.tfstate"
+region       = "us-east-1"
+encrypt      = true
+use_lockfile = true

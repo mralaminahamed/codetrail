@@ -5,12 +5,17 @@ package store
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/mralaminahamed/codetrail/packages/shared/models"
 	"github.com/mralaminahamed/codetrail/packages/shared/testdb"
@@ -436,4 +441,59 @@ func heldAdvisoryLocks(t *testing.T, p *pgxpool.Pool) int {
 		t.Fatal(err)
 	}
 	return n
+}
+
+// The gauge exists because dev and production do not run the same pgvector —
+// compose is ahead of what RDS offers — so the number has to come from the
+// server rather than from the image tag anyone asked for. Asserted against
+// pg_extension and current_setting read a second way: a Versions that returned
+// a constant would pass every hermetic test there is.
+func TestTheDatastoreInfoGaugeCarriesTheServersRealVersions(t *testing.T) {
+	ctx := context.Background()
+	s, err := New(ctx, dsn(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	pg, vec, err := s.Versions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wantPG, wantVec string
+	if err := s.Pool().QueryRow(ctx, `SELECT current_setting('server_version')`).Scan(&wantPG); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Pool().QueryRow(ctx, `SELECT extversion FROM pg_extension WHERE extname = 'vector'`).Scan(&wantVec); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(wantPG, pg) || pg == "" {
+		t.Errorf("Versions says postgres %q, the server says %q", pg, wantPG)
+	}
+	if vec != wantVec {
+		t.Errorf("Versions says pgvector %q, pg_extension says %q", vec, wantVec)
+	}
+	// HNSW, which migrations/0002_span_ann.sql builds, needs 0.5.0.
+	if vec < "0.5.0" {
+		t.Errorf("pgvector is %q, below the 0.5.0 HNSW floor", vec)
+	}
+
+	// And New publishes it, which is the half a caller of Versions alone would
+	// not have.
+	series := `codetrail_datastore_info{pgvector="` + vec + `",postgres="` + pg + `"}`
+	srv := httptest.NewServer(promhttp.Handler())
+	defer srv.Close()
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), series+" 1") {
+		t.Fatalf("%s is not on /metrics after store.New", series)
+	}
+	t.Logf("datastore: postgres %s, pgvector %s", pg, vec)
 }

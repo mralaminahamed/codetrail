@@ -87,6 +87,65 @@ var (
 		Name: "codetrail_score_floor_calibrated",
 		Help: "1 when the score floor was measured, 0 when it is a placeholder. It is 0 until P6 measures one.",
 	})
+
+	jobTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "codetrail_job_total",
+		Help: "Indexing jobs by outcome: done, retried, or failed meaning terminal.",
+	}, []string{"outcome"})
+
+	// Labelled by outcome, because "how long does a failure take" is a
+	// different question from "how long does a job take": a job that fails at
+	// the deadline and one refused at admission are the same counter and very
+	// different histograms.
+	//
+	// Exponential from 1s rather than DefBuckets, whose 10s ceiling would put
+	// every real job in +Inf: a job clones, walks, chunks, embeds and
+	// type-checks a stranger's repository under a 600s deadline.
+	jobSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "codetrail_job_seconds",
+		Help:    "Time one indexing job took, by outcome.",
+		Buckets: prometheus.ExponentialBuckets(1, 2, 14),
+	}, []string{"outcome"})
+
+	// Two counters rather than one with a rule label, for the reason answers
+	// and refusals are two: the rule is defined for one outcome only. It also
+	// gives a rejection *rate* a denominator, which "rejections by reason"
+	// alone does not.
+	admissions = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "codetrail_admission_total",
+		Help: "Repository submissions by admission outcome: accepted or rejected.",
+	}, []string{"outcome"})
+
+	admissionRejections = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "codetrail_admission_rejected_total",
+		Help: "Admission rejections by the rule that refused: form, scheme or host.",
+	}, []string{"rule"})
+
+	// Rows, not sweeps: a sweep that removed forty repositories and one that
+	// removed none are the same event and very different facts.
+	evictions = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "codetrail_evicted_total",
+		Help: "Repository rows removed by LRU eviction.",
+	})
+
+	// Version strings as labels, against this package's own rule, and the
+	// exception is argued rather than assumed: a server version is bounded by
+	// the database, produces one series per running deployment, and changes
+	// only when somebody upgrades. It exists because compose and RDS do not
+	// run the same pgvector, and the honest answer to that is to publish what
+	// is actually serving rather than to claim parity.
+	datastore = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "codetrail_datastore_info",
+		Help: "1, labelled with the PostgreSQL and pgvector versions actually serving.",
+	}, []string{"postgres", "pgvector"})
+)
+
+// The job counters' vocabulary. Constants rather than literals at the call
+// sites, because the worker decides the outcome in five places.
+const (
+	JobDone    = "done"
+	JobRetried = "retried"
+	JobFailed  = "failed"
 )
 
 // GraphProvenances and TypecheckReasons are the graph counters' whole
@@ -96,6 +155,13 @@ var (
 var (
 	GraphProvenances = []string{"resolved", "syntactic"}
 	TypecheckReasons = []string{"ok", "disabled", "no_toolchain", "no_module", "load_error", "deadline", "policy"}
+
+	// JobOutcomes and AdmissionRules are the two new counters' whole
+	// vocabularies. AdmissionRules is admit.Rule's, written out rather than
+	// imported so a test can pin the two together: importing it would make
+	// that test compare admit against itself.
+	JobOutcomes    = []string{JobDone, JobRetried, JobFailed}
+	AdmissionRules = []string{"form", "scheme", "host"}
 )
 
 // The label sets are closed, and these are their whole vocabularies — rag's
@@ -123,6 +189,19 @@ func init() {
 	for _, reason := range TypecheckReasons {
 		typechecks.WithLabelValues(reason)
 	}
+	for _, outcome := range JobOutcomes {
+		jobTotal.WithLabelValues(outcome)
+		jobSeconds.WithLabelValues(outcome)
+	}
+	for _, outcome := range []string{"accepted", "rejected"} {
+		admissions.WithLabelValues(outcome)
+	}
+	for _, rule := range AdmissionRules {
+		admissionRejections.WithLabelValues(rule)
+	}
+	// datastore is deliberately not seeded: its labels are not known until a
+	// connection exists, and a series labelled with an empty version would
+	// claim a fact nobody has read yet.
 }
 
 // ObserveRetrieval records how long the arms and the fusion took. The
@@ -175,6 +254,38 @@ func SetFloor(value float64, calibrated bool) {
 		return
 	}
 	scoreFloorCalibrated.Set(0)
+}
+
+// CountJob records one job's outcome and how long it took, once per job, from
+// the worker that ran it. The duration goes in under the same outcome as the
+// count, so the two instruments cannot disagree about what happened.
+func CountJob(outcome string, d time.Duration) {
+	jobTotal.WithLabelValues(outcome).Inc()
+	jobSeconds.WithLabelValues(outcome).Observe(d.Seconds())
+}
+
+// CountAdmission records one admission decision and, for a refusal, the rule
+// behind it. rule is read only when accepted is false.
+//
+// Called by the gateway only. The indexer re-checks the same allowlist before
+// it clones, and counting there too would double every submission; that
+// re-check failing is a job failure with a reason and belongs to CountJob.
+func CountAdmission(accepted bool, rule string) {
+	if accepted {
+		admissions.WithLabelValues("accepted").Inc()
+		return
+	}
+	admissions.WithLabelValues("rejected").Inc()
+	admissionRejections.WithLabelValues(rule).Inc()
+}
+
+// CountEvicted counts the rows one sweep removed.
+func CountEvicted(n int) { evictions.Add(float64(n)) }
+
+// SetDatastoreInfo publishes the versions the process is actually talking to,
+// read from the server rather than from the image tag that was asked for.
+func SetDatastoreInfo(postgres, pgvector string) {
+	datastore.WithLabelValues(postgres, pgvector).Set(1)
 }
 
 // SetReady records the outcome of a readiness check. A service that never
