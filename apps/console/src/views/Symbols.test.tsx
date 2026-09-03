@@ -59,6 +59,17 @@ describe("the definitions list", () => {
     expect(symbolsOne.matched).toBe("exact");
   });
 
+  test("the console renders the response's matched value, not the request's", async () => {
+    // graph.go:166-169 derives `matched` from the flag that reached the store
+    // "so a widening the caller did not ask for is visible in the payload".
+    // Today the two always agree, so only a response that disagrees can tell a
+    // console reading the answer from one reading the question.
+    stub("get", PATH, 200, { ...symbolsOne, matched: "suffix" });
+    renderSymbols("?name=Total");
+    expect(await screen.findByText(/Matched: suffix\./)).toBeInTheDocument();
+    expect(screen.queryByText(/Matched: exact\./)).toBeNull();
+  });
+
   test("the suffix checkbox is a labelled opt-in and is sent only when checked", async () => {
     const rec = stub("get", PATH, 200, symbolsOne);
     renderSymbols("?name=Total");

@@ -64,7 +64,16 @@ describe("asking", () => {
     await askQuestion();
     await screen.findByRole("heading", { name: "Answer" });
     expect(container.textContent).toContain(answered.answer.slice(0, 40));
-    expect(screen.getAllByRole("listitem").length).toBe(answered.citations.length);
+    const rows = screen.getAllByRole("listitem");
+    expect(rows.length).toBe(answered.citations.length);
+    // The marker ORDER, not just membership: the markers point into the answer
+    // text, so a reordered citation list makes every marker cite the wrong
+    // span. Sorting by span id reorders this fixture, which is why the order
+    // is asserted as a sequence rather than as a set.
+    expect(rows.map((li) => li.textContent?.match(/\[(\d+)\]/)?.[1])).toEqual(
+      answered.citations.map((c) => String(c.marker)),
+    );
+    expect(rows.map((li) => (li.textContent?.includes(answered.citations[0]!.citation.digest) ? 0 : 1))[0]).toBe(0);
     for (const c of answered.citations) {
       expect(container.textContent).toContain(c.citation.digest);
     }
