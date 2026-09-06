@@ -51,12 +51,16 @@ groups:
           summary: "{{ $labels.service }} is up but not ready"
           description: "A readiness dependency has been unreachable for 2m behind a process that is still listening."
 
-      # Do: this is spec:275-276's "unconfigured" state alert, and which side of
-      # P6 the deployment is on decides what it means. Before P6 the floor is a
-      # -1 placeholder and this fires by design. After P6 it means a deployment
-      # is serving an operator's own ANSWER_SCORE_FLOOR, or the placeholder,
-      # rather than the value docs/eval/runs/ measured — which is the failure
-      # nothing else reports, because every answer is still a 200.
+      # Do: this is spec:275-276's "unconfigured" state alert, and the thing
+      # that decides what it means is the gauge beside it, not a phase. While
+      # codetrail_score_floor_calibrated is 0 EVERYWHERE, no calibrated floor
+      # exists to be served: P6 ran the eval and declined to calibrate on one
+      # corpus (docs/eval/corpora.md), so the floor is the -1 placeholder and
+      # this rule fires by design. Silence it; there is no value to hunt for.
+      # Once some deployment reports 1, the rule has its real job back: a
+      # deployment still reading 0 is serving an operator's own
+      # ANSWER_SCORE_FLOOR, or the placeholder, rather than the measured value
+      # — the failure nothing else reports, because every answer is still 200.
       #
       # Scoped to the gateway because both processes share the default registry:
       # the indexer exports this gauge at a permanent 0 that only the gateway
@@ -67,7 +71,7 @@ groups:
         labels: { severity: warning }
         annotations:
           summary: "the answer score floor is not calibrated"
-          description: "codetrail_score_floor is {{ with query \"codetrail_score_floor\" }}{{ . | first | value }}{{ end }} and nothing this project measured produced it. Expected while P6 is unlanded; afterwards it means the deployment is not serving the calibrated value."
+          description: "codetrail_score_floor is {{ with query \"codetrail_score_floor\" }}{{ . | first | value }}{{ end }} and nothing this project measured produced it. No calibrated floor exists yet — the eval declined to calibrate on one corpus — so this is expected and should be silenced, not chased. Once codetrail_score_floor_calibrated reads 1 anywhere, a deployment still reading 0 is serving the wrong value."
 
       # --- Counts: not ratios, so no conjunct — but note they are rates over a
       # counter and therefore, unlike the state rules above, CANNOT fire with no
@@ -75,7 +79,9 @@ groups:
 
       # Do: the indexer cannot find a go binary, so every edge it writes is
       # syntactic and every HTTP response is still a 200 — the silent downgrade
-      # README:540 warns P8 about. Check the image, then `command -v go` in the
+      # the README's "The symbol graph, and its honesty" section warns about (a
+      # section reference, not a line number: the line moved once already).
+      # Check the image, then `command -v go` in the
       # running task. A count and not a ratio, so no conjunct: one job that
       # cannot type-check is already the whole story.
       #
@@ -128,10 +134,12 @@ groups:
           summary: "/ask error rate above 5%"
           description: "{{ $value | humanizePercentage }} of answers errored over 5m. Not the floor — that is a refusal."
 
-      # Do: read codetrail_refusal_total's reason split first. Until P6 the floor
-      # is a placeholder, so below_floor should be zero and every refusal should
-      # be no_spans or unscored — a corpus gap, not a threshold. After P6 the
-      # split tells floor drift from a missing corpus.
+      # Do: read codetrail_refusal_total's reason split first. While
+      # codetrail_score_floor_calibrated is 0 the floor is the -1 placeholder,
+      # which no cosine similarity can fall under, so below_floor is
+      # UNREACHABLE and every refusal should be no_spans or unscored — a corpus
+      # gap, not a threshold. Once that gauge reads 1 the split is what tells
+      # floor drift from a missing corpus.
       # Traffic: more than 20 answers per 30m — a majority-refusal reading has
       # to be more than two questions before it means anything. First
       # admissible sample 21, where twelve refusals is 57.1% and does not clear
