@@ -127,6 +127,46 @@ export type SearchResult = {
 
 export type Floor = { value: number; calibrated: boolean; applicable: boolean };
 
+// The loop was attempted and did not write the answer. Present IFF that is
+// true (read.go:67-71): absent for a deployment with no model, absent for a
+// caller who asked for extractive, and absent when the model DID answer.
+//
+// It is the only thing that distinguishes a degraded answer from a plain
+// extractive one, because read.go stamps answered_by "extractive" on both —
+// which is the whole reason this type exists and P5 shipping without it was a
+// defect rather than an omission.
+export type Degraded = { from: string; reason: string };
+
+// Never the arguments to a tool call. agent/trace.go:63-69: an argument to
+// search_code is the model's rewriting of the user's question, and the rule
+// that keeps a question out of a log extends to a payload a console renders
+// into an operator's screenshot. The server does not send them and this type
+// has no field for them.
+export type ToolInvocation = { name: string; ms: number };
+
+// estimated means the provider reported no token counts and the client sized
+// the prompt itself. A number presented as measured when it was inferred is
+// the same class of error as a scale drawn from an uncalibrated floor.
+export type Usage = { input_tokens: number; output_tokens: number; estimated: boolean };
+
+// What the loop did, present IFF it ran — degradation included, so a reader can
+// see the work done before the fallback. A zero-valued block on every
+// extractive answer would make "the loop ran and stopped at step 0" and "the
+// loop never ran" the same payload (read.go:161-165).
+export type LLMTrace = {
+  model: string;
+  steps: number;
+  tool_calls: number;
+  // agent/trace.go:7-9 calls this a closed set, a metric label and a response
+  // field. It is a string here and not a union: the console renders it as the
+  // server spelled it, and a union would turn a tenth stop reason added
+  // server-side into a value this client silently renders as nothing.
+  stop: string;
+  tools: ToolInvocation[];
+  usage: Usage;
+  citations_dropped: number;
+};
+
 export type Cited = {
   marker: number;
   span_id: string;
@@ -139,6 +179,8 @@ export type Answered = {
   repo_id: string;
   refused: false;
   answered_by: string;
+  degraded: Degraded | null;
+  llm: LLMTrace | null;
   answer: string;
   citations: Cited[];
   dropped: number;
@@ -152,6 +194,12 @@ export type RefusalReason = "no_spans" | "below_floor" | "unscored";
 export type Refused = {
   repo_id: string;
   refused: true;
+  // On the refusal too, because read.go puts both on refusalResponse: a
+  // refusal is exactly where a caller most wants to know whether a model was
+  // consulted, and read.go:443-448 can refuse *after* a degradation.
+  answered_by: string;
+  degraded: Degraded | null;
+  llm: LLMTrace | null;
   reason: RefusalReason;
   // The server's sentence, one per reason (read.go:386-398). Rendered verbatim.
   detail: string;
