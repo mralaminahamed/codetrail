@@ -9,7 +9,7 @@
 // named, and it is — as a label beside the sentence that says what to change.
 export default function Rejected({ rule, detail }: { rule: string; detail: string }) {
   return (
-    <div>
+    <div className="panel panel-rejected">
       <h2>codetrail refused this submission.</h2>
       <p>{detail}</p>
       {rule !== "" && (

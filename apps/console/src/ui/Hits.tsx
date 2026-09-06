@@ -14,7 +14,7 @@ export default function Hits({ repo, result }: { repo: string; result: SearchRes
       {/* No floor on this route. Search ranks; the floor is the answer's
           decision, and reporting one here would imply a filter that did not
           run (read.go:313-314). */}
-      <ol>
+      <ol className="rows">
         {/* The server's order, rendered as given and never sorted: fused rank
             order is the API's claim. */}
         {result.hits.map((h) => (

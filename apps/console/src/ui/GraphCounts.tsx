@@ -6,7 +6,7 @@ import type { RepoDetail } from "../api/types";
 // and the numbers are read as counts, which is what they are.
 export default function GraphCounts({ repo }: { repo: RepoDetail }) {
   return (
-    <div>
+    <div className="meta">
       <p>
         {`${repo.symbols} definitions, ${repo.edges} call edges: ${repo.edges_resolved} resolved and ${repo.edges_syntactic} syntactic.`}
       </p>

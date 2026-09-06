@@ -71,12 +71,14 @@ export default function Ask() {
           <label htmlFor="q">Question</label>
           <input id="q" name="q" type="text" required />
         </p>
-        <button type="submit" name="op" value="ask" disabled={inFlight}>
-          Ask
-        </button>
-        <button type="submit" name="op" value="search" disabled={inFlight}>
-          Search
-        </button>
+        <div className="buttons">
+          <button type="submit" name="op" value="ask" data-primary disabled={inFlight}>
+            Ask
+          </button>
+          <button type="submit" name="op" value="search" disabled={inFlight}>
+            Search
+          </button>
+        </div>
       </form>
 
       <div ref={region} tabIndex={-1}>

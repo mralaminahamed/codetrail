@@ -41,14 +41,14 @@ export default function Symbols() {
           <label htmlFor="name">Symbol name</label>
           <input id="name" name="name" type="text" defaultValue={name} />
         </p>
-        <p>
+        <p className="check-row">
           {/* P4's Open question 11, answered here: a labelled opt-in, because
               P3's lexical arm reaches Store.Get through its parts and a user
               who found a method by searching will type Get. */}
           <input id="suffix" name="suffix" type="checkbox" defaultChecked={suffix} />
           <label htmlFor="suffix">also match a method by its last segment</label>
         </p>
-        <button type="submit">Find definitions</button>
+        <button type="submit" data-primary>Find definitions</button>
       </form>
 
       {outcome?.kind === "ok" && (
@@ -60,7 +60,7 @@ export default function Symbols() {
             {`Matched: ${outcome.value.matched}.`}
           </p>
           {outcome.value.truncated && <p>This list was truncated; there are more.</p>}
-          <ul>
+          <ul className="rows">
             {/* The server's order — path, then start line — rendered as given. */}
             {outcome.value.symbols.map((s) => (
               <li key={s.id}>

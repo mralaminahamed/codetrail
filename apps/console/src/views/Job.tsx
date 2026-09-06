@@ -37,7 +37,7 @@ export default function Job() {
       <Live>{announcement(phase, job)}</Live>
 
       {job !== null && (
-        <dl>
+        <dl className="tuple">
           <dt>Repository</dt>
           <dd>{job.remote}</dd>
           <dt>Ref</dt>
@@ -70,7 +70,7 @@ export default function Job() {
             Still indexing after 30 minutes. codetrail has stopped checking automatically; a
             repository this large is possible, and so is an indexer that is not running.
           </p>
-          <button type="button" onClick={checkNow}>
+          <button type="button" data-primary onClick={checkNow}>
             Check again
           </button>
         </>

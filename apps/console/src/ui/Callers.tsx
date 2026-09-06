@@ -15,7 +15,7 @@ export default function Callers({ callers }: { callers: CallersValue }) {
         <p>{`${callers.callers.length} definitions call this one, to depth ${callers.depth}.`}</p>
         {callers.truncated && <p>This list was truncated; there are more.</p>}
         {callers.callers.length === 0 && <p>Nothing in this repository calls this definition.</p>}
-        <ul>
+        <ul className="rows">
           {callers.callers.map((c) => (
             <li key={`${c.symbol.id}:${c.call.path}:${c.call.line}`}>
               <p>
