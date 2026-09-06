@@ -1,0 +1,31 @@
+{
+  "repo_id": "ae4bae98f7440ee9e4c013b6c69be7e4",
+  "refused": true,
+  "answered_by": "extractive",
+  "degraded": {
+    "from": "llm",
+    "reason": "provider_unavailable"
+  },
+  "llm": {
+    "model": "fake-scripted",
+    "steps": 1,
+    "tool_calls": 0,
+    "stop": "provider_unavailable",
+    "tools": null,
+    "usage": {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "estimated": false
+    },
+    "citations_dropped": 0
+  },
+  "reason": "below_floor",
+  "detail": "The best match scored under the configured floor of 0.99. That floor is not calibrated; its value is measured in P6.",
+  "mode": "hybrid",
+  "top_score": 0.559502899646759,
+  "floor": {
+    "value": 0.99,
+    "calibrated": false,
+    "applicable": true
+  }
+}
