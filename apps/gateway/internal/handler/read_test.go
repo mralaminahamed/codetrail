@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -117,6 +118,11 @@ type fakeStore struct {
 	// error hooks. Embedded rather than spelled here so the graph endpoints'
 	// fake lives beside the tests that set it.
 	*graphFake
+
+	// Guards the three fields the read path WRITES, because the concurrency
+	// tests drive several requests through one of these at once. Every
+	// assertion reads them after its requests have returned.
+	mu sync.Mutex
 }
 
 func newStore() *fakeStore {
@@ -148,7 +154,9 @@ func newStore() *fakeStore {
 // a handler that swallows one then serves that zero value, which is the shape
 // of the mistake worth catching.
 func (f *fakeStore) ListRepos(_ context.Context, limit int) ([]store.RepoRow, error) {
+	f.mu.Lock()
 	f.listLimit = limit
+	f.mu.Unlock()
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
@@ -184,7 +192,9 @@ func (f *fakeStore) RepoStats(context.Context, string) (store.Stats, error) {
 }
 
 func (f *fakeStore) GetSpan(_ context.Context, _, spanID string) (models.Span, error) {
+	f.mu.Lock()
 	f.spanReads++
+	f.mu.Unlock()
 	if f.spanErr != nil {
 		return models.Span{}, f.spanErr
 	}
@@ -203,7 +213,9 @@ func (f *fakeStore) NewerCommit(context.Context, string) (string, time.Time, err
 }
 
 func (f *fakeStore) TouchRepo(_ context.Context, id string) error {
+	f.mu.Lock()
 	f.touched = append(f.touched, id)
+	f.mu.Unlock()
 	return f.touchErr
 }
 
@@ -228,13 +240,19 @@ type retrieverCall struct {
 }
 
 type fakeRetriever struct {
-	res   rag.Result
-	err   error
+	res rag.Result
+	err error
+	// Guarded because the concurrency tests drive several requests through one
+	// of these at once; every assertion below reads calls after its requests
+	// have returned.
+	mu    sync.Mutex
 	calls []retrieverCall
 }
 
 func (f *fakeRetriever) Search(_ context.Context, repoID, q string, limit int) (rag.Result, error) {
+	f.mu.Lock()
 	f.calls = append(f.calls, retrieverCall{repoID, q, limit})
+	f.mu.Unlock()
 	if f.err != nil {
 		return rag.Result{}, f.err
 	}

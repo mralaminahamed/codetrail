@@ -547,7 +547,14 @@ func TestAnExhaustedTokenBudgetDegradesAndSaysSo(t *testing.T) {
 func TestTheBudgetIsSpentFromReportedUsageWhenTheProviderReportsIt(t *testing.T) {
 	now := fixtureNow
 	b := newBudget(100_000, func() time.Time { return now })
-	b.spend(9000)
+	// Reserved at the worst case and settled at the reported one, which is the
+	// pairing the loop makes: the reservation comes back off, and only what was
+	// actually used stays charged.
+	const worstCase = 13_500
+	if !b.allow(worstCase) {
+		t.Fatalf("a worst-case request did not fit an empty budget of 100,000")
+	}
+	b.spend(worstCase, 9000)
 	if got := b.remaining(); got != 91_000 {
 		t.Errorf("budget_remaining %d, want 91000", got)
 	}
@@ -579,7 +586,10 @@ func TestTheBudgetIsSpentFromReportedUsageWhenTheProviderReportsIt(t *testing.T)
 func TestTheBudgetWindowRolls(t *testing.T) {
 	now := fixtureNow
 	b := newBudget(1000, func() time.Time { return now })
-	b.spend(900)
+	if !b.allow(900) {
+		t.Fatalf("900 did not fit an empty budget of 1000")
+	}
+	b.spend(900, 900)
 	if b.allow(200) {
 		t.Errorf("a request over the budget was allowed")
 	}
@@ -587,6 +597,9 @@ func TestTheBudgetWindowRolls(t *testing.T) {
 	if !b.allow(200) {
 		t.Errorf("the budget did not roll after an hour")
 	}
+	// Settled, because a reservation is not a spend: the gauge below would
+	// otherwise still be holding what the allow above put aside.
+	b.spend(200, 0)
 	if got := b.remaining(); got != 1000 {
 		t.Errorf("budget_remaining %d after the window rolled, want 1000", got)
 	}
@@ -1090,5 +1103,109 @@ func TestADegradationThatCalledNoToolServesToolsAsAnEmptyList(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `"tools":[]`) {
 		t.Errorf("llm.tools is not an empty list: %s", rec.Body)
+	}
+}
+
+// A bound that reads the total and lets go is a report, not a ceiling: the
+// spend it is guarding happens up to a minute later, so every request that
+// starts inside that window sees a total none of them has added to yet.
+func TestTheBudgetReservesTheWorstCaseRatherThanOnlyReadingIt(t *testing.T) {
+	now := fixtureNow
+	b := newBudget(1000, func() time.Time { return now })
+	if !b.allow(400) || !b.allow(400) {
+		t.Fatalf("two 400-token worst cases did not fit a budget of 1000")
+	}
+	// Nothing has been spent yet — spent is empty and total is 0 — so a check
+	// that only read the total would allow this and every one after it.
+	if b.allow(400) {
+		t.Errorf("a third worst case was allowed against 1000 with 800 already in flight")
+	}
+	if got := b.remaining(); got != 200 {
+		t.Errorf("budget_remaining %d with 800 reserved, want 200", got)
+	}
+	// And the reservation is released by the settlement, not held for the
+	// window: two loops that used almost nothing leave the budget almost whole.
+	b.spend(400, 10)
+	b.spend(400, 10)
+	if got := b.remaining(); got != 980 {
+		t.Errorf("budget_remaining %d after two 10-token loops settled, want 980", got)
+	}
+	if !b.allow(400) {
+		t.Errorf("a settled budget refused a worst case it has room for")
+	}
+}
+
+// gateModel holds every call until release is closed and counts how many
+// arrived, so a test can see how many requests got past the spend controls
+// while none of them had finished paying. blockingModel holds only the first.
+type gateModel struct {
+	release chan struct{}
+	mu      sync.Mutex
+	entered int
+}
+
+func (g *gateModel) Name() string { return "fake-gate" }
+
+func (g *gateModel) Complete(_ context.Context, _ llm.Request) (llm.Response, error) {
+	g.mu.Lock()
+	g.entered++
+	g.mu.Unlock()
+	<-g.release
+	// No tool call and no marker, so every loop that got here stops uncited
+	// without touching a shared fixture from eight goroutines.
+	return llm.Response{Text: "nothing to cite", Usage: llm.Usage{InputTokens: 11000, OutputTokens: 0}}, nil
+}
+
+func (g *gateModel) arrived() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.entered
+}
+
+// The concurrent case, which is the only one the defect shows in. The budget is
+// one worst-case request and the concurrency cap is eight, so the semaphore
+// admits all eight and the budget is the only thing between them and the
+// provider.
+//
+// Measured before the reservation: 8 of 8 reached the model, and at 11,000
+// reported input tokens each that is 88,000 spent against a budget of 13,500.
+func TestTheBudgetCeilingHoldsWhenEightRequestsArriveAtOnce(t *testing.T) {
+	const concurrent = 8
+	const worstCase = 13_500 // agent.DefaultBounds(): 12,000 in + 1,500 out.
+
+	g := &gateModel{release: make(chan struct{})}
+	t.Cleanup(func() {
+		select {
+		case <-g.release:
+		default:
+			close(g.release)
+		}
+	})
+
+	h := hermeticHandler(newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)})
+	h.LLM = NewLoop(g, &fakeCorpus{res: result(rag.ModeHybrid, 0.83, true)},
+		agent.DefaultBounds(), agent.DefaultToolLimits(), false, concurrent, worstCase,
+		func() time.Time { return fixtureNow })
+	h.AnswerDefault = answererLLM
+	e := mount(h)
+
+	done := make(chan struct{}, concurrent)
+	for range concurrent {
+		go func() {
+			do(e, http.MethodPost, "/api/repos/repo-1/ask", `{"q":"sampler"}`)
+			done <- struct{}{}
+		}()
+	}
+	// Every request has either reached the model or been turned away; without
+	// this the count below could be read before the eighth goroutine started.
+	waitFor(t, func() bool { return g.arrived()+len(done) == concurrent })
+
+	if n := g.arrived(); n != 1 {
+		t.Errorf("%d of %d requests reached the model against a budget of one worst case (%d tokens); "+
+			"they would spend %d", n, concurrent, worstCase, n*11000)
+	}
+	close(g.release)
+	for range concurrent {
+		<-done
 	}
 }
