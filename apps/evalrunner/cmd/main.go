@@ -296,7 +296,15 @@ func readConfig(ctx context.Context) (Config, error) {
 	// `c := cfg; c.Fusion.WLexical = 0.5` — which is what rag.Retriever's
 	// exported fields are for.
 	cfg.Fusion = rag.DefaultParams()
-	mode, err := rag.ParseMode(config.Get("RETRIEVAL_MODE", string(rag.ModeHybrid)))
+	// rag.ModeVector, which is what the gateway defaults to. It was ModeHybrid
+	// — written when the gateway's default was hybrid too, and left behind when
+	// P7's experiment moved that one. The divergence is not a design choice:
+	// this function's own contract, three lines up, is "the same environment
+	// variables with the same defaults", and an eval whose unset default
+	// measures a configuration nothing serves is the failure mode the contract
+	// exists to prevent. Every published run sets RETRIEVAL_MODE explicitly, so
+	// no recorded artefact is affected.
+	mode, err := rag.ParseMode(config.Get("RETRIEVAL_MODE", string(rag.ModeVector)))
 	if err != nil {
 		return cfg, err
 	}

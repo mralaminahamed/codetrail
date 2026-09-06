@@ -70,7 +70,7 @@ jobs:
       # own instruction, and the reason is measured rather than argued:
       # newRetriever reads the ambient environment, and apps/gateway/cmd's tests
       # run in both steps below and above. `RETRIEVAL_MODE=lexical go test
-      # ./apps/gateway/cmd/` fails TestTheDefaultRetrieverIsHybridAtTheUncalibratedFloor
+      # ./apps/gateway/cmd/` fails TestTheDefaultRetrieverIsVectorAtTheUncalibratedFloor
       # with "mode=lexical", and `ANSWER_SCORE_FLOOR=0.35` fails it with
       # "floor {Value:0.35 …}". So exporting the shipped defaults here would
       # leave that test green while it asserted this file instead of the code —
@@ -159,7 +159,7 @@ jobs:
       # job-level env, for the reason the block above gives: newRetriever reads
       # the ambient environment and apps/gateway/cmd's tests run in this same
       # job, so exporting the shipped defaults here would leave
-      # TestTheDefaultRetrieverIsHybridAtTheUncalibratedFloor asserting this
+      # TestTheDefaultRetrieverIsVectorAtTheUncalibratedFloor asserting this
       # file instead of the code. The suite writes its artefact to a temporary
       # directory: a CI job that commits a measurement is a CI job that
       # publishes a fake one.
