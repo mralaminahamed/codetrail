@@ -2,6 +2,14 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Superseded since — recorded 2026-09-06, not edited into the plan below.** This file is a record
+> of what was true when it was written. The claim it made that the world has since contradicted:
+>
+> - **The walker's home.** Every reference below to `apps/indexer/internal/walk/` — the file list,
+>   the mutation commands, the import in Task 8 — was correct as executed. P6 moved the package to
+>   **`packages/shared/walk/`**, because the eval runner needed the same guarded reader and a copy
+>   would have drifted from it. The move is the only change; the tests and the limits are P1's.
+
 **Goal:** Accept a public git URL through the API, clone it under a sandbox with enforced caps, record its files, and evict the least-recently-queried repo when the quota is reached.
 
 **Architecture:** A `gateway` HTTP endpoint validates a submitted URL against an allowlist policy and enqueues a job row in Postgres. A separate `indexer` binary leases jobs, shells out to `git clone` under a wall-clock deadline and byte cap, walks the checkout skipping every non-regular file, records `repos` and `files`, and deletes the scratch directory. Eviction runs after each successful index.

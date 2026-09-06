@@ -2,6 +2,16 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Superseded since — recorded 2026-09-06, not edited into the plan below.** This file is a record
+> of what was true when it was written. One premise it states three times has since been closed:
+>
+> - **"The indexer has no `/metrics` endpoint, and no HTTP server at all."** True in P3, and
+>   correctly recorded here as a gap rather than papered over with an unscrapable exporter. **P8's
+>   Task 2 closed it**: the indexer serves `/health`, `/ready` and `/metrics` on `PROBE_PORT`
+>   (9090) through the same `health.Register` the gateway uses, and the eviction and job-outcome
+>   counters this plan said had nowhere to live are exported there. The occurrences below are left
+>   as written.
+
 **Goal:** Make the spans P2 wrote answer a question, and make the answer checkable. Hybrid retrieval over one repository, a citation that renders as an immutable forge permalink and says what it does *not* know about staleness, an extractive answer assembled from ranked spans, and a refusal that is counted as a refusal rather than as an error.
 
 **Architecture:** A new `packages/shared/rag` holds the parts that are pure functions — reciprocal-rank fusion, the floor decision, query tokenisation, permalink rendering, answer assembly — plus the `Retriever` that runs the two arms and fuses them. The two arms are SQL and live in `packages/shared/store`: `VectorSearch` (pgvector cosine, filtered by repo) and `LexicalSearch` (a weighted `tsvector` over `symbol` and `text`). The gateway grows read endpoints, its own embedder (it has to embed the query), and the metrics spec §11 lists for retrieval and answers. `store.Evict` starts leaving a tombstone so an evicted repo can answer `410` rather than `404`, and the `jobs` table finally gets the retention rule §14 deferred to this phase.
