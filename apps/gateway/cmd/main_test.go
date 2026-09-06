@@ -20,6 +20,7 @@ import (
 
 	"github.com/mralaminahamed/codetrail/apps/gateway/internal/handler"
 	"github.com/mralaminahamed/codetrail/packages/shared/admit"
+	"github.com/mralaminahamed/codetrail/packages/shared/agent"
 	"github.com/mralaminahamed/codetrail/packages/shared/jobs"
 	"github.com/mralaminahamed/codetrail/packages/shared/models"
 	"github.com/mralaminahamed/codetrail/packages/shared/rag"
@@ -692,5 +693,19 @@ func TestTheBoundsAreInTheBootLog(t *testing.T) {
 		if !strings.Contains(logged.String(), want) {
 			t.Errorf("the boot log does not carry %q: %s", want, logged)
 		}
+	}
+}
+
+// The client's own timeout must be LONGER than the loop's whole deadline.
+//
+// The loop's context is what should end a call; a client timeout shorter than
+// it would end one first and report a client error where the trace should say
+// `deadline`. Found by the whole-branch sweep: shortening it to 5s survived
+// everything, because nothing related the two numbers.
+func TestTheClientTimeoutOutlastsTheLoopDeadline(t *testing.T) {
+	b := agent.DefaultBounds()
+	if llmClientTimeout <= b.Deadline {
+		t.Errorf("llmClientTimeout is %v and the loop's deadline is %v: the client would end a call first and report the wrong reason",
+			llmClientTimeout, b.Deadline)
 	}
 }

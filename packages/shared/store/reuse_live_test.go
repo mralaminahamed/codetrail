@@ -505,3 +505,64 @@ func TestTheReuseIndexIsUsableForTheReadItExistsForLive(t *testing.T) {
 		t.Errorf("the reuse read cannot use spans_reuse_idx even with seqscan off:\n%s", plan.String())
 	}
 }
+
+// PreviousBlobs answers about the OTHER commit, never about the one being
+// indexed.
+//
+// Without the exclusion it compares a commit against itself, so files_changed
+// reads 0 for every job — a number that always says "nothing changed", which is
+// worse than no number. Found by the whole-branch sweep: neutralising the
+// `r.id <> $2` predicate survived everything, because nothing exercised the
+// read with two commits of one remote in the database.
+func TestPreviousBlobsAnswersAboutTheOtherCommitLive(t *testing.T) {
+	ctx := context.Background()
+	const remote = "https://github.com/blobs/two-commits"
+	oldID, newID := "pb-old", "pb-new"
+	s := fresh(t, oldID, newID)
+
+	for i, id := range []string{oldID, newID} {
+		if _, err := s.pool.Exec(ctx, `
+			INSERT INTO repos (id, remote, ref, commit_sha, indexed_at)
+			VALUES ($1, $2, 'main', $3, now() - make_interval(days => $4))`,
+			id, remote, Digest(id)[:40], 2-i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The older commit's blobs, and the newer one's — deliberately different, so
+	// a read that answered about the wrong commit is visible in the values.
+	for _, r := range []struct{ repo, blob string }{
+		{oldID, "1111111111111111111111111111111111111111"},
+		{newID, "2222222222222222222222222222222222222222"},
+	} {
+		if _, err := s.pool.Exec(ctx,
+			`INSERT INTO files (id, repo_id, path, blob, lang, lines) VALUES ($1, $2, 'a.go', $3, 'go', 9)`,
+			r.repo+"-f", r.repo, r.blob); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := s.PreviousBlobs(ctx, remote, newID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["a.go"] != "1111111111111111111111111111111111111111" {
+		t.Errorf("PreviousBlobs returned %q for a.go, want the OLDER commit's blob", got["a.go"])
+	}
+	// Case-folded, because the forge decides the display case of an owner and a
+	// name and two case-variant submissions are one repository.
+	up, err := s.PreviousBlobs(ctx, strings.ToUpper(remote), newID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(up, got) {
+		t.Errorf("PreviousBlobs is case-sensitive on the remote: %v against %v", up, got)
+	}
+	// And with no other commit, an empty map rather than its own rows.
+	only, err := s.PreviousBlobs(ctx, "https://github.com/blobs/only-one", "nobody")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(only) != 0 {
+		t.Errorf("PreviousBlobs returned %v for a remote with no earlier commit", only)
+	}
+}

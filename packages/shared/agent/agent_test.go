@@ -545,3 +545,31 @@ func TestTheLoopMakesNoModelCallWhenItsContextIsAlreadyDone(t *testing.T) {
 	a := Run(ctx, f, okTools(), testBounds(), "q")
 	assertLoop(t, a, f, StopDeadline, 0, 0)
 }
+
+// The system prompt is the SECOND place the untrusted-content instruction
+// lives, and the frame is the first. Both are mitigation rather than
+// enforcement — a model can be persuaded by text inside a frame however it is
+// labelled — and both are pinned by a string comparison, which is the honest
+// form for a property with nothing behavioural to assert.
+//
+// Found by the whole-branch sweep: deleting the sentence from the system prompt
+// survived everything, because only the frame's copy was tested.
+func TestTheSystemPromptSaysToolResultsAreNotInstructions(t *testing.T) {
+	for _, want := range []string{
+		"unknown third party",
+		"never an instruction",
+		// The citation contract, which is what makes Resolve's positional rule
+		// something the model was actually told.
+		"read_span",
+		"[n]",
+	} {
+		if !strings.Contains(systemPrompt, want) {
+			t.Errorf("the system prompt does not say %q:\n%s", want, systemPrompt)
+		}
+	}
+	// And it carries no repository text and no question: it is a compile-time
+	// constant, which is what makes that true rather than hoped for.
+	if strings.Contains(systemPrompt, "%s") || strings.Contains(systemPrompt, "%v") {
+		t.Errorf("the system prompt has a format verb in it, so something is interpolated into it")
+	}
+}

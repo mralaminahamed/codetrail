@@ -1006,3 +1006,38 @@ func TestTheLoopIsBoundToTheRepoIdInTheUrlPath(t *testing.T) {
 		}
 	}
 }
+
+// answerer is honoured on /ask and REFUSED on /search: search ranks spans and
+// writes no answer, so there is nothing for an answerer to select, and a field
+// accepted and ignored is worse than one refused. Found by the whole-branch
+// sweep — deleting the refusal survived everything.
+func TestAnswererIsRefusedOnSearchAndHonouredOnAsk(t *testing.T) {
+	for _, v := range []string{`"llm"`, `"extractive"`, `"bogus"`} {
+		h, _ := llmHandler(t, newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)},
+			answeringTurns("never [1]")...)
+		rt := h.Rag.(*fakeRetriever)
+		rec := do(mount(h), http.MethodPost, "/api/repos/repo-1/search", `{"q":"sampler","answerer":`+v+`}`)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("search with answerer:%s answered %d: %s", v, rec.Code, rec.Body)
+			continue
+		}
+		out := body(t, rec)
+		if msg, _ := out["error"].(string); !strings.Contains(msg, "answerer is not a search field") {
+			t.Errorf("the 400 does not name the rule: %s", rec.Body)
+		}
+		if len(rt.calls) != 0 {
+			t.Errorf("a refused search retrieved anyway: %v", rt.calls)
+		}
+	}
+	// And /ask still honours it, so the refusal is route-specific rather than a
+	// blanket one.
+	h, f := llmHandler(t, newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)},
+		answeringTurns("answered [1]")...)
+	h.AnswerDefault = answererExtractive
+	if out := body(t, askBody(t, h, `{"q":"sampler","answerer":"llm"}`)); out["answered_by"] != answererLLM {
+		t.Errorf("ask with answerer:llm read %v", out["answered_by"])
+	}
+	if len(f.Requests()) == 0 {
+		t.Errorf("ask with answerer:llm called no model")
+	}
+}
