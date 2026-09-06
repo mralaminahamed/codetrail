@@ -158,14 +158,39 @@ describe("submitting a repository", () => {
     await waitFor(() => expect(rec.calls).toBe(1));
   });
 
-  test("focus moves to the result region after submitting", async () => {
-    stub("post", "/api/repos", 400, host);
+  test("the rejection is IN the region before focus reaches it, and the region has a name", async () => {
+    // Same discrimination as Ask.test's: the test this replaces asserted
+    // activeElement afterwards and passed under the broken version too, because
+    // focus() ran on the line after setOutcome — before React had rendered —
+    // and the element focused is the same either way.
+    let atFocus: string | null = null;
+    const on = (e: FocusEvent) => {
+      const el = e.target as HTMLElement;
+      if (atFocus === null && el.getAttribute?.("tabindex") === "-1") atFocus = el.textContent ?? "";
+    };
+    document.addEventListener("focusin", on);
+    try {
+      stub("post", "/api/repos", 400, host);
+      renderSubmit();
+      await submit("https://example.com/rs/zerolog");
+      await screen.findByText(host.error);
+      expect(document.activeElement).toBe(screen.getByRole("region", { name: "Submission result" }));
+      expect(atFocus).toContain(host.error);
+    } finally {
+      document.removeEventListener("focusin", on);
+    }
+  });
+
+  test("a rejection is a status with its own name, so it is announced at all", async () => {
+    // Rejected had NO role until now: the panel naming which admission rule
+    // refused the submission was inserted into the page silently.
+    stub("post", "/api/repos", 400, scheme);
     renderSubmit();
-    await submit("https://example.com/rs/zerolog");
-    const panel = await screen.findByText(host.error);
-    const region = panel.closest("div[tabindex]");
-    expect(region).not.toBeNull();
-    expect(document.activeElement).toBe(region);
+    await submit("http://github.com/rs/zerolog");
+    const panel = await screen.findByRole("status", { name: "Submission outcome" });
+    expect(panel.textContent).toContain(scheme.error);
+    // A status, never an alert: nothing broke and there is no id to quote.
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   test("a 500 renders the error panel with the request id, not the rejection panel", async () => {
