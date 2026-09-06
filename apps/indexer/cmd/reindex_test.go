@@ -3,8 +3,14 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/mralaminahamed/codetrail/apps/indexer/internal/clone"
 	"github.com/mralaminahamed/codetrail/packages/shared/models"
@@ -633,5 +639,142 @@ func TestReuseAsksForEachDigestOnceAndForThisWorkersEmbedder(t *testing.T) {
 	// than the span list — which is what "once per digest" means.
 	if len(asked) >= 4 {
 		t.Errorf("reuse asked for %d digests: %v", len(asked), asked)
+	}
+}
+
+// ---- the two counters -----------------------------------------------------
+
+// indexerCounters reads this process's own re-index series the way Prometheus
+// would.
+//
+// The plan's side-effect ledger claimed codetrail_reuse_spans_total was read
+// back by TestAnUnchangedDeclarationIsNotReEmbedded and
+// codetrail_clone_skipped_total by TestAnAlreadyIndexedCommitCompletesWithoutCloning.
+// Neither was: the whole-branch sweep deleted both call sites and every test
+// still passed. A ledger entry is a claim like any other.
+func indexerCounters(t *testing.T) map[string]float64 {
+	t.Helper()
+	srv := httptest.NewServer(promhttp.Handler())
+	defer srv.Close()
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]float64{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if !strings.HasPrefix(line, "codetrail_reuse_spans_total{") &&
+			!strings.HasPrefix(line, "codetrail_clone_skipped_total{") {
+			continue
+		}
+		series, value, ok := strings.Cut(line, "} ")
+		if !ok {
+			t.Fatalf("unparseable metric line %q", line)
+		}
+		v, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			t.Fatalf("metric %q: %v", line, err)
+		}
+		out[series+"}"] = v
+	}
+	if len(out) == 0 {
+		t.Fatal("no re-index counters are registered; the assertions would prove nothing")
+	}
+	return out
+}
+
+func movedCounters(t *testing.T, before map[string]float64) map[string]float64 {
+	t.Helper()
+	moved := map[string]float64{}
+	for series, now := range indexerCounters(t) {
+		if d := now - before[series]; d != 0 {
+			moved[series] = d
+		}
+	}
+	return moved
+}
+
+// reused and embedded always sum to the job's span count, so the two labels
+// cannot disagree about what happened.
+func TestTheReuseCounterSplitsEverySpanBetweenItsTwoOutcomes(t *testing.T) {
+	before := indexerCounters(t)
+	ix, rec, _ := counted(t)
+	prime(ix, vecOf(ix))
+	ix.runJob(context.Background(), aJob())
+	if rec.failReason() != "" {
+		t.Fatalf("the job failed: %s", rec.failReason())
+	}
+	moved := movedCounters(t, before)
+	if got := moved[`codetrail_reuse_spans_total{outcome="reused"}`]; got != float64(len(rec.spans)) {
+		t.Errorf("reused moved %v, want %d", got, len(rec.spans))
+	}
+	if got := moved[`codetrail_reuse_spans_total{outcome="embedded"}`]; got != 0 {
+		t.Errorf("embedded moved %v, want 0", got)
+	}
+
+	// And the counterfactual, so the split is a property of the reuse rather
+	// than of a fixture that produces no spans.
+	before2 := indexerCounters(t)
+	ix2, rec2, _ := counted(t)
+	ix2.runJob(context.Background(), aJob())
+	moved2 := movedCounters(t, before2)
+	if got := moved2[`codetrail_reuse_spans_total{outcome="embedded"}`]; got != float64(len(rec2.spans)) {
+		t.Errorf("embedded moved %v, want %d", got, len(rec2.spans))
+	}
+	if got := moved2[`codetrail_reuse_spans_total{outcome="reused"}`]; got != 0 {
+		t.Errorf("reused moved %v, want 0", got)
+	}
+}
+
+// Each of the three pre-clone outcomes moves its own label and only its own.
+func TestTheCloneSkippedCounterNamesWhichDecisionWasMade(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		build   func(t *testing.T) *indexer
+		outcome string
+	}{
+		{"skipped", func(t *testing.T) *indexer {
+			ix, _ := fastPathIndexer(t, testCommit)
+			ix.getRepo = func(_ context.Context, id string) (models.Repo, error) { return models.Repo{ID: id}, nil }
+			ix.countSpans = func(context.Context, string) (int, error) { return 4, nil }
+			ix.spanEmbedder = func(context.Context, string) (string, int, error) {
+				return ix.emb.Model(), ix.emb.Dim(), nil
+			}
+			return ix
+		}, "skipped"},
+		{"cloned", func(t *testing.T) *indexer {
+			ix, _ := fastPathIndexer(t, testCommit)
+			return ix // getRepo answers ErrNotFound, so the fast path misses
+		}, "cloned"},
+		{"unresolved", func(t *testing.T) *indexer {
+			ix, _ := fakeIndexer(t)
+			ix.lim.skipClone = true
+			ix.resolve = func(context.Context, string, string, clone.Limits) (string, error) {
+				return "", errors.New("ls-remote: exit status 128")
+			}
+			return ix
+		}, "unresolved"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := indexerCounters(t)
+			tc.build(t).runJob(context.Background(), aJob())
+			moved := movedCounters(t, before)
+			series := `codetrail_clone_skipped_total{outcome="` + tc.outcome + `"}`
+			if moved[series] != 1 {
+				t.Errorf("%s moved %v, want 1", series, moved[series])
+			}
+			delete(moved, series)
+			// The WHOLE delta vector over this counter, so a mutant that
+			// increments two outcomes fails even when the one expected is right.
+			for other, d := range moved {
+				if strings.HasPrefix(other, "codetrail_clone_skipped_total{") {
+					t.Errorf("%s also moved %v, want 0", other, d)
+				}
+			}
+		})
 	}
 }
