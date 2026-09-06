@@ -19,11 +19,9 @@ import (
 // rag.Floor.Calibrated. Everything a reader ever sees about it has to be
 // derived from that field rather than written down as a fact.
 //
-// This is the guard P6's plan specified as
-// TestNoShippedSurfaceStillSaysTheFloorIsMeasuredInP6 — "greps the tree for
-// `measured in P6` and `until P6` outside docs/superpowers/ and fails on a
-// hit" — and never wrote. It is generalised in the two directions that made
-// that spelling too narrow to be worth having.
+// The guard the eval's plan specified — "greps the tree for `measured in P6`
+// and `until P6` and fails on a hit" — and never wrote. It is generalised in
+// the two directions that made that spelling too narrow to be worth having.
 //
 //  1. Not two literals. Any PHASE IDENTIFIER used as the floor's discriminator
 //     is refused — "in P6", "until P6", "before P6", "while P6", "after P6"
@@ -44,10 +42,6 @@ import (
 //     paged. Rationale comments citing spec:315 — which really does put the
 //     number in a phase — are untouched, so nothing here asks anyone to lie
 //     about where the requirement came from.
-//
-// docs/superpowers/ is excluded because the spec and the plans are records of
-// what was believed when they were written, and correcting those into hindsight
-// is the one thing this project's convention forbids.
 //
 // It would have failed before the fix wave, on five surfaces at once: README's
 // "The number is measured in P6" and "nobody will see until P6 sets a number";
@@ -138,8 +132,6 @@ func phaseKeyedFloorClaims(text string) []string {
 func floorSurfaceText(t *testing.T, root, rel string) (string, bool) {
 	t.Helper()
 	switch {
-	case strings.HasPrefix(rel, "docs/superpowers/"):
-		return "", false
 	// A test may quote a forbidden phrase in order to forbid it — this file
 	// does, and so does the console's Refusal suite.
 	case strings.HasSuffix(rel, "_test.go"),
