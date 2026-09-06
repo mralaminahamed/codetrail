@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -504,5 +505,40 @@ func TestASpanCarryingTheDelimiterCannotCloseTheFrameOnTheToolPath(t *testing.T)
 	}
 	if !strings.Contains(r.Content, `\u003c/tool_result`) {
 		t.Errorf("the tool body no longer HTML-escapes its JSON; escapeFrame is now the only layer:\n%s", r.Content)
+	}
+}
+
+// spec:234 names FOUR tools. Nothing pinned the set until the whole-branch
+// sweep replaced one of them with a duplicate of another and every test passed:
+// the loop checks a call's name against Specs, so a missing tool is a
+// malformed_tool_call rather than a visible absence, and no fixture called the
+// one that went.
+func TestTheToolSetIsExactlyTheFourTheDesignNames(t *testing.T) {
+	specs := NewTools(twoRepos(), "repo-1", DefaultToolLimits()).Specs()
+	var got []string
+	for _, s := range specs {
+		got = append(got, s.Name)
+		if s.Description == "" {
+			t.Errorf("tool %s has no description; the model is told nothing about it", s.Name)
+		}
+		if len(s.Schema) == 0 {
+			t.Errorf("tool %s has no schema", s.Name)
+		}
+	}
+	want := []string{"search_code", "read_span", "definition_of", "callers_of"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("tools %v, want %v", got, want)
+	}
+	// And each is dispatchable, so the set is not merely declared.
+	for _, tc := range []struct{ name, args string }{
+		{"search_code", `{"q":"Get"}`},
+		{"read_span", `{"span_id":"one-a"}`},
+		{"definition_of", `{"name":"Get"}`},
+		{"callers_of", `{"symbol_id":"s1"}`},
+	} {
+		ts := NewTools(twoRepos(), "repo-1", DefaultToolLimits())
+		if _, err := callTool(t, ts, tc.name, tc.args); err != nil {
+			t.Errorf("%s is declared but not dispatchable: %v", tc.name, err)
+		}
 	}
 }

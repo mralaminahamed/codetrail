@@ -44,6 +44,16 @@ func TestAFakeReturnsItsTurnsInOrderAndRecordsEveryRequest(t *testing.T) {
 	if len(reqs[1].Messages) != 2 || reqs[1].Messages[1].Text != "second" {
 		t.Errorf("recorded request 1 as %+v, want its two messages verbatim", reqs[1].Messages)
 	}
+
+	// A COPY, not the live slice. The recorder is the observer every ceiling
+	// test rests on, so a caller that sorted or truncated what it got back would
+	// corrupt the evidence for every later assertion in the same test — and
+	// nothing would say so. Found by the whole-branch sweep: returning f.reqs
+	// directly survived everything.
+	reqs[0] = Request{System: "clobbered"}
+	if again := f.Requests(); again[0].System != "sys" {
+		t.Errorf("mutating the returned slice reached the recorder: %+v", again[0])
+	}
 }
 
 // One turn, driven twice.
