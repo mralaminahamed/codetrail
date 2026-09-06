@@ -925,6 +925,68 @@ func TestClearingTheAllowlistAdmitsNoHost(t *testing.T) {
 	}
 }
 
+// The tree leaked without bound across hard kills: workerID generates a fresh
+// id every boot, so sweepHome removes only the running process's own subtree
+// and no future worker ever reached a killed one's. Every OOM-kill stranded up
+// to MAX_REPO_BYTES for good.
+//
+// The boot sweep takes what cannot belong to a live worker and nothing else.
+// The window is the job's deadline plus the lease that outlasts it, and the
+// peer just inside it is the assertion that matters: it is the in-flight clone
+// sweepHome's warning is about, and a sweep that reached it would be the
+// worker-on-worker collision with extra steps.
+func TestTheBootSweepTakesAnAbandonedTreeAndLeavesALiveOne(t *testing.T) {
+	q := &fakeQueue{}
+	ix, logged := testIndexer(t, q)
+	window := 2*ix.lim.clone.Deadline + time.Minute
+
+	trees := map[string]time.Duration{
+		"killed-worker":  window + time.Second,
+		"working-worker": window - time.Second,
+		"fresh-worker":   0,
+	}
+	for name, age := range trees {
+		checkout := filepath.Join(ix.scratch, name, "job1")
+		if err := os.MkdirAll(checkout, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(checkout, "f.go"), []byte("package p\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		at := time.Now().Add(-age)
+		if err := os.Chtimes(filepath.Join(ix.scratch, name), at, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ix.sweepStale()
+
+	for name := range trees {
+		_, err := os.Stat(filepath.Join(ix.scratch, name, "job1", "f.go"))
+		gone := errors.Is(err, os.ErrNotExist)
+		if want := name == "killed-worker"; gone != want {
+			t.Errorf("%s: swept=%v, want %v (%v)", name, gone, want, err)
+		}
+	}
+	if out := logged.String(); !strings.Contains(out, "killed-worker") {
+		t.Errorf("the sweep says nothing about what it removed: %s", out)
+	}
+}
+
+// A scratch directory that does not exist yet is the normal first boot, not a
+// fault to warn about.
+func TestTheBootSweepIsQuietWhenThereIsNothingToSweep(t *testing.T) {
+	q := &fakeQueue{}
+	ix, logged := testIndexer(t, q)
+	ix.scratch = filepath.Join(ix.scratch, "not-created-yet")
+
+	ix.sweepStale()
+
+	if out := logged.String(); out != "" {
+		t.Errorf("a first boot logged %s", out)
+	}
+}
+
 // The binary's doc comment claims this is the component that handles the
 // untrusted URL. A row it did not admit — an allowlist edited since, or a
 // write that did not come from the gateway — reaches git otherwise.
