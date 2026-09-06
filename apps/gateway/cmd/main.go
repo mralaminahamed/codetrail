@@ -233,12 +233,19 @@ func newRetriever(ctx context.Context, log zerolog.Logger, st rag.Searcher) (*ra
 	// Both gauges at boot, so a dashboard shows the floor — and that nobody has
 	// measured it — before the first query rather than after it.
 	metrics.SetFloor(floor.Value, floor.Calibrated)
+	// The message follows the gauge rather than asserting one of the two
+	// states: written unconditionally it would go on saying "not calibrated"
+	// into an operator's log the day a measured floor shipped.
+	msg := "retrieval configured; the score floor is a placeholder that no evaluation has chosen"
+	if floor.Calibrated {
+		msg = "retrieval configured; the score floor is a measured value"
+	}
 	log.Info().
 		Str("mode", string(mode)).Int("rrf_k", k).Int("candidates", candidates).
 		Bool("split_identifiers", split).
 		Float64("score_floor", floor.Value).Bool("floor_calibrated", floor.Calibrated).
 		Str("embed_model", emb.Model()).Int("embed_dim", emb.Dim()).
-		Msg("retrieval configured; the score floor is not calibrated, its value is measured in P6")
+		Msg(msg)
 
 	return &rag.Retriever{
 		Store: st, Emb: emb, Mode: mode,

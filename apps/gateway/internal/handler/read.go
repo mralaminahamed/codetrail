@@ -567,9 +567,17 @@ func detail(r rag.Reason, f rag.Floor) string {
 	case rag.ReasonNoSpans:
 		return "Nothing in this repository's index matched the question."
 	case rag.ReasonBelowFloor:
-		return "The best match scored under the configured floor of " +
-			strconv.FormatFloat(f.Value, 'g', -1, 64) +
-			". That floor is not calibrated; its value is measured in P6."
+		// Branching on Calibrated rather than stating one of the two. The
+		// sentence was unconditional and named a phase, so it would have gone
+		// on calling a measured floor uncalibrated the day one shipped, and
+		// "P6" is a phase identifier no caller can resolve.
+		s := "The best match scored under the configured floor of " +
+			strconv.FormatFloat(f.Value, 'g', -1, 64)
+		if !f.Calibrated {
+			return s + ". That floor is a mechanism, not a measured threshold: " +
+				"no evaluation has chosen this number, so it has filtered nothing."
+		}
+		return s + "."
 	case rag.ReasonUnscored:
 		return "The best match has no usable similarity score, so there is nothing to judge it by."
 	}

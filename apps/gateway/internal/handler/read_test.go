@@ -513,7 +513,9 @@ func TestAskRefusesUnderTheFloorWithTwoHundredAndAReason(t *testing.T) {
 	if out["reason"] != string(rag.ReasonBelowFloor) {
 		t.Errorf("reason %v, want %q", out["reason"], rag.ReasonBelowFloor)
 	}
-	if d, _ := out["detail"].(string); !strings.Contains(d, "not calibrated") {
+	// The uncalibrated half of detail(), matched on what it now says rather
+	// than on the phase identifier it used to name.
+	if d, _ := out["detail"].(string); !strings.Contains(d, "not a measured threshold") {
 		t.Errorf("detail %q says nothing about the floor being uncalibrated", d)
 	}
 	floor, _ := out["floor"].(map[string]any)
@@ -1271,7 +1273,13 @@ func TestEveryRefusalReasonCarriesItsOwnDetail(t *testing.T) {
 			"Nothing in this repository's index matched the question."},
 		{rag.ReasonBelowFloor, result(rag.ModeHybrid, 0.2, true), rag.Floor{Value: 0.5},
 			"The best match scored under the configured floor of 0.5. " +
-				"That floor is not calibrated; its value is measured in P6."},
+				"That floor is a mechanism, not a measured threshold: " +
+				"no evaluation has chosen this number, so it has filtered nothing."},
+		// The same reason with a calibrated floor states the number and stops.
+		// The sentence above was unconditional, so it would have gone on
+		// calling a measured floor uncalibrated the day one shipped.
+		{rag.ReasonBelowFloor, result(rag.ModeHybrid, 0.2, true), rag.Floor{Value: 0.5, Calibrated: true},
+			"The best match scored under the configured floor of 0.5."},
 		{rag.ReasonUnscored, result(rag.ModeHybrid, math.NaN(), true), rag.DefaultFloor(),
 			"The best match has no usable similarity score, so there is nothing to judge it by."},
 	} {

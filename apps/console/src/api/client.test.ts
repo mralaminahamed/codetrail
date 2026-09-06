@@ -30,7 +30,7 @@ describe("the outcome taxonomy", () => {
   test("all three refusal reasons parse to ok, each with its own sentence", async () => {
     const cases = [
       [askRefusedNoSpans, "no_spans", "Nothing in this repository's index matched the question."],
-      [askRefusedBelowFloor, "below_floor", "The best match scored under the configured floor of 0.99. That floor is not calibrated; its value is measured in P6."],
+      [askRefusedBelowFloor, "below_floor", "The best match scored under the configured floor of 0.99. That floor is a mechanism, not a measured threshold: no evaluation has chosen this number, so it has filtered nothing."],
       [askRefusedUnscored, "unscored", "The best match has no usable similarity score, so there is nothing to judge it by."],
     ] as const;
     for (const [fixture, reason, detail] of cases) {

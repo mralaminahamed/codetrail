@@ -441,7 +441,10 @@ func TestTheDefaultRetrieverIsVectorAtTheUncalibratedFloor(t *testing.T) {
 	if !strings.Contains(line, `"score_floor":-1`) || !strings.Contains(line, `"floor_calibrated":false`) {
 		t.Errorf("the boot log does not carry the floor and its calibration: %s", line)
 	}
-	if !strings.Contains(line, "not calibrated") {
+	// Matched on what the line now says rather than on the phase it used to
+	// name. The message follows floor.Calibrated, so a measured floor changes
+	// it instead of leaving a stale claim in an operator's log.
+	if !strings.Contains(line, "no evaluation has chosen") {
 		t.Errorf("the boot log does not say the floor is uncalibrated: %s", line)
 	}
 }
