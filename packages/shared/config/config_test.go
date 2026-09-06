@@ -90,3 +90,45 @@ func TestGetListReadsAClearedSettingAsAnEmptyList(t *testing.T) {
 		t.Errorf("TP_L=%q read as %q, want the split left alone", "a, b", got)
 	}
 }
+
+// The house rule this package now owns: a boolean knob is PARSED, so
+// TYPECHECK=no is a refusal rather than a switch that reads as on. It was
+// written out five times across two binaries — one helper per package plus
+// three call sites, two bodies byte-identical — which is the drift GetInt was
+// extracted to stop.
+func TestGetBoolParsesOrRefuses(t *testing.T) {
+	os.Unsetenv("TP_B")
+	for _, def := range []bool{true, false} {
+		if got, err := GetBool("TP_B", def); got != def || err != nil {
+			t.Fatalf("unset with def %v: %v, %v", def, got, err)
+		}
+	}
+	t.Cleanup(func() { os.Unsetenv("TP_B") })
+	// Empty is unset, as it is for Get and GetInt: a knob cleared in a compose
+	// file is not one set wrong. GetList is the one reader that differs, and
+	// its doc says why.
+	os.Setenv("TP_B", "")
+	if got, err := GetBool("TP_B", true); !got || err != nil {
+		t.Errorf("empty: %v, %v", got, err)
+	}
+	for v, want := range map[string]bool{
+		"true": true, "TRUE": true, "True": true, "1": true, "t": true,
+		"false": false, "FALSE": false, "0": false, "f": false,
+	} {
+		os.Setenv("TP_B", v)
+		if got, err := GetBool("TP_B", !want); got != want || err != nil {
+			t.Errorf("%q read as %v (%v), want %v", v, got, err, want)
+		}
+	}
+	// The values that would silently invert a knob if this compared against
+	// "true" instead of parsing.
+	for _, v := range []string{"no", "yes", "on", "off", "nope", " true"} {
+		os.Setenv("TP_B", v)
+		got, err := GetBool("TP_B", true)
+		if err == nil {
+			t.Errorf("%q was read as %v", v, got)
+		} else if !strings.Contains(err.Error(), "TP_B") || !strings.Contains(err.Error(), v) {
+			t.Errorf("%q: the error names neither the setting nor the value: %v", v, err)
+		}
+	}
+}
