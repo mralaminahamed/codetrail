@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -143,6 +144,32 @@ func TestAllowedHostsDefaultsAndSurvivesSpaces(t *testing.T) {
 	}
 	if _, err := p.Check("https://codeberg.org/a/b"); err == nil {
 		t.Error("a configured list must replace the default, not extend it")
+	}
+}
+
+// Clearing the allowlist has to mean "admit nothing". Reading it through
+// config.Get made an empty value indistinguishable from an unset one, so the
+// operator who cleared the only SSRF control this gateway has got the built-in
+// list back — and a single space was the difference between fail-open and
+// fail-closed. The indexer's twin covers the same knob at its own boot.
+func TestClearingTheAllowlistAdmitsNoHost(t *testing.T) {
+	for _, v := range []string{"", " "} {
+		t.Run(strconv.Quote(v), func(t *testing.T) {
+			t.Setenv("ALLOWED_HOSTS", v)
+			p := admit.NewPolicy(allowedHosts())
+			for _, remote := range []string{"https://github.com/a/b", "https://codeberg.org/a/b"} {
+				if _, err := p.Check(remote); err == nil {
+					t.Errorf("ALLOWED_HOSTS=%q admitted %s: the default allowlist is back", v, remote)
+				}
+			}
+		})
+	}
+	// The control, or the assertion above would pass against a reader that
+	// returned nothing whatever the environment said.
+	t.Setenv("ALLOWED_HOSTS", "")
+	os.Unsetenv("ALLOWED_HOSTS")
+	if _, err := admit.NewPolicy(allowedHosts()).Check("https://github.com/a/b"); err != nil {
+		t.Errorf("with ALLOWED_HOSTS unset, github.com is refused: %v", err)
 	}
 }
 

@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -48,7 +47,7 @@ func newRouter(ready func() bool, h *handler.Handler) *echo.Echo {
 // served by adding it — gitlab.com's group/repo would be accepted and its
 // group/subgroup/repo refused — because Check requires exactly two segments.
 func allowedHosts() []string {
-	return strings.Split(config.Get("ALLOWED_HOSTS", strings.Join(admit.DefaultHosts, ",")), ",")
+	return config.GetList("ALLOWED_HOSTS", admit.DefaultHosts)
 }
 
 // newHandler builds the API handler main serves from. A function so a test can
