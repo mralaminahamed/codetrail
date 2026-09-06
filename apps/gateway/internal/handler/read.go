@@ -397,13 +397,18 @@ func (h *Handler) ask(c echo.Context) error {
 	floor := floorView{Value: h.Floor.Value, Calibrated: h.Floor.Calibrated, Applicable: out.VectorRan}
 	outcome, reason := out.Decide(h.Floor)
 
-	// The loop runs only where the floor did not already settle it, and NEVER on
-	// no_spans: a loop over a corpus with nothing in it is spend with no
-	// possible answer, and spec:230's "costs nothing per visitor" is the reason
-	// to care.
+	// The loop runs where nothing refused, and on a refusal only for the one
+	// reason LLM_BELOW_FLOOR names.
+	//
+	// NEVER on no_spans: a loop over a corpus with nothing in it is spend with
+	// no possible answer, and spec:230's "costs nothing per visitor" is the
+	// reason to care. And never on unscored, which is not a floor refusal at
+	// all — the top score is not a number, so there is nothing for the floor to
+	// have been lenient about, and a knob that turned that into an answer would
+	// be a second behaviour its own doc does not describe.
 	tryLoop := want == answererLLM && h.LLM != nil &&
 		(outcome == rag.OutcomeAnswered ||
-			(reason != rag.ReasonNoSpans && h.belowFloorLoop()))
+			(reason == rag.ReasonBelowFloor && h.belowFloorLoop()))
 
 	if outcome == rag.OutcomeRefused && !tryLoop {
 		return h.refuse(c, r, out, floor, reason, answererExtractive, nil, nil)
@@ -414,7 +419,14 @@ func (h *Handler) ask(c echo.Context) error {
 	if tryLoop {
 		a := h.LLM.Ask(ctx, r.ID, q, out)
 		metrics.CountLLMStop(string(a.Trace.Stop))
-		metrics.ObserveLLM(a.Trace.Steps, a.Trace.Usage.InputTokens, a.Trace.Usage.OutputTokens)
+		// Only where a model was actually called. codetrail_llm_steps counts
+		// model calls per loop and its buckets start at 1, so a 0 from busy or
+		// budget_exhausted — both decided before agent.Run is reached — lands
+		// in le="1" and reads as a loop that made one. The stop counter above
+		// is where those two are visible.
+		if a.Trace.Steps > 0 {
+			metrics.ObserveLLM(a.Trace.Steps, a.Trace.Usage.InputTokens, a.Trace.Usage.OutputTokens)
+		}
 		trace = &a.Trace
 		if a.Trace.Stop == agent.StopFinal {
 			newer, err := h.newer(ctx, r.ID)

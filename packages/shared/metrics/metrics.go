@@ -385,8 +385,13 @@ func CountAnswerBy(answerer string) { answerBy.WithLabelValues(answerer).Inc() }
 func CountLLMStop(reason string) { llmStops.WithLabelValues(reason).Inc() }
 
 // ObserveLLM records one loop's work: how many model calls it made and what it
-// spent. Called for every loop, including one that degraded — a degradation
-// that cost four steps and 9,000 tokens is spend an operator has to see.
+// spent. Called for every loop that made at least one model call, a degraded
+// one included — a degradation that cost four steps and 9,000 tokens is spend
+// an operator has to see.
+//
+// Not for a loop that made none. The buckets below start at 1, so a 0 lands in
+// le="1" and is indistinguishable from a single call; the caller's stop counter
+// is what records those.
 func ObserveLLM(steps, inputTokens, outputTokens int) {
 	llmSteps.Observe(float64(steps))
 	llmTokens.WithLabelValues("input").Add(float64(inputTokens))

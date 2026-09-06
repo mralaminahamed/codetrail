@@ -132,8 +132,22 @@ func TestStalenessAgeIsCoarseAndReads(t *testing.T) {
 	}{
 		{92 * 24 * time.Hour, "92 days"},
 		{25 * time.Hour, "1 day"},
+		// The boundary itself, so the hours/days split cannot drift by one.
+		{24 * time.Hour, "1 day"},
+		{23 * time.Hour, "23 hours"},
 		{5 * time.Hour, "5 hours"},
 		{90 * time.Minute, "1 hour"},
+		// Everything under an hour said "0 hours ago" — three seconds, twenty
+		// minutes and fifty-nine minutes alike — in a unit this deliberately
+		// does not claim.
+		{59 * time.Minute, "less than an hour"},
+		{3 * time.Second, "less than an hour"},
+		// Postgres writes indexed_at from its own now() and this compares it
+		// against the gateway's clock, so a few seconds of skew between two
+		// hosts rendered "indexed -1 hours ago": a note that reads as a broken
+		// corpus rather than as two clocks disagreeing.
+		{-3 * time.Second, "less than an hour"},
+		{-90 * time.Minute, "less than an hour"},
 	} {
 		r := oldRepo
 		r.IndexedAt = fixedNow.Add(-c.since)

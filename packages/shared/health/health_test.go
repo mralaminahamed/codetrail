@@ -1,6 +1,7 @@
 package health
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -144,5 +145,47 @@ func TestReadinessSeedsTrueSoAFreshProcessDoesNotAlert(t *testing.T) {
 	}
 	if p.calls != 0 {
 		t.Fatalf("construction probed the dependency %d times; the seed is a seed, not a check", p.calls)
+	}
+}
+
+// A second dependency is not a second copy of the first. The log has to name
+// which one went, or an operator reads "not ready" and goes to the wrong
+// system — and the check has to stop at the first failure, or a probe against
+// a system already known to be answering nothing is a round trip for nothing.
+func TestReadinessCoversEveryDependencyAndNamesTheOneThatWent(t *testing.T) {
+	pg := &probe{}
+	emb := &probe{err: errors.New("ollama is down")}
+	var logged bytes.Buffer
+	at := time.Unix(0, 0)
+	r := withClock(NewReadiness(zerolog.New(&logged), pg.ping,
+		Dep{Name: "embedder", Check: emb.ping}), func() time.Time { return at })
+
+	if r.Ready() {
+		t.Error("ready with the second dependency down")
+	}
+	if !strings.Contains(logged.String(), `"dependency":"embedder"`) {
+		t.Errorf("the log does not name which dependency went: %s", logged.String())
+	}
+	// Postgres was asked and answered, so this is the second one's failure and
+	// not the first one's mislabelled.
+	if pg.calls != 1 || emb.calls != 1 {
+		t.Errorf("postgres probed %d times, embedder %d, want 1 each", pg.calls, emb.calls)
+	}
+
+	// The first one failing stops the walk.
+	pg.err = errors.New("postgres is gone")
+	at = at.Add(r.ttl)
+	if r.Ready() {
+		t.Error("ready with both dependencies down")
+	}
+	if emb.calls != 1 {
+		t.Errorf("the embedder was probed %d times although postgres had already failed", emb.calls)
+	}
+
+	// And back: a readiness that only ever falls is one nothing recovers from.
+	pg.err, emb.err = nil, nil
+	at = at.Add(r.ttl)
+	if !r.Ready() {
+		t.Error("not ready with every dependency answering")
 	}
 }

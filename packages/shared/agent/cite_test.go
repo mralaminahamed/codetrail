@@ -158,3 +158,71 @@ func TestTheDroppedCountReachesTheTrace(t *testing.T) {
 		t.Errorf("answer still carries an invented marker: %q", a.Text)
 	}
 }
+
+// The subscript cases, measured on the pattern that shipped before this one:
+// "The handler reads cfg.Hosts[0] and cfg.Hosts[1] before dialling." came back
+// with [0] DELETED — codetrail rewriting a stranger's source into a false claim
+// about it — and "It returns parts[1] when the split succeeds." came back
+// carrying a citation the model never wrote, which is enough to ship an answer
+// that should have been discarded as uncited.
+//
+// This is a code-RAG product. A subscript in an answer is the common case, not
+// the exotic one.
+func TestASubscriptInQuotedCodeIsNotACitation(t *testing.T) {
+	read := spans("read-a", "read-b")
+	for name, in := range map[string]string{
+		"index zero beside index one":     "The handler reads cfg.Hosts[0] and cfg.Hosts[1] before dialling.",
+		"a split result":                  "It returns parts[1] when the split succeeds.",
+		"a package selector":              "It reads os.Args[1] and matches[2].",
+		"a two-dimensional index":         "The row is grid[1][2].",
+		"a call's result":                 "It uses split(s)[1] and nothing else.",
+		"an underscored identifier":       "It reads raw_parts[1].",
+		"an identifier ending in _":       "It reads buf_[1] there.",
+		"a numeric literal":               "The slice is []int{9}[0].",
+		"an identifier ending in a digit": "It reads chunk2[1] first.",
+	} {
+		t.Run(name, func(t *testing.T) {
+			text, order, dropped := Resolve(in, read)
+			if text != in {
+				t.Errorf("Resolve rewrote quoted source: %q, want %q", text, in)
+			}
+			if len(order) != 0 {
+				t.Errorf("order = %v, want none: a subscript is not a citation", order)
+			}
+			if dropped != 0 {
+				t.Errorf("dropped %d, want 0", dropped)
+			}
+		})
+	}
+}
+
+// The other half of the same rule: a marker with nothing in front of it to
+// index is still a citation, wherever in the sentence it sits. Without these a
+// fix that refused every [n] would pass the subscript test above.
+func TestAMarkerWithNothingToIndexStillResolves(t *testing.T) {
+	read := spans("read-a", "read-b")
+	for name, tc := range map[string]struct {
+		in   string
+		want []int
+	}{
+		"after a word":         {"See the RFC [2].", []int{1}},
+		"after a full stop":    {"The handler dials it.[1]", []int{0}},
+		"at position zero":     {"[1] is the one that dials.", []int{0}},
+		"inside parentheses":   {"the dialler ([1]) reads it", []int{0}},
+		"after a newline":      {"the dialler\n[1]", []int{0}},
+		"two markers in a row": {"both agree [1][2].", []int{0, 1}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			text, order, dropped := Resolve(tc.in, read)
+			if text != tc.in {
+				t.Errorf("Resolve rewrote a resolvable marker: %q, want %q", text, tc.in)
+			}
+			if !reflect.DeepEqual(order, tc.want) {
+				t.Errorf("order = %v, want %v", order, tc.want)
+			}
+			if dropped != 0 {
+				t.Errorf("dropped %d, want 0", dropped)
+			}
+		})
+	}
+}

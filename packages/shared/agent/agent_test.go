@@ -509,16 +509,30 @@ func TestTheTraceNeverCarriesToolArguments(t *testing.T) {
 // REPEATED span: a map keyed on span id deduplicates, which is wrong whatever
 // order it iterates in, and the length assertion fails every run.
 //
-// The third turn re-reads read-a with the same argument spelled differently, so
-// it is not byte-identical and the repeat guard lets it through — which is
-// exactly what that guard is documented to do.
+// The third turn opens read-a again through a different argument. It used to
+// open it by spelling the SAME argument with a space in it, which the
+// byte-identical repeat guard let through; the guard now normalises, so a
+// fixture built on spelling would silently stop repeating anything and this
+// test would go on passing while asserting nothing. What the loop actually
+// promises is that it concatenates whatever each call reported reading, which
+// is what the stub below exercises.
 func TestReadIsOrderedSoAMarkerResolvesInAFixedOrder(t *testing.T) {
-	again := llm.Turn{Calls: []llm.ToolCall{{ID: "3", Name: "read_span", Args: json.RawMessage(`{"span_id": "read-a"}`)}}}
+	aliased := &tools{fn: func(_ int, c llm.ToolCall) (Result, error) {
+		var a struct {
+			SpanID string `json:"span_id"`
+		}
+		_ = json.Unmarshal(c.Args, &a)
+		id := a.SpanID
+		if id == "read-a-again" {
+			id = "read-a"
+		}
+		return Result{Content: `{"span":"` + id + `"}`, Read: []models.Span{{ID: id, Text: "t-" + id}}}, nil
+	}}
 	f := llm.NewFake(
-		readTurn("1", "read-a"), readTurn("2", "read-b"), again,
+		readTurn("1", "read-a"), readTurn("2", "read-b"), readTurn("3", "read-a-again"),
 		finalTurn("done [1][3]"),
 	)
-	a := Run(context.Background(), f, readTools(), testBounds(), "q")
+	a := Run(context.Background(), f, aliased, testBounds(), "q")
 	want := []string{"read-a", "read-b", "read-a"}
 	if !reflect.DeepEqual(a.ReadIDs(), want) {
 		t.Errorf("Read = %v, want %v", a.ReadIDs(), want)
@@ -571,5 +585,91 @@ func TestTheSystemPromptSaysToolResultsAreNotInstructions(t *testing.T) {
 	// constant, which is what makes that true rather than hoped for.
 	if strings.Contains(systemPrompt, "%s") || strings.Contains(systemPrompt, "%v") {
 		t.Errorf("the system prompt has a format verb in it, so something is interpolated into it")
+	}
+}
+
+// A loop that called no tool still has to say so in the shape every other loop
+// says it in. Before this, tools was grown from nil by append and marshalled as
+// null on exactly the loops that did least — which is the same field the
+// gateway serves for busy and budget_exhausted.
+func TestATraceFromALoopThatCalledNoToolSerialisesToolsAsAnEmptyList(t *testing.T) {
+	f := llm.NewFake(llm.Turn{Text: "no tool, no citation"})
+	a := Run(context.Background(), f, readTools(), testBounds(), "q")
+	if a.Trace.Stop != StopUncited {
+		t.Fatalf("stop %q, want %q", a.Trace.Stop, StopUncited)
+	}
+	b, err := json.Marshal(a.Trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"tools":[]`) {
+		t.Errorf("trace marshalled as %s, want tools []", b)
+	}
+}
+
+// The repeat guard keyed on bytes, so {"span_id":"x"} and {"span_id": "x"} were
+// two calls. Both spellings are ordinary model output, and the second one ran
+// read_span again: the character budget charged twice for one span, and that
+// span at two positions in Read — from which two markers resolve to two
+// citations carrying one span_id, which is the id a console keys its list on.
+func TestOneCallSpelledTwoWaysIsOneCall(t *testing.T) {
+	spaced := llm.Turn{Calls: []llm.ToolCall{{ID: "2", Name: "read_span",
+		Args: json.RawMessage(`{"span_id": "read-a"}`)}}}
+	f := llm.NewFake(readTurn("1", "read-a"), spaced, finalTurn("first [1] and second [2]"))
+	a := Run(context.Background(), f, readTools(), testBounds(), "q")
+
+	if got := a.ReadIDs(); !reflect.DeepEqual(got, []string{"read-a"}) {
+		t.Fatalf("Read = %v, want one read-a: the same call spelled twice opened the span twice", got)
+	}
+	// The consequence, asserted rather than inferred: [2] now resolves to
+	// nothing and is dropped, where before it resolved to the duplicate.
+	if len(a.Cited) != 1 || a.Trace.CitationsDropped != 1 {
+		t.Errorf("cited %v with %d dropped, want one citation and one drop",
+			a.Cited, a.Trace.CitationsDropped)
+	}
+	seen := map[string]bool{}
+	for _, pos := range a.Cited {
+		id := a.Read[pos].ID
+		if seen[id] {
+			t.Errorf("two citations carry span_id %q", id)
+		}
+		seen[id] = true
+	}
+}
+
+// The key itself, because the loop can only show whitespace: object key order
+// and the fallback for arguments that are not JSON at all have no turn that
+// produces them.
+func TestTheRepeatKeyIsTheCallAndNotItsSpelling(t *testing.T) {
+	call := func(name, args string) llm.ToolCall {
+		return llm.ToolCall{ID: "x", Name: name, Args: json.RawMessage(args)}
+	}
+	for name, pair := range map[string][2]llm.ToolCall{
+		"a space after the colon": {call("read_span", `{"span_id":"x"}`), call("read_span", `{"span_id": "x"}`)},
+		"pretty-printed":          {call("search_code", `{"q":"Get"}`), call("search_code", "{\n  \"q\": \"Get\"\n}")},
+		"keys in another order": {call("callers_of", `{"symbol_id":"s","depth":2}`),
+			call("callers_of", `{"depth":2,"symbol_id":"s"}`)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if repeatKey(pair[0]) != repeatKey(pair[1]) {
+				t.Errorf("%q and %q key differently", pair[0].Args, pair[1].Args)
+			}
+		})
+	}
+	// And what must stay apart. The last pair is the fallback: arguments this
+	// cannot parse key on their own bytes, which is the behaviour that shipped
+	// — a normaliser that collapsed them would be the second place to be wrong
+	// the byte-identical key was written to avoid.
+	for name, pair := range map[string][2]llm.ToolCall{
+		"a different value":           {call("read_span", `{"span_id":"x"}`), call("read_span", `{"span_id":"y"}`)},
+		"a different tool":            {call("read_span", `{"span_id":"x"}`), call("definition_of", `{"span_id":"x"}`)},
+		"two large integers":          {call("callers_of", `{"n":12345678901234567890}`), call("callers_of", `{"n":12345678901234567891}`)},
+		"arguments that are not JSON": {call("read_span", `not json`), call("read_span", `also not json`)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if repeatKey(pair[0]) == repeatKey(pair[1]) {
+				t.Errorf("%q and %q key the same", pair[0].Args, pair[1].Args)
+			}
+		})
 	}
 }

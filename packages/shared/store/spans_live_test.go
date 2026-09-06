@@ -566,3 +566,67 @@ func TestPutSpansRefusesASpanFromAnotherRepoLive(t *testing.T) {
 		t.Fatalf("%d spans were written anyway (%v)", n, err)
 	}
 }
+
+// The repair for a job that died between PutRepo and PutSpans: the repo row is
+// removed only when it holds no spans, and the cascade takes its files.
+//
+// Both halves matter. The delete is what stops a failed job pinning a quota
+// slot forever — PutRepo winds last_queried_at, so the orphan is the most
+// recently "queried" row and the LAST thing Evict would take. The guard is
+// what stops a retry of an already-indexed commit deleting a corpus somebody
+// is querying: a repo id is hash(key, commit), so the two jobs own one row.
+func TestDeleteEmptyRepoTakesOnlyTheRepoWithNoSpansLive(t *testing.T) {
+	ctx := context.Background()
+	s, repoID, fileID := seedSpanRepo(t, "emptyrepo")
+
+	// With spans: refused, and nothing about the repository moves.
+	sp := mkSpan(repoID, fileID, "a.go", 1, 3, "func One() int { return 1 }", unit(5))
+	if err := s.PutSpans(ctx, repoID, []EmbeddedSpan{sp}, fakeModel, EmbeddingDim); err != nil {
+		t.Fatal(err)
+	}
+	dropped, err := s.DeleteEmptyRepo(ctx, repoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dropped {
+		t.Fatal("a repository with spans was deleted")
+	}
+	if _, err := s.GetRepo(ctx, repoID); err != nil {
+		t.Fatalf("the repository is gone: %v", err)
+	}
+
+	// Without them: taken, and the files go with it.
+	if _, err := s.pool.Exec(ctx, `DELETE FROM spans WHERE repo_id = $1`, repoID); err != nil {
+		t.Fatal(err)
+	}
+	dropped, err = s.DeleteEmptyRepo(ctx, repoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !dropped {
+		t.Fatal("a repository with no spans survived")
+	}
+	if _, err := s.GetRepo(ctx, repoID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("GetRepo answered %v, want ErrNotFound", err)
+	}
+	var files int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM files WHERE repo_id = $1`, repoID).Scan(&files); err != nil {
+		t.Fatal(err)
+	}
+	if files != 0 {
+		t.Errorf("%d files survived the delete; the cascade is what takes them", files)
+	}
+	// No tombstone: 410 says "this was here and we dropped it", which a
+	// repository that never held a span was not.
+	gone, err := s.RepoGone(ctx, repoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gone {
+		t.Error("the cleanup left a tombstone, so a read of it would answer 410 rather than 404")
+	}
+	// An id that names nothing is not an error and not a deletion.
+	if dropped, err := s.DeleteEmptyRepo(ctx, repoID); err != nil || dropped {
+		t.Errorf("deleting an absent repo answered %v, %v", dropped, err)
+	}
+}
