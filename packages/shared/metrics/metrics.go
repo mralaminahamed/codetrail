@@ -25,14 +25,14 @@ var (
 		Buckets: prometheus.DefBuckets,
 	}, []string{"mode"})
 
-	// topScore is the distribution spec §11 asks for and the instrument P6
+	// topScore is the distribution spec §11 asks for and the instrument an eval
 	// reads. It is NOT the calibration: spec §9 calibrates the floor from the
 	// eval's own distribution over a labelled golden set, and a histogram has
 	// no label for "was this hit correct" — a confident wrong answer and a
 	// confident right one land in the same bucket.
 	topScore = promauto.NewHistogram(prometheus.HistogramOpts{
 		Name:    "codetrail_retrieval_top_score",
-		Help:    "Cosine similarity of the best-ranked span. Production instrument; the floor is calibrated in P6 from the eval's labelled distribution, not from this.",
+		Help:    "Cosine similarity of the best-ranked span. A production instrument, not a calibration: the floor is calibrated from a labelled golden set, which this has no label for.",
 		Buckets: prometheus.LinearBuckets(0, 0.05, 21),
 	})
 
@@ -76,8 +76,14 @@ var (
 	})
 
 	// Two gauges rather than one, so a dashboard shows a guess as a guess.
-	// Spec:315 puts the number in P6; until then the value is -1 and
-	// calibrated is 0, and an operator can see both without reading the code.
+	// Nobody has measured a floor yet — spec:315 asked for one and the eval
+	// declined on a single corpus — so today the value is -1 and calibrated is
+	// 0, and an operator can see both without reading the code.
+	//
+	// The Help strings are SCRAPED and therefore shipped surfaces: neither may
+	// state which of the two states is current, because a Help string that
+	// says "it is 0" goes on saying so on the dashboard of the deployment that
+	// measured one. They describe the encoding; the value reports the state.
 	scoreFloor = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "codetrail_score_floor",
 		Help: "The configured cosine-similarity floor an answer must reach.",
@@ -85,7 +91,7 @@ var (
 
 	scoreFloorCalibrated = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "codetrail_score_floor_calibrated",
-		Help: "1 when the score floor was measured, 0 when it is a placeholder. It is 0 until P6 measures one.",
+		Help: "1 when this project measured the score floor from a labelled golden set, 0 when it is a placeholder nobody measured.",
 	})
 
 	jobTotal = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -163,10 +169,19 @@ var (
 		Help: "Tokens left in this PROCESS's rolling hourly budget. Not shared across replicas.",
 	})
 
-	// The incremental re-index's two counters. Both live in the INDEXER, which
-	// still has no /metrics endpoint — P3 recorded that gap, P4 widened it by
-	// four instruments and P7 widens it by two more. Recorded again rather than
-	// quietly closed with an exporter nothing scrapes.
+	// The incremental re-index's two counters. Both live in the INDEXER, and
+	// they are scraped: health.Register mounts promhttp on the indexer's probe
+	// server (PROBE_PORT, default 9090).
+	//
+	// This comment used to say the indexer "still has no /metrics endpoint —
+	// P3 recorded that gap, P4 widened it by four instruments". It was never
+	// true. The commit that gave the indexer its probe surface is an ANCESTOR
+	// of the commit that wrote the sentence, so this was not drift, it was
+	// wrong on the day; and P4 added three instruments, not four
+	// (codetrail_graph_edges_total, codetrail_typecheck_total,
+	// codetrail_typecheck_seconds). Recorded that way rather than silently
+	// reworded, because a count inherited from a predecessor's prose is the
+	// error this project keeps finding.
 	reuseSpans = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "codetrail_reuse_spans_total",
 		Help: "Spans by how their vector was obtained: reused from an existing row, or embedded.",
