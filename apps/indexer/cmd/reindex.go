@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
-	"strconv"
 
 	"github.com/rs/zerolog"
 
@@ -19,26 +17,17 @@ import (
 // makes "reuse changes nothing in the rows" testable at all, exactly as
 // TYPECHECK=false made P4's edge-count equality testable.
 //
-// Parsed, never compared against "true". The house rule, stated three times in
-// this codebase: a knob an operator believes is in force and is not is the
-// shape of bug this project has already shipped.
+// Parsed, never compared against "true", and through config.GetBool rather
+// than a fourth local copy of that rule: a knob an operator believes is in
+// force and is not is the shape of bug this project has already shipped.
 func reindexKnobs() (skipClone, reuse bool, err error) {
-	if skipClone, err = boolKnob("REINDEX_SKIP_CLONE", "true"); err != nil {
+	if skipClone, err = config.GetBool("REINDEX_SKIP_CLONE", true); err != nil {
 		return false, false, err
 	}
-	if reuse, err = boolKnob("REINDEX_REUSE", "true"); err != nil {
+	if reuse, err = config.GetBool("REINDEX_REUSE", true); err != nil {
 		return false, false, err
 	}
 	return skipClone, reuse, nil
-}
-
-func boolKnob(key, def string) (bool, error) {
-	v := config.Get(key, def)
-	b, err := strconv.ParseBool(v)
-	if err != nil {
-		return false, fmt.Errorf("%s must be a boolean, got %q", key, v)
-	}
-	return b, nil
 }
 
 // fastPath reports whether this commit is already indexed in a form this worker
