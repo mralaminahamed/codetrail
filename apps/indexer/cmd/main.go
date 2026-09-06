@@ -15,7 +15,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
@@ -247,12 +246,19 @@ func (ix *indexer) probeServer(ping func(context.Context) error) *echo.Echo {
 // definition would otherwise serve the wrong process on the right port.
 func probeAddr() string { return ":" + config.Get("PROBE_PORT", "9090") }
 
-// allowedHosts reads the exact-host allowlist the same way the gateway does:
-// ALLOWED_HOSTS, comma-separated, replacing the default rather than extending
-// it. Duplicated rather than shared because the two binaries are separate
-// packages; if a third reader appears, this belongs in admit.
+// allowedHosts reads the exact-host allowlist: ALLOWED_HOSTS, comma-separated,
+// replacing the default rather than extending it. Duplicated rather than shared
+// because the two binaries are separate packages; if a third reader appears,
+// this belongs in admit.
+//
+// Through config.GetList and not config.Get, and that is the whole content of
+// this function. Get reads present-but-empty as unset, so ALLOWED_HOSTS=""
+// handed back the built-in allowlist and admitted github.com — an operator
+// clearing the only SSRF control codetrail has got it back, while a single
+// space refused everything. GetList reads a cleared permission as granting
+// nothing.
 func allowedHosts() []string {
-	return strings.Split(config.Get("ALLOWED_HOSTS", strings.Join(admit.DefaultHosts, ",")), ",")
+	return config.GetList("ALLOWED_HOSTS", admit.DefaultHosts)
 }
 
 // home is this worker's own scratch subtree. Per worker, because two indexers

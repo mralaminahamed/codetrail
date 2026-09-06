@@ -774,6 +774,41 @@ func TestSweepHomeLeavesAPeersTreeAlone(t *testing.T) {
 	}
 }
 
+// ALLOWED_HOSTS is the only SSRF control codetrail has (admit's package doc),
+// and clearing it must grant NOTHING rather than hand the default back.
+//
+// Read through config.Get it failed open, because Get treats present-but-empty
+// as unset. Measured:
+//
+//	ALLOWED_HOSTS=""   -> ["github.com" "codeberg.org"], github.com ADMITTED
+//	ALLOWED_HOSTS=" "  -> [" "],                         github.com refused
+//
+// A single space was the difference between fail-open and fail-closed, for an
+// operator clearing the control on purpose.
+//
+// Asserted through the POLICY and not through the slice: an empty list that
+// admit still admitted from would pass a length check and refuse nothing.
+func TestClearingTheAllowlistAdmitsNoHost(t *testing.T) {
+	for _, v := range []string{"", " "} {
+		t.Run(strconv.Quote(v), func(t *testing.T) {
+			t.Setenv("ALLOWED_HOSTS", v)
+			p := admit.NewPolicy(allowedHosts())
+			for _, remote := range []string{"https://github.com/a/b", "https://codeberg.org/a/b"} {
+				if _, err := p.Check(remote); err == nil {
+					t.Errorf("ALLOWED_HOSTS=%q admitted %s: the default allowlist is back", v, remote)
+				}
+			}
+		})
+	}
+	// The control: an unset knob still gets the default, or the assertion above
+	// would pass against an allowlist reader that returned nothing ever.
+	t.Setenv("ALLOWED_HOSTS", "")
+	os.Unsetenv("ALLOWED_HOSTS")
+	if _, err := admit.NewPolicy(allowedHosts()).Check("https://github.com/a/b"); err != nil {
+		t.Errorf("with ALLOWED_HOSTS unset, github.com is refused: %v", err)
+	}
+}
+
 // The binary's doc comment claims this is the component that handles the
 // untrusted URL. A row it did not admit — an allowlist edited since, or a
 // write that did not come from the gateway — reaches git otherwise.
