@@ -1,7 +1,15 @@
 // Package rag holds the parts of retrieval that are pure functions: how two
 // ranked lists become one, and whether the result is worth answering from.
 //
-// Nothing here touches a database, an embedder or a clock. That is what lets
+// Nothing here opens a connection or dials anything. The package imports no
+// database driver and no HTTP client, and what it does need it is HANDED
+// rather than constructs: Retriever holds a Searcher and an embed.Embedder,
+// both interfaces, and every citation's clock arrives as NewCitation's `now`
+// argument. The import graph is the check — neither pgx nor net/http appears
+// in any file here. (Search does call Emb.Embed, and retrieve.go has one
+// direct time.Now() for the latency histogram; no decision reads either.)
+//
+// That is what lets
 // the eval (spec §9) run the same fusion and the same floor the gateway serves
 // from, and it is also the only place the two arms can be told apart at all:
 // under embed.Fake — a hashed bag of words over the same span text the lexical

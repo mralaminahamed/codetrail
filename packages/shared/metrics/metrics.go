@@ -163,10 +163,19 @@ var (
 		Help: "Tokens left in this PROCESS's rolling hourly budget. Not shared across replicas.",
 	})
 
-	// The incremental re-index's two counters. Both live in the INDEXER, which
-	// still has no /metrics endpoint — P3 recorded that gap, P4 widened it by
-	// four instruments and P7 widens it by two more. Recorded again rather than
-	// quietly closed with an exporter nothing scrapes.
+	// The incremental re-index's two counters. Both live in the INDEXER, and
+	// they are scraped: health.Register mounts promhttp on the indexer's probe
+	// server (PROBE_PORT, default 9090).
+	//
+	// This comment used to say the indexer "still has no /metrics endpoint —
+	// P3 recorded that gap, P4 widened it by four instruments". It was never
+	// true. The commit that gave the indexer its probe surface is an ANCESTOR
+	// of the commit that wrote the sentence, so this was not drift, it was
+	// wrong on the day; and P4 added three instruments, not four
+	// (codetrail_graph_edges_total, codetrail_typecheck_total,
+	// codetrail_typecheck_seconds). Recorded that way rather than silently
+	// reworded, because a count inherited from a predecessor's prose is the
+	// error this project keeps finding.
 	reuseSpans = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "codetrail_reuse_spans_total",
 		Help: "Spans by how their vector was obtained: reused from an existing row, or embedded.",

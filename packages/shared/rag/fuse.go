@@ -22,9 +22,11 @@ import (
 // README line, for a consumer that does not exist — which is the
 // mode-request-field defect this project has already shipped once.
 //
-// Why a weight at all before the experiment says fusion helps: "by how much"
-// (spec:316) is unanswerable at a fixed 1:1 ratio. P6 would measure one point
-// and report it as a curve.
+// Why a weight at all, now that the experiment has run and fusion LOST: the
+// experiment measured one point on the 1:1 ratio, and "by how much" (spec:316)
+// is still unanswerable at a fixed ratio. The result was one corpus of
+// doc-comment prose queries, so a later re-run on a second golden set needs
+// this field to say anything more than that one point.
 type Params struct {
 	K                 int
 	WVector, WLexical float64
@@ -68,8 +70,11 @@ func (p Params) Validate() error {
 // Ranks, not scores, because the two arms have no common unit — a cosine
 // similarity and a ts_rank_cd cannot be added, and normalising them would
 // invent an exchange rate nobody measured. Spec §8 names this fusion;
-// spec:316 makes whether it beats the vector arm alone an experiment for
-// P6/P7, so every hit keeps the per-arm ranks that comparison needs.
+// spec:316 made whether it beats the vector arm alone an experiment, and the
+// experiment ran: on google/uuid @ 2d3c2a9, 74 cases, the AST arm's MRR was
+// vector 0.7492 against hybrid 0.4023, so ModeVector is the default. Every hit
+// still keeps the per-arm ranks, because that is what makes the comparison
+// re-runnable on a corpus that is not one small library.
 //
 // The returned Score is a function of ranks alone. It is deliberately not the
 // number the floor reads: the top hit of any non-empty result scores 1/(k+1)
@@ -137,7 +142,9 @@ func entry(acc map[string]*Fused, h Hit) *Fused {
 }
 
 // k is the discount that stops one arm's top rank from dominating the sum. It
-// is the parameter P6 sweeps, which is why it is a field and not a const.
+// is a field and not a const so an eval can sweep it; the one eval run so far
+// held it at the paper's 60 and swept nothing, so no measurement here argues
+// for any other value.
 //
 // The weight scales the arm's CONTRIBUTION and is applied outside this
 // function, deliberately. Inside the denominator — 1/(w*k+rank) — it would
