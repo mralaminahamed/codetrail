@@ -552,8 +552,16 @@ func (ix *indexer) doJob(ctx context.Context, job jobs.Job) string {
 		l.Error().Err(err).Msg("could not clear the scratch directory")
 		return ix.fail(ctx, l, job, err.Error())
 	}
-	defer removeScratch(dir)
-	defer removeScratch(goHome)
+	// The error is logged, not discarded. This is the removal removeScratch's
+	// own doc was written for — measured to leak not the module cache but the
+	// whole tree it is in, one job at a time — and it is the one that runs
+	// after the last thing that could report anything. A silent failure here
+	// is a volume filling up with no line saying so.
+	defer func() {
+		if err := errors.Join(removeScratch(dir), removeScratch(goHome)); err != nil {
+			l.Warn().Err(err).Str("dir", dir).Msg("could not clear the scratch directory after the job")
+		}
+	}()
 
 	// One deadline for the whole job (spec §6): clone, read, chunk, embed and
 	// write share it, so a slow clone cannot buy itself extra time by failing

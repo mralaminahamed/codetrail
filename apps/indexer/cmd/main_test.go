@@ -591,6 +591,48 @@ func TestRunJobRemovesTheScratchTreeOnEveryPath(t *testing.T) {
 	}
 }
 
+// The post-job removal reports what it could not remove.
+//
+// removeScratch's own doc records the measurement this is about: with a proxy
+// configured, the module cache's directories are written 0555 and RemoveAll
+// then leaks not the cache but the whole tree it is in, one job at a time. The
+// pre-clone call at the top of doJob logged; the two deferred calls after the
+// work discarded their error, so the disk filled with nothing saying why.
+func TestAScratchTreeThatCannotBeRemovedAfterTheJobIsLogged(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root unlinks from a read-only directory")
+	}
+	ix, rec := fakeIndexer(t)
+	inner := ix.clone
+	ix.clone = func(ctx context.Context, remote, ref, d string, lim clone.Limits) (clone.Result, error) {
+		res, err := inner(ctx, remote, ref, d, lim)
+		// After the pre-clone removal, so this is the deferred one failing and
+		// not the guarded one. Freezing the PARENT is what makes it fail:
+		// removeScratch restores the permissions of the tree it is removing,
+		// and unlinking needs write permission on the directory above it.
+		home := filepath.Dir(d)
+		if cerr := os.Chmod(home, 0o500); cerr != nil {
+			t.Fatal(cerr)
+		}
+		t.Cleanup(func() { _ = os.Chmod(home, 0o700) })
+		return res, err
+	}
+	ix.runJob(context.Background(), aJob())
+
+	if len(rec.completed) != 1 {
+		t.Fatalf("the job did not complete: %+v", rec.failed)
+	}
+	out := rec.logged.String()
+	if !strings.Contains(out, "could not clear the scratch directory after the job") {
+		t.Errorf("the leaked tree is not in the log: %s", out)
+	}
+	// The control: the checkout really is still there, so the log line is
+	// reporting something rather than describing a removal that worked.
+	if _, err := os.Stat(filepath.Join(ix.home(), "job1")); err != nil {
+		t.Errorf("the checkout was removed after all, so this test proves nothing: %v", err)
+	}
+}
+
 // git clone refuses a non-empty destination, so a checkout left by a crash
 // would fail every retry of that job on the leftover rather than on the
 // repository.
