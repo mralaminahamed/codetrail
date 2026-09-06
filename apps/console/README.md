@@ -108,9 +108,10 @@ which is the defect, stated as data.
   and a bar drawn from it would render a guess as a measurement. The console's
   own sentence says the floor is a mechanism rather than a measured threshold,
   and names no phase: a plan identifier is not something a reader can act on.
-  (The server's `detail` for a `below_floor` refusal still contains one; that
-  string is `read.go`'s and is rendered verbatim, like every other sentence the
-  server writes.)
+  (The server's `detail` for a `below_floor` refusal used to contain one. It no
+  longer does — it branches on `floor.calibrated` and names neither a phase nor
+  a state it has not been told — so the two sentences agree, and the server's
+  is still rendered verbatim like every other sentence the server writes.)
 - **It does not send `answerer`.** The field is honoured by `/ask`, and leaving
   it out is a decision `src/api/client.ts` argues in full: `ANSWER_DEFAULT` is
   the operator's, and the console cannot see whether a provider is configured,
