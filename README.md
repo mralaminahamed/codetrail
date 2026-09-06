@@ -964,8 +964,8 @@ not at the newline after it.
 
 React 19, TypeScript and Tailwind v4 in `apps/console`, built by Vite into a static bundle. It
 does the four things §2 names — submit, watch indexing, ask, jump to source — plus the symbol
-graph browsing P4's three endpoints have had no consumer for two phases. Every one of its tests
-runs against MSW over fixtures the shipped handlers emit, and **none of them asserts a class name**,
+graph browsing P4's three endpoints have had no consumer for two phases. 183 tests across 21 files,
+every one against MSW over fixtures the shipped handlers emit, and **none of them asserts a class name**,
 which is what makes the design safe to change. It has a real visual design, a dark mode driven by
 `prefers-color-scheme`, and citation cards with a copy button for the verification command; the
 design is argued in [`apps/console/README.md`](apps/console/README.md).
