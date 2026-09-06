@@ -76,7 +76,10 @@ type Answer struct {
 // now is a parameter for the same reason NewCitation takes one — this package
 // stays free of the clock.
 func Assemble(r models.Repo, hits []Fused, spans map[string]models.Span, newer Newer, now time.Time, b Budget) Answer {
-	var a Answer
+	// Citations is allocated rather than grown from nil so an answer that cites
+	// nothing serialises as [] and not as null, which is what every other list
+	// this API serves does — including the LLM path's own copy one file over.
+	a := Answer{Citations: make([]Cited, 0, len(hits))}
 	var sb strings.Builder
 	for i, h := range hits {
 		sp, ok := spans[h.SpanID]

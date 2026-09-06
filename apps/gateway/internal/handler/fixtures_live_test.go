@@ -607,15 +607,17 @@ func TestConsoleFixturesMatchTheShippedHandlersLive(t *testing.T) {
 
 	// Class (b). Assemble's "the span did not travel" branch is dead code under
 	// the shipped retriever — spansOf fills its map from the very hits it is
-	// handed (retrieve.go:190-204) — so {"answer":"","citations":null} is a
-	// shape a client must handle and no query can produce.
+	// handed (retrieve.go:190-204) — so an answer that cites nothing is a shape
+	// a client must handle and no query can produce. Citations serialises as []
+	// rather than null since Assemble allocated it; the console holds the null
+	// case against a literal, because no emitted fixture carries one.
 	emptyAssemble := consoleHandler(t, st, st, rag.ModeHybrid, rag.DefaultFloor(), 40)
 	emptyAssemble.Rag = &fakeRetriever{res: rag.Result{
 		Hits:  []rag.Fused{{SpanID: "span-that-did-not-travel", Path: "calc/calc.go", StartLine: 19, Score: 0.016, VectorScore: 0.42, VectorRank: 1, LexicalRank: 1}},
 		Spans: map[string]models.Span{}, TopScore: 0.42, VectorRan: true, Mode: rag.ModeHybrid}}
 	ae := emit(t, "ask-answered-empty.json", http.StatusOK,
 		consolePost(emptyAssemble, "/api/repos/"+main.ID+"/ask", `{"q":"`+consoleQ+`"}`))
-	mustContain(t, "ask-answered-empty.json", ae, `"citations":null`)
+	mustContain(t, "ask-answered-empty.json", ae, `"citations":[]`)
 	mustContain(t, "ask-answered-empty.json", ae, `"answer":""`)
 	mustContain(t, "ask-answered-empty.json", ae, `"refused":false`)
 
