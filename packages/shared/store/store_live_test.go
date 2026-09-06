@@ -497,3 +497,56 @@ func TestTheDatastoreInfoGaugeCarriesTheServersRealVersions(t *testing.T) {
 	}
 	t.Logf("datastore: postgres %s, pgvector %s", pg, vec)
 }
+
+// The migration transaction takes pg_advisory_xact_lock before it reads the
+// ledger, which is what stops several processes applying 0001 to a fresh
+// database at once. The cost is that whoever holds it holds up every other
+// process's boot — both binaries call New before serving anything, and both
+// pass context.Background() — so a migration that wedges wedges the fleet.
+//
+// The lock is held here from a second session, which is what a wedged migrator
+// looks like from the inside of this one.
+func TestMigrateGivesUpRatherThanHoldingUpEveryOtherBootLive(t *testing.T) {
+	ctx := context.Background()
+	holder, err := pgx.Connect(ctx, dsn(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close(ctx)
+	tx, err := holder.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, migrateLockKey); err != nil {
+		t.Fatal(err)
+	}
+
+	restore := migrateTimeout
+	migrateTimeout = 300 * time.Millisecond
+	defer func() { migrateTimeout = restore }()
+
+	// In a goroutine with a deadline of its own, because the mutant here does
+	// not fail — it waits, and a test that waited with it would hang the suite
+	// rather than report anything.
+	done := make(chan error, 1)
+	go func() {
+		s, err := New(ctx, dsn(t))
+		if s != nil {
+			s.Close()
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("New returned successfully while another session held the migration lock")
+		}
+		if !strings.Contains(err.Error(), "migrate") {
+			t.Errorf("New failed with %v, want a migration error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("New has waited 5s for the migration lock; without a deadline it waits for as long " +
+			"as the holder does, and every other process booting against this database waits with it")
+	}
+}

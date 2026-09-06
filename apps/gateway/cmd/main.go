@@ -324,8 +324,24 @@ func scoreFloor() (rag.Floor, error) {
 func newServer(log zerolog.Logger, st storeHandle, r *rag.Retriever, b rag.Budget,
 	loop handler.Answerer, answerDefault string,
 ) *echo.Echo {
-	return newRouter(health.NewReadiness(log, st.Ping).Ready,
+	return newRouter(health.NewReadiness(log, st.Ping, embedderDep(r)).Ready,
 		newHandler(log, jobs.New(st.Pool()), st, r, b, loop, answerDefault))
+}
+
+// embedderDep keeps the boot probe running.
+//
+// newRetriever's own comment argues boot must depend on the embedder because a
+// gateway that starts without a working one can only fail one request at a
+// time — and after boot it did exactly that and nothing noticed: Ollama dies,
+// every /search and /ask 500s because retrieval embeds the question, and /ready
+// answers 200 while the load balancer keeps sending traffic.
+//
+// embed.Probe, not a second check of our own: two definitions of "the embedder
+// works" agree on the day they are written.
+func embedderDep(r *rag.Retriever) health.Dep {
+	return health.Dep{Name: "embedder", Check: func(ctx context.Context) error {
+		return embed.Probe(ctx, r.Emb)
+	}}
 }
 
 // corpus is what the four tools read through: the same Reader the endpoints use

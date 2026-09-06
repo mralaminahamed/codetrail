@@ -21,6 +21,7 @@ import (
 	"github.com/mralaminahamed/codetrail/apps/gateway/internal/handler"
 	"github.com/mralaminahamed/codetrail/packages/shared/admit"
 	"github.com/mralaminahamed/codetrail/packages/shared/agent"
+	"github.com/mralaminahamed/codetrail/packages/shared/embed"
 	"github.com/mralaminahamed/codetrail/packages/shared/jobs"
 	"github.com/mralaminahamed/codetrail/packages/shared/models"
 	"github.com/mralaminahamed/codetrail/packages/shared/rag"
@@ -212,7 +213,8 @@ func TestNewServerAssemblesWhatMainServes(t *testing.T) {
 
 	var logged bytes.Buffer
 	e := newServer(zerolog.New(&logged).Level(zerolog.InfoLevel), deadStore{pool},
-		&rag.Retriever{Store: deadStore{pool}, Mode: rag.ModeHybrid, Fusion: rag.DefaultParams(), Candidates: 40, Floor: rag.DefaultFloor()},
+		&rag.Retriever{Store: deadStore{pool}, Emb: embed.NewFake(store.EmbeddingDim), Mode: rag.ModeHybrid,
+			Fusion: rag.DefaultParams(), Candidates: 40, Floor: rag.DefaultFloor()},
 		rag.DefaultBudget(), nil, "extractive")
 
 	// Readiness has to reflect the dependency, not a constant.
@@ -707,5 +709,61 @@ func TestTheClientTimeoutOutlastsTheLoopDeadline(t *testing.T) {
 	if llmClientTimeout <= b.Deadline {
 		t.Errorf("llmClientTimeout is %v and the loop's deadline is %v: the client would end a call first and report the wrong reason",
 			llmClientTimeout, b.Deadline)
+	}
+}
+
+// liveStore is deadStore with a Postgres that answers, so a readiness failure
+// below can only be the dependency beside it.
+type liveStore struct{ deadStore }
+
+func (liveStore) Ping(context.Context) error { return nil }
+
+// deadEmbedder is what an Ollama that has stopped looks like from here.
+type deadEmbedder struct{}
+
+func (deadEmbedder) Model() string { return "dead" }
+func (deadEmbedder) Dim() int      { return store.EmbeddingDim }
+func (deadEmbedder) Embed(context.Context, []string) ([][]float32, error) {
+	return nil, errors.New("ollama is down")
+}
+
+// /ready is the load balancer's question, and retrieval embeds the QUESTION on
+// every /search and every /ask — so a gateway whose embedder has gone can
+// answer neither, and before this it kept saying 200 while the load balancer
+// kept sending traffic. newRetriever's own comment makes boot depend on the
+// embedder for exactly that reason; after boot nothing did.
+func TestReadinessReflectsTheEmbedderAndNotOnlyPostgres(t *testing.T) {
+	pool, err := pgxpool.New(context.Background(), "postgres://u:p@127.0.0.1:1/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	retriever := func(e embed.Embedder) *rag.Retriever {
+		return &rag.Retriever{Store: deadStore{pool}, Emb: e, Mode: rag.ModeHybrid,
+			Fusion: rag.DefaultParams(), Candidates: 40, Floor: rag.DefaultFloor()}
+	}
+
+	var logged bytes.Buffer
+	down := newServer(zerolog.New(&logged).Level(zerolog.InfoLevel), liveStore{deadStore{pool}},
+		retriever(deadEmbedder{}), rag.DefaultBudget(), nil, "extractive")
+	if rec := serve(down, http.MethodGet, "/ready", ""); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("/ready: want 503 with the embedder down, got %d", rec.Code)
+	}
+	if !strings.Contains(logged.String(), `"dependency":"embedder"`) {
+		t.Errorf("the log does not say which dependency went: %s", logged.String())
+	}
+	// Liveness is not readiness: killing this task would not bring Ollama back,
+	// and a container health check on /ready turns one outage into a rolling
+	// restart of every task.
+	if rec := serve(down, http.MethodGet, "/health", ""); rec.Code != http.StatusOK {
+		t.Errorf("/health: want 200 with the embedder down, got %d", rec.Code)
+	}
+
+	// The other direction, so a readiness that is simply always false fails too.
+	up := newServer(zerolog.Nop(), liveStore{deadStore{pool}},
+		retriever(embed.NewFake(store.EmbeddingDim)), rag.DefaultBudget(), nil, "extractive")
+	if rec := serve(up, http.MethodGet, "/ready", ""); rec.Code != http.StatusOK {
+		t.Errorf("/ready: want 200 with both dependencies answering, got %d", rec.Code)
 	}
 }
