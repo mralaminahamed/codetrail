@@ -130,6 +130,37 @@ func (s *Store) NewerCommit(ctx context.Context, repoID string) (string, time.Ti
 	return commit, at, err
 }
 
+// DeleteEmptyRepo removes a repo row that has no spans and reports whether it
+// did. The cascade takes its files.
+//
+// A job's writes are three transactions — PutRepo, PutSpans, PutGraph — because
+// the corpus write and the graph write are on different budgets (spec §6). A
+// job that fails terminally between the first two therefore commits a
+// repository with nothing retrievable in it: ListRepos lists it, an /ask
+// against it refuses no_spans forever, and because PutRepo winds
+// last_queried_at the dead repo is the MOST recently used row — the last thing
+// Evict will ever take, holding a quota slot indefinitely. Nothing else sweeps
+// a repo with zero spans.
+//
+// Guarded on the span count in SQL rather than trusted from the caller. A repo
+// id is hash(key, commit), so an earlier successful index of the same commit
+// owns the same row, and a later job failing on it must not delete a corpus
+// somebody is querying.
+//
+// No tombstone, deliberately. evicted_repos is what lets a read answer 410
+// instead of 404 (spec §10), and 410 says "this was here and we dropped it" —
+// which a repository that never held a span was not.
+func (s *Store) DeleteEmptyRepo(ctx context.Context, id string) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `
+		DELETE FROM repos r
+		WHERE r.id = $1
+		  AND NOT EXISTS (SELECT 1 FROM spans s WHERE s.repo_id = r.id)`, id)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 // TouchRepo records a query against a repo. This is the LRU clock: eviction
 // reads exactly this column, and PutRepo is the only other thing that winds it.
 //
