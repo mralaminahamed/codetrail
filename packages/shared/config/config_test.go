@@ -49,3 +49,44 @@ func TestGetIntParsesOrRefuses(t *testing.T) {
 		}
 	}
 }
+
+// A list-valued setting is where "empty is unset" fails OPEN, which is why
+// GetList does not have that rule. Measured on ALLOWED_HOSTS, the only SSRF
+// control codetrail has: read through Get, ALLOWED_HOSTS="" handed back
+// ["github.com" "codeberg.org"] and admitted github.com, while ALLOWED_HOSTS=" "
+// produced [" "] and refused it — one space between fail-open and fail-closed.
+//
+// The Get half is asserted alongside, because the contrast IS the property: a
+// GetList that drifted back to Get's rule would otherwise only fail the
+// indexer's test, one package away.
+func TestGetListReadsAClearedSettingAsAnEmptyList(t *testing.T) {
+	def := []string{"github.com", "codeberg.org"}
+	os.Unsetenv("TP_L")
+	if got := GetList("TP_L", def); len(got) != 2 || got[0] != "github.com" {
+		t.Fatalf("unset: %q, want the default", got)
+	}
+	t.Cleanup(func() { os.Unsetenv("TP_L") })
+	// Both spellings of "cleared" answer alike here rather than alike only
+	// because a caller happens to trim.
+	for _, v := range []string{"", " ", "  \t "} {
+		os.Setenv("TP_L", v)
+		if got := GetList("TP_L", def); len(got) != 0 {
+			t.Errorf("TP_L=%q read as %q, want an empty list: clearing a permission grants nothing", v, got)
+		}
+	}
+	// The contrast, on the spelling both readers see: Get hands the default
+	// back, which for a permission means handing the permission back.
+	os.Setenv("TP_L", "")
+	if got := Get("TP_L", "github.com,codeberg.org"); got != "github.com,codeberg.org" {
+		t.Errorf(`Get read TP_L="" as %q; the two readers are supposed to differ here`, got)
+	}
+	os.Setenv("TP_L", "a,b")
+	if got := GetList("TP_L", def); len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Errorf("TP_L=%q read as %q", "a,b", got)
+	}
+	// Unnormalised otherwise: the caller knows whether its entries are hosts.
+	os.Setenv("TP_L", "a, b")
+	if got := GetList("TP_L", def); len(got) != 2 || got[1] != " b" {
+		t.Errorf("TP_L=%q read as %q, want the split left alone", "a, b", got)
+	}
+}
