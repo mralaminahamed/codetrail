@@ -76,19 +76,28 @@ func (l *Loop) Ask(ctx context.Context, repoID, q string, _ rag.Result) agent.An
 		return agent.Answer{Trace: tr}
 	}
 
-	// Checked before the call, not after, for the reason the loop's own input
-	// budget is: a bound checked after the spend is a report.
-	if !l.budget.allow(l.Bounds.MaxInputTokens + l.Bounds.MaxOutputTokens) {
+	// RESERVED before the call, not merely checked: a bound that reads the
+	// total and lets go is a report, whether it is read before the spend or
+	// after it.
+	want := l.Bounds.MaxInputTokens + l.Bounds.MaxOutputTokens
+	if !l.budget.allow(want) {
 		tr.Stop = agent.StopBudgetExhausted
 		return agent.Answer{Trace: tr}
 	}
+	// Settled in a defer so the reservation cannot outlive the request that
+	// made it. A leaked reservation is permanent until the window rolls, which
+	// would turn one panic into an hour of budget_exhausted.
+	used := 0
+	defer func() {
+		l.budget.spend(want, used)
+		metrics.SetLLMBudget(l.budget.remaining())
+	}()
 
 	// The tools are bound to this repository HERE, before the first model call,
 	// from the id the handler took out of the URL path. No tool schema has a
 	// repo field and nothing the model writes reaches this argument.
 	a := agent.Run(ctx, l.Model, agent.NewTools(l.Corpus, repoID, l.Limits), l.Bounds, q)
-	l.budget.spend(a.Trace.Usage.InputTokens + a.Trace.Usage.OutputTokens)
-	metrics.SetLLMBudget(l.budget.remaining())
+	used = a.Trace.Usage.InputTokens + a.Trace.Usage.OutputTokens
 	return a
 }
 
@@ -105,6 +114,9 @@ type budget struct {
 	now   func() time.Time
 	spent []spendAt
 	total int
+	// What in-flight requests may still spend. Not in spent, because it is not
+	// a spend yet and must not age out of the window while its loop is running.
+	reserved int
 }
 
 type spendAt struct {
@@ -121,35 +133,54 @@ func newBudget(limit int, now func() time.Time) *budget {
 	return &budget{limit: limit, now: now}
 }
 
-// allow reports whether a request whose WORST CASE is want tokens may start.
-// The worst case, not the actual spend, because the actual spend is not known
-// until the loop has already paid for it.
+// allow RESERVES want against the limit and reports whether it fitted. The
+// worst case, not the actual spend, because the actual spend is not known until
+// the loop has already paid for it.
+//
+// It reserves rather than reads because a loop runs for up to a minute between
+// the check and the settlement, and every request that starts inside that
+// window would otherwise see a total none of them had added to yet. Measured
+// with LLM_TOKENS_PER_HOUR=13500 — one worst case — and LLM_MAX_CONCURRENT=8:
+// 8 of 8 requests ran and 88,000 tokens were spent, 6.5x the budget. At the
+// shipped defaults the overshoot is a few per cent, but LLM_MAX_CONCURRENT is
+// validated only as positive.
+//
+// Every allow that returns true must be settled by exactly one spend.
 func (b *budget) allow(want int) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.prune()
-	return b.total+want <= b.limit
+	if b.total+b.reserved+want > b.limit {
+		return false
+	}
+	b.reserved += want
+	return true
 }
 
-// spend records what a loop actually used — reported usage where the provider
-// reported it, the estimate where it did not. The Estimated flag travels in the
-// trace so a reader of the gauge can tell which.
-func (b *budget) spend(n int) {
+// spend settles one reservation: the worst case comes off, what the loop
+// actually used goes on — reported usage where the provider reported it, the
+// estimate where it did not. The Estimated flag travels in the trace so a
+// reader of the gauge can tell which.
+func (b *budget) spend(want, actual int) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.prune()
-	b.spent = append(b.spent, spendAt{at: b.now(), n: n})
-	b.total += n
+	b.reserved -= want
+	b.spent = append(b.spent, spendAt{at: b.now(), n: actual})
+	b.total += actual
 }
 
+// remaining is what a new request could still reserve, so it counts the
+// in-flight reservations as gone. A gauge that showed reserved tokens as
+// available would report a ceiling this process will not honour.
 func (b *budget) remaining() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.prune()
-	if b.total >= b.limit {
+	if b.total+b.reserved >= b.limit {
 		return 0
 	}
-	return b.limit - b.total
+	return b.limit - b.total - b.reserved
 }
 
 // prune drops everything outside the window. Caller holds the lock.
