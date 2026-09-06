@@ -3,7 +3,7 @@
   "refused": true,
   "answered_by": "extractive",
   "reason": "below_floor",
-  "detail": "The best match scored under the configured floor of 0.99. That floor is not calibrated; its value is measured in P6.",
+  "detail": "The best match scored under the configured floor of 0.99. That floor is a mechanism, not a measured threshold: no evaluation has chosen this number, so it has filtered nothing.",
   "mode": "hybrid",
   "top_score": 0.559502899646759,
   "floor": {

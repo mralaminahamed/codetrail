@@ -3,7 +3,7 @@
   "refused": false,
   "answered_by": "extractive",
   "answer": "",
-  "citations": null,
+  "citations": [],
   "dropped": 1,
   "mode": "hybrid",
   "top_score": 0.42,

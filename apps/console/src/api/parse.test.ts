@@ -16,10 +16,14 @@ import callers from "./fixtures/callers.json";
 describe("the four normalisations", () => {
   test("an answered response with citations null parses to an empty array", () => {
     // ask-answered.json cannot separate this mutant: it has citations, so
-    // `?? []` never runs. This fixture's citations really are JSON null.
-    expect(askAnsweredEmpty.citations).toBeNull();
+    // `?? []` never runs. The gateway allocates Citations now, so no emitted
+    // fixture carries null and the null case is asserted against a literal
+    // built from one. `?? []` stays: the wire shape is the server's to change,
+    // and a .map on null unmounts the tree.
+    expect(askAnsweredEmpty.citations).toEqual([]);
+    const wire = { ...askAnsweredEmpty, citations: null };
 
-    const out = parseAsk(askAnsweredEmpty);
+    const out = parseAsk(wire);
     expect(out).not.toBeNull();
     if (out === null || out.refused) throw new Error("unreachable");
     // Deep equality on the value, at the parser. Not through a render: a .map

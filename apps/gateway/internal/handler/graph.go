@@ -24,10 +24,15 @@ const (
 	// Direct callers are what "who calls this" usually means. A default of 3
 	// would make the common request expensive for a reason nobody asked for.
 	defaultDepth = 1
-	// Not measured: fan-out in a call graph is multiplicative, and this is a
-	// bound chosen to be obviously finite. P6/P7 can raise it with a corpus in
-	// front of them.
-	maxDepth = 5
+	// Measured, and lowered from 5. Fan-out in a call graph is multiplicative
+	// and the depth bound is the only thing that caps it: EXPLAIN (ANALYZE)
+	// over 20 mutually-calling symbols walks 1,494,559 rows at depth 5 before
+	// LIMIT sees any of them, and 30 symbols at depth 4 exceeds the statement
+	// timeout. At 3 the same graphs answer in 79ms and 1.5s.
+	//
+	// Three is also what agent.DefaultToolLimits gives the model's callers_of,
+	// so the endpoint and the tool now bound the same walk the same way.
+	maxDepth = 3
 )
 
 // symbolView is what a caller may see of a definition. repo_id and file_id are

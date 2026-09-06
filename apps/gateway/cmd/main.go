@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -48,7 +47,7 @@ func newRouter(ready func() bool, h *handler.Handler) *echo.Echo {
 // served by adding it — gitlab.com's group/repo would be accepted and its
 // group/subgroup/repo refused — because Check requires exactly two segments.
 func allowedHosts() []string {
-	return strings.Split(config.Get("ALLOWED_HOSTS", strings.Join(admit.DefaultHosts, ",")), ",")
+	return config.GetList("ALLOWED_HOSTS", admit.DefaultHosts)
 }
 
 // newHandler builds the API handler main serves from. A function so a test can
@@ -104,7 +103,7 @@ func answering(log zerolog.Logger, rd handler.Reader, r *rag.Retriever) (handler
 			Msg("no model provider configured; every answer is extractive and nothing is a degradation")
 		return nil, def, nil
 	}
-	belowFloor, err := boolEnv("LLM_BELOW_FLOOR", "false")
+	belowFloor, err := config.GetBool("LLM_BELOW_FLOOR", false)
 	if err != nil {
 		return nil, "", err
 	}
@@ -139,18 +138,6 @@ func answering(log zerolog.Logger, rd handler.Reader, r *rag.Retriever) (handler
 		Int("worst_case_tokens", b.MaxInputTokens+b.MaxOutputTokens).
 		Msg("answering loop configured; the token budget is per process and is not shared across replicas")
 	return handler.NewLoop(m, corpusOf(rd, r), b, lim, belowFloor, concurrent, perHour, time.Now), def, nil
-}
-
-// boolEnv parses rather than comparing against "true". The house rule, stated
-// three times in this codebase: a knob an operator believes is in force and is
-// not is the shape of bug this project has already shipped.
-func boolEnv(key, def string) (bool, error) {
-	v := config.Get(key, def)
-	b, err := strconv.ParseBool(v)
-	if err != nil {
-		return false, fmt.Errorf("%s must be a boolean, got %q", key, v)
-	}
-	return b, nil
 }
 
 // answerBudget reads what one answer may hold. Both knobs are validated rather
@@ -246,12 +233,19 @@ func newRetriever(ctx context.Context, log zerolog.Logger, st rag.Searcher) (*ra
 	// Both gauges at boot, so a dashboard shows the floor — and that nobody has
 	// measured it — before the first query rather than after it.
 	metrics.SetFloor(floor.Value, floor.Calibrated)
+	// The message follows the gauge rather than asserting one of the two
+	// states: written unconditionally it would go on saying "not calibrated"
+	// into an operator's log the day a measured floor shipped.
+	msg := "retrieval configured; the score floor is a placeholder that no evaluation has chosen"
+	if floor.Calibrated {
+		msg = "retrieval configured; the score floor is a measured value"
+	}
 	log.Info().
 		Str("mode", string(mode)).Int("rrf_k", k).Int("candidates", candidates).
 		Bool("split_identifiers", split).
 		Float64("score_floor", floor.Value).Bool("floor_calibrated", floor.Calibrated).
 		Str("embed_model", emb.Model()).Int("embed_dim", emb.Dim()).
-		Msg("retrieval configured; the score floor is not calibrated, its value is measured in P6")
+		Msg(msg)
 
 	return &rag.Retriever{
 		Store: st, Emb: emb, Mode: mode,
@@ -265,12 +259,7 @@ func newRetriever(ctx context.Context, log zerolog.Logger, st rag.Searcher) (*ra
 // LEXICAL_SPLIT_IDENTIFIERS=yes would otherwise read as false and quietly
 // narrow every lexical query.
 func splitIdentifiers() (bool, error) {
-	v := config.Get("LEXICAL_SPLIT_IDENTIFIERS", "true")
-	b, err := strconv.ParseBool(v)
-	if err != nil {
-		return false, fmt.Errorf("LEXICAL_SPLIT_IDENTIFIERS must be a boolean, got %q", v)
-	}
-	return b, nil
+	return config.GetBool("LEXICAL_SPLIT_IDENTIFIERS", true)
 }
 
 // scoreFloor reads ANSWER_SCORE_FLOOR and refuses what a cosine similarity
