@@ -159,11 +159,22 @@ describe("the four normalisations", () => {
     if (degraded === null || degraded.refused) throw new Error("unreachable");
     expect(degraded.degraded).toEqual({ from: "llm", reason: "rate_limited" });
     expect(degraded.llm?.stop).toBe("rate_limited");
-    // tools serialises as null when the loop made no tool call. arr() is what
-    // turns that into [], and a .map on null throws.
-    expect(askAnsweredDegraded.llm.tools).toBeNull();
     expect(degraded.llm?.tools).toEqual([]);
     expect(degraded.llm?.usage.estimated).toBe(false);
+  });
+
+  test("a null tools list still parses to an empty one", () => {
+    // The gateway serialises tools as [] since NewTrace became its only
+    // constructor, so no fixture carries null any more and this asserts on a
+    // literal rather than on one. arr() stays because a .map on null throws
+    // and unmounts the tree, and the wire shape is the server's to change.
+    const wire = {
+      ...(askAnsweredDegraded as unknown as Record<string, unknown>),
+      llm: { ...askAnsweredDegraded.llm, tools: null },
+    };
+    const out = parseAsk(wire);
+    if (out === null || out.refused) throw new Error("unreachable");
+    expect(out.llm?.tools).toEqual([]);
   });
 
   test("an llm answer parses its trace, tool names and estimated usage", () => {

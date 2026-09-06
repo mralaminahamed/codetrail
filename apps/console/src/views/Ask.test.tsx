@@ -530,11 +530,12 @@ describe("the two fields the console ignored for a phase", () => {
     expect(container.textContent).toContain(refusedDegraded.reason);
   });
 
-  test("a trace with no tool calls survives its null tools list", async () => {
-    // `tools` serialises as null when the loop made no tool call, which a
-    // provider failure on turn one always does — the commonest degradation
-    // there is. A .map on null throws and unmounts the tree.
-    expect(answeredDegraded.llm.tools).toBeNull();
+  test("a trace with no tool calls renders the empty list as none", async () => {
+    // A provider failure on turn one calls no tool, which is the commonest
+    // degradation there is. The gateway serialises that as [] rather than
+    // null; parse.test.ts holds the null case against a literal, because no
+    // fixture carries one any more.
+    expect(answeredDegraded.llm.tools).toEqual([]);
     stub("post", ASK, 200, answeredDegraded);
     const { container } = renderAsk();
     await askQuestion();

@@ -11,7 +11,7 @@
     "steps": 1,
     "tool_calls": 0,
     "stop": "provider_unavailable",
-    "tools": null,
+    "tools": [],
     "usage": {
       "input_tokens": 0,
       "output_tokens": 0,
