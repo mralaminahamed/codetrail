@@ -241,7 +241,7 @@ func liveHandler(t *testing.T, st *store.Store, mode rag.Mode, floor rag.Floor) 
 	return &Handler{
 		Repos: st,
 		Rag: &rag.Retriever{Store: st, Emb: emb, Mode: mode,
-			K: 60, Candidates: 40, Split: true, Floor: floor},
+			Fusion: rag.DefaultParams(), Candidates: 40, Split: true, Floor: floor},
 		Floor: floor, Budget: rag.DefaultBudget(), Now: time.Now,
 	}
 }
@@ -558,7 +558,7 @@ func TestARefusalAnErrorAndAValidationFailureAreThreeOutcomesLive(t *testing.T) 
 	// A narrower embedder than the corpus was written with. rag refuses before
 	// embedding anything, so this is the mismatch and not a pgvector error.
 	h.Rag = &rag.Retriever{Store: st, Emb: embed.NewFake(16), Mode: rag.ModeHybrid,
-		K: 60, Candidates: 40, Split: true, Floor: rag.DefaultFloor()}
+		Fusion: rag.DefaultParams(), Candidates: 40, Split: true, Floor: rag.DefaultFloor()}
 
 	before := counters(t)
 	rec := post(t, h, "/api/repos/"+repo.ID+"/ask", `{"q":"how does the machine push a running total"}`)

@@ -286,6 +286,16 @@ func openArm(ctx context.Context, name, dsn, repoID string, cfg Config) (*opened
 // not a code change.
 func readConfig(ctx context.Context) (Config, error) {
 	var cfg Config
+	// The weights before anything else, because rag.Params's zero value fuses
+	// every span to score 0 — a ranking that is really no ranking, presenting
+	// as a plausible result set rather than as an error. Retriever.validate
+	// refuses it; this is what stops the harness ever building one.
+	//
+	// They are set here and not read from the environment on purpose: P7 ships
+	// no RETRIEVAL_W_* knob. A sweep over weights is a struct copy —
+	// `c := cfg; c.Fusion.WLexical = 0.5` — which is what rag.Retriever's
+	// exported fields are for.
+	cfg.Fusion = rag.DefaultParams()
 	mode, err := rag.ParseMode(config.Get("RETRIEVAL_MODE", string(rag.ModeHybrid)))
 	if err != nil {
 		return cfg, err

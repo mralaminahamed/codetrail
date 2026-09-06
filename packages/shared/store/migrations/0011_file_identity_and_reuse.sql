@@ -1,0 +1,67 @@
+-- NO expand-only exemption marker, deliberately, and the reasoning is worth a
+-- reader's attention because the obvious move is to add one.
+--
+-- P8's make migrations-lint matches DROP COLUMN, DROP TABLE, ALTER COLUMN ...
+-- TYPE, SET NOT NULL and RENAME. It does NOT match DROP CONSTRAINT, so this
+-- file passes untouched — verified: `11 migrations checked, all expand-only or
+-- exempt with a reason`, with 0011 not among the flagged.
+--
+-- That is the right answer rather than a gap to paper over. The linter's own
+-- definition of destructive is "a change the previous image cannot survive: it
+-- either removes something that image still reads, or rejects a write it still
+-- makes." Dropping a UNIQUE constraint does neither — it WIDENS what the table
+-- accepts, and the previous image never read the constraint and never relied on
+-- it firing. Adding DROP CONSTRAINT to that pattern list would make every such
+-- migration a false positive.
+--
+-- And a marker here would be worse than useless: the script takes the FIRST
+-- marker in a file and exempts the whole file, so an unused one left in place
+-- would silently blanket-exempt any genuinely destructive statement a later
+-- hand added below.
+
+-- files.id = FileID(repo_id, path), so files_repo_id_path_key is a SECOND
+-- IDENTITY on exactly the two columns the hash takes. It is dormant while the
+-- two agree — two rows agreeing on (repo_id, path) agree on id, so
+-- ON CONFLICT (id) arbitrates first — and fatal the moment they do not.
+--
+-- That is not hypothetical. 0007 recorded it on repos: f1813be re-keyed
+-- repos.id and shipped no migration, a stale row gave one repository at one
+-- commit two identities, ON CONFLICT (id) missed it, and job e797a006 burned
+-- all three of its attempts on SQLSTATE 23505 because no retry can remove a
+-- stale row. 0007 dropped the repos constraint and wrote the rule down; the
+-- files one was left behind.
+--
+-- The rule the schema now embodies and the design does not state: A TABLE WHOSE
+-- id IS A DETERMINISTIC HASH MUST HAVE THAT HASH AS ITS ONLY UNIQUENESS
+-- CONSTRAINT. Anything else is a second identity, dormant until the hash's
+-- inputs, separator or truncation change.
+--
+-- This changes no behaviour today, which is exactly why the test that comes
+-- with it proves the OTHER constraint is still doing the arbitration.
+ALTER TABLE files DROP CONSTRAINT IF EXISTS files_repo_id_path_key;
+
+-- The embedding-reuse read. Keyed on CONTENT, not on a repository: an embedding
+-- is a pure function of (text, model, dim), and the same declaration in two
+-- repositories embeds identically — so scoping this by repo would help only
+-- where the same repository was already indexed at another commit and would
+-- miss a fork, a vendored copy and a moved file entirely.
+--
+-- Partial on embedding IS NOT NULL because a span with no vector has nothing to
+-- lend, and because the vector arm's own query already filters the same way
+-- (search.go's `WHERE repo_id = $1 AND embedding IS NOT NULL`).
+--
+-- No CONCURRENTLY: migrate() runs the whole ledger in one transaction holding
+-- pg_advisory_xact_lock, and CREATE INDEX CONCURRENTLY cannot run in a
+-- transaction block. 0008, 0009 and 0010 each say the same.
+--
+-- WHAT THAT COSTS, because "safe against a populated database" is not the same
+-- as "cheap against one": CREATE INDEX takes a ShareLock on spans and holds it
+-- until the ledger's single transaction commits, and every process calls
+-- migrate() on startup. So on a corpus of any size the build blocks writes to
+-- spans AND blocks every other booting process behind the advisory lock for its
+-- duration. The build time is measured in P7 Task 10 against a real corpus and
+-- recorded in the README rather than guessed at here; whatever it is, it scales
+-- with the table and this comment is not the place to pretend otherwise.
+CREATE INDEX IF NOT EXISTS spans_reuse_idx
+    ON spans (digest, embed_model, embed_dim)
+    WHERE embedding IS NOT NULL;
