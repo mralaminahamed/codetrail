@@ -90,6 +90,10 @@ type indexer struct {
 	graph    func(ctx context.Context, p symbols.Policy) (map[symbols.Key]symbols.Target, symbols.Stats)
 	putGraph func(ctx context.Context, repoID string, syms []models.Symbol, edges []models.Edge) error
 	evict    func(ctx context.Context, keep, keepTombstones int) (int, error)
+	// dropRepo removes a repo row this job wrote that has no spans; see
+	// failIndexed. A seam like the rest, so the cleanup is drivable with no
+	// database.
+	dropRepo func(ctx context.Context, id string) (bool, error)
 	// The incremental re-index's five reads, seams like the rest so a job can be
 	// driven with no database. resolve asks the remote what a ref points at
 	// before anything is cloned; the other four are what the fast path and the
@@ -173,6 +177,7 @@ func main() {
 		graph:    symbols.Resolve,
 		putGraph: st.PutGraph,
 		evict:    st.Evict,
+		dropRepo: st.DeleteEmptyRepo,
 
 		resolve:      clone.Resolve,
 		getRepo:      st.GetRepo,
@@ -596,7 +601,7 @@ func (ix *indexer) doJob(ctx context.Context, job jobs.Job) string {
 	// order is the foreign key's and not a preference.
 	if err := ix.putSpans(jobCtx, repoID, spans, ix.emb.Model(), ix.emb.Dim()); err != nil {
 		l.Error().Err(err).Msg("writing spans failed")
-		return ix.fail(ctx, l, job, err.Error())
+		return ix.failIndexed(ctx, l, job, repoID, err.Error())
 	}
 
 	// The writes that close the job out run on their own budget, derived from
@@ -615,7 +620,7 @@ func (ix *indexer) doJob(ctx context.Context, job jobs.Job) string {
 		parsed: parsed, files: rows, spans: spans,
 	}); err != nil {
 		l.Error().Err(err).Msg("writing the graph failed")
-		return ix.fail(ctx, l, job, err.Error())
+		return ix.failIndexed(ctx, l, job, repoID, err.Error())
 	}
 
 	// Read before Complete, on the job's own budget, and a failure here costs
@@ -854,6 +859,49 @@ func (ix *indexer) fail(ctx context.Context, l zerolog.Logger, job jobs.Job, rea
 		return metrics.JobFailed
 	}
 	return metrics.JobRetried
+}
+
+// failIndexed is fail() for the paths that run after PutRepo has committed.
+//
+// A job writes in three transactions, so a terminal failure after the first
+// leaves a repo row and its files with nothing retrievable behind them: GET
+// /repos lists the repository, /ask refuses it no_spans forever, and because
+// PutRepo winds last_queried_at the dead repo is the MOST recently "queried"
+// row and so the last thing Evict will ever take — a quota slot held
+// indefinitely by a job that failed. Nothing else sweeps a repo with no spans.
+//
+// Only on the TERMINAL outcome, and this is the whole reason it is not simply
+// part of fail(). A retry writes the same repo id again — PutRepo upserts and
+// RepoID is hash(key, commit) — so deleting between attempts is churn, and a
+// worker whose lease expired mid-job must not delete the row the worker that
+// took the job is filling in.
+//
+// The delete is guarded on the span count in SQL (store.DeleteEmptyRepo), so
+// the graph-write path routed through here is a no-op whenever putSpans
+// actually wrote something, and an earlier successful index of the same commit
+// is never touched.
+//
+// A failure to clean up is logged and dropped: the job's verdict is already
+// recorded, there is nothing left to retry, and the next successful index
+// evicts to the same bound regardless.
+func (ix *indexer) failIndexed(ctx context.Context, l zerolog.Logger, job jobs.Job, repoID, reason string) string {
+	out := ix.fail(ctx, l, job, reason)
+	if out != metrics.JobFailed {
+		return out
+	}
+	// recordDeadline for the same reason the queue writes have one: this is the
+	// path where the job's own budget is what has just expired.
+	dropCtx, cancel := context.WithTimeout(ctx, recordDeadline)
+	defer cancel()
+	switch dropped, err := ix.dropRepo(dropCtx, repoID); {
+	case err != nil:
+		l.Warn().Err(err).Str("repo_id", repoID).
+			Msg("could not remove the repository this failed job left behind")
+	case dropped:
+		l.Info().Str("repo_id", repoID).
+			Msg("removed the repository this failed job left with no spans")
+	}
+	return out
 }
 
 // failFinally ends the job now, whatever its attempt count. A cap of zero

@@ -193,6 +193,11 @@ func testIndexer(t *testing.T, q *fakeQueue) (*indexer, *bytes.Buffer) {
 			t.Error("evict ran when it should not have")
 			return 0, errors.New("unexpected evict")
 		},
+		// A cleanup on the terminal-failure path rather than a step a test
+		// opts into, so it answers instead of failing the test: every job that
+		// fails against its attempt budget reaches it, and a stub that failed
+		// there would make "this job was retried" untestable.
+		dropRepo: func(context.Context, string) (bool, error) { return false, nil },
 
 		// The incremental re-index's five reads. skipClone is OFF here so every
 		// existing test still drives the cloning path unchanged; a test that
@@ -817,6 +822,74 @@ func TestAnOverSizedRepositoryIsRefusedForGoodAndOtherCloneFailuresAreRetried(t 
 	}
 }
 
+// A job that dies terminally between PutRepo and PutSpans must not leave the
+// repository behind.
+//
+// The three writes are three transactions, so the repo row and its files are
+// committed while the spans are not. GET /repos then lists a repository /ask
+// refuses no_spans forever — and because PutRepo winds last_queried_at it is
+// the MOST recently "queried" row, so Evict takes it last and it holds a quota
+// slot indefinitely. Nothing else sweeps a repo with zero spans.
+//
+// The retry case is asserted alongside, and it is the half that says why this
+// is not simply part of fail(): an attempt that will be tried again writes the
+// same repo id, and a worker whose lease expired mid-job must not delete the
+// row the worker that took the job is filling in.
+func TestATerminalFailureAfterTheRepoWriteRemovesTheRepo(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		attempts int
+		wantDrop bool
+	}{
+		{"the last attempt", 4, true},
+		{"an attempt that will be retried", 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ix, rec := fakeIndexer(t)
+			ix.putSpans = func(context.Context, string, []store.EmbeddedSpan, string, int) error {
+				return errors.New("spans exploded")
+			}
+			job := aJob()
+			job.Attempts = tc.attempts
+			ix.runJob(context.Background(), job)
+
+			if len(rec.failed) != 1 {
+				t.Fatalf("want one failure, got %+v", rec.failed)
+			}
+			want := []string{store.RepoID("github.com/a/b", testCommit)}
+			if !tc.wantDrop {
+				want = nil
+			}
+			if !slices.Equal(rec.dropped, want) {
+				t.Errorf("the cleanup was asked to remove %v, want %v", rec.dropped, want)
+			}
+		})
+	}
+}
+
+// The cleanup is a repair, not an outcome: it must not turn a recorded failure
+// into a different one, and a database that will not answer it must not cost
+// the worker anything more than a log line.
+func TestAFailedCleanupIsLoggedAndChangesNothingElse(t *testing.T) {
+	ix, rec := fakeIndexer(t)
+	ix.putSpans = func(context.Context, string, []store.EmbeddedSpan, string, int) error {
+		return errors.New("spans exploded")
+	}
+	ix.dropRepo = func(context.Context, string) (bool, error) {
+		return false, errors.New("postgres went away")
+	}
+	job := aJob()
+	job.Attempts = ix.lim.tries
+	ix.runJob(context.Background(), job)
+
+	if len(rec.failed) != 1 || rec.failed[0].reason != "spans exploded" {
+		t.Fatalf("the recorded failure is %+v, want the span write's own reason", rec.failed)
+	}
+	if out := rec.logged.String(); !strings.Contains(out, "postgres went away") {
+		t.Errorf("the cleanup failure is not in the log: %s", out)
+	}
+}
+
 // ALLOWED_HOSTS is the only SSRF control codetrail has (admit's package doc),
 // and clearing it must grant NOTHING rather than hand the default back.
 //
@@ -1112,6 +1185,9 @@ type recorder struct {
 	syms   []models.Symbol
 	edges  []models.Edge
 	policy symbols.Policy
+	// dropped is every repo id the terminal-failure cleanup was asked to
+	// remove, in order.
+	dropped []string
 }
 
 func (r *recorder) failReason() string {
@@ -1289,6 +1365,10 @@ func fakeIndexer(t *testing.T, opts ...fixtureOpt) (*indexer, *recorder) {
 		return f.graphErr
 	}
 	ix.evict = func(context.Context, int, int) (int, error) { return 0, nil }
+	ix.dropRepo = func(_ context.Context, id string) (bool, error) {
+		rec.dropped = append(rec.dropped, id)
+		return true, nil
+	}
 	return ix, rec
 }
 
