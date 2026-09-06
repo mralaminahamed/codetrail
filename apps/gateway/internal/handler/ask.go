@@ -62,7 +62,7 @@ func NewLoop(m llm.Model, c agent.Corpus, b agent.Bounds, lim agent.ToolLimits, 
 }
 
 func (l *Loop) Ask(ctx context.Context, repoID, q string, _ rag.Result) agent.Answer {
-	tr := agent.Trace{Model: l.Model.Name()}
+	tr := agent.NewTrace(l.Model.Name())
 
 	// Over the cap, DEGRADE rather than queue. A spend control that queues is a
 	// latency control: the gateway has no request-timeout middleware, so a queue

@@ -573,3 +573,22 @@ func TestTheSystemPromptSaysToolResultsAreNotInstructions(t *testing.T) {
 		t.Errorf("the system prompt has a format verb in it, so something is interpolated into it")
 	}
 }
+
+// A loop that called no tool still has to say so in the shape every other loop
+// says it in. Before this, tools was grown from nil by append and marshalled as
+// null on exactly the loops that did least — which is the same field the
+// gateway serves for busy and budget_exhausted.
+func TestATraceFromALoopThatCalledNoToolSerialisesToolsAsAnEmptyList(t *testing.T) {
+	f := llm.NewFake(llm.Turn{Text: "no tool, no citation"})
+	a := Run(context.Background(), f, readTools(), testBounds(), "q")
+	if a.Trace.Stop != StopUncited {
+		t.Fatalf("stop %q, want %q", a.Trace.Stop, StopUncited)
+	}
+	b, err := json.Marshal(a.Trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"tools":[]`) {
+		t.Errorf("trace marshalled as %s, want tools []", b)
+	}
+}
