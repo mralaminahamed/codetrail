@@ -206,14 +206,58 @@ describe("the outcomes a question can end in", () => {
     expect(container.textContent).not.toContain("has never been calibrated");
   });
 
-  test("focus moves to the result region after asking", async () => {
+  // What the region CONTAINED at the instant it received focus.
+  //
+  // The test this replaces asserted document.activeElement afterwards, and
+  // passed under both the broken and the fixed version: focus() was called on
+  // the line after setResult, React 19 batched that update into a promise
+  // continuation, so focus landed on an EMPTY div and the answer was inserted
+  // silently afterwards — and the element focused is the same element either
+  // way. Only the content at the moment of focus tells the two apart.
+  function contentAtFocus(): { read: () => string | null; stop: () => void } {
+    let seen: string | null = null;
+    const on = (e: FocusEvent) => {
+      const el = e.target as HTMLElement;
+      // The result region, not the button the click focused: only the region
+      // carries tabindex="-1".
+      if (seen === null && el.getAttribute?.("tabindex") === "-1") seen = el.textContent ?? "";
+    };
+    document.addEventListener("focusin", on);
+    return { read: () => seen, stop: () => document.removeEventListener("focusin", on) };
+  }
+
+  test("an answered result is IN the region before focus reaches it, and the region has a name", async () => {
+    stub("post", ASK, 200, answered);
+    renderAsk();
+    const watch = contentAtFocus();
+    try {
+      await askQuestion();
+      await screen.findByRole("heading", { name: "Answer" });
+      const region = screen.getByRole("region", { name: "Result" });
+      expect(document.activeElement).toBe(region);
+      // Under the broken version this is "". An unnamed, empty div taking
+      // focus announces nothing, and the answered path had no role="status"
+      // and no role="alert" to announce it afterwards either — so "it worked"
+      // was the one outcome a screen-reader user was never told about.
+      expect(watch.read()).not.toBe("");
+      expect(watch.read()).toContain(answered.answer.slice(0, 30));
+    } finally {
+      watch.stop();
+    }
+  });
+
+  test("a refused result is also in the region before focus reaches it", async () => {
     stub("post", ASK, 200, noSpans);
     renderAsk();
-    await askQuestion();
-    const panel = await screen.findByRole("status", { name: "Answer outcome" });
-    const region = panel.closest("div[tabindex]");
-    expect(region).not.toBeNull();
-    expect(document.activeElement).toBe(region);
+    const watch = contentAtFocus();
+    try {
+      await askQuestion();
+      await screen.findByRole("status", { name: "Answer outcome" });
+      expect(document.activeElement).toBe(screen.getByRole("region", { name: "Result" }));
+      expect(watch.read()).toContain(noSpans.detail);
+    } finally {
+      watch.stop();
+    }
   });
 });
 

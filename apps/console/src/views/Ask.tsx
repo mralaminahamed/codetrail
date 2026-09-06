@@ -42,8 +42,20 @@ export default function Ask() {
     const outcome = of === "ask" ? await ask(repo, q) : await search(repo, q);
     setInFlight(false);
     setResult({ of, outcome } as Result);
-    region.current?.focus();
   }
+
+  // Focus moves in an EFFECT keyed on the result, not on the line after
+  // setResult. React 19 batches a state update made in a promise continuation,
+  // so at the moment run() returned the DOM had not been updated: focus landed
+  // on an empty div and the answer was inserted into it silently afterwards.
+  //
+  // Refused and failed survived that by accident — Refusal is a role="status"
+  // and ErrorPanel is a role="alert", so both announce themselves on insertion.
+  // ANSWERED had neither, which made "it worked" the one outcome a screen
+  // reader did not hear.
+  useEffect(() => {
+    if (result !== null) region.current?.focus();
+  }, [result]);
 
   function onSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
@@ -81,7 +93,10 @@ export default function Ask() {
         </div>
       </form>
 
-      <div ref={region} tabIndex={-1}>
+      {/* A named region, because a div with tabIndex={-1} and no role has no
+          accessible name: focusing it announces nothing at all, which is what
+          made the fix above only half a fix. */}
+      <div ref={region} tabIndex={-1} role="region" aria-label="Result" aria-busy={inFlight}>
         {result?.of === "ask" && result.outcome.kind === "ok" && (
           // The discriminant is `refused`, never whether `answer` is non-empty:
           // an answered response can carry answer: "" (answer.go:83-89), and

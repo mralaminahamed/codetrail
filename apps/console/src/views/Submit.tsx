@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router";
 import { submitRepo } from "../api/client";
 import type { Outcome, Job } from "../api/types";
@@ -32,16 +32,25 @@ export default function Submit() {
     const out = await submitRepo(remote, String(form.get("ref") ?? ""));
     setInFlight(false);
     setOutcome(out);
-    // Focus follows direct submission — the one place in this phase focus moves
-    // without a route change, because the user asked for this. A poll never
-    // does (see hooks/useJob).
-    result.current?.focus();
 
     if (out.kind === "ok") {
       rememberJob({ id: out.value.id, remote: out.value.remote, ref: out.value.ref });
       await navigate(`/jobs/${out.value.id}`);
     }
   }
+
+  // Focus follows direct submission — the one place in this phase focus moves
+  // without a route change, because the user asked for this. A poll never does
+  // (see hooks/useJob). In an effect rather than on the line after setOutcome,
+  // for the reason written out in Ask.tsx: the region was empty and unnamed at
+  // the moment it took focus.
+  //
+  // Not on an accepted submission: that navigates to the job, and focusing a
+  // region on a view about to unmount announces nothing and steals the route
+  // change's own focus move.
+  useEffect(() => {
+    if (outcome !== null && outcome.kind !== "ok") result.current?.focus();
+  }, [outcome]);
 
   return (
     <>
@@ -65,7 +74,13 @@ export default function Submit() {
           Index this repository
         </button>
       </form>
-      <div ref={result} tabIndex={-1}>
+      <div
+        ref={result}
+        tabIndex={-1}
+        role="region"
+        aria-label="Submission result"
+        aria-busy={inFlight}
+      >
         {outcome?.kind === "rejected" && <Rejected rule={outcome.rule} detail={outcome.detail} />}
         {outcome?.kind === "failed" && (
           <ErrorPanel title="codetrail could not accept this submission." detail={outcome.detail} requestId={outcome.requestId} />
