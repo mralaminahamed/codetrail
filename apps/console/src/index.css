@@ -748,7 +748,12 @@ form > * + * {
 
    A search result, a caller list and a definition list are all "a row, then
    its citation". The row is the sentence and the card is the evidence. */
-.rows > li {
+/* A row holds a citation card, and a card is not prose: the 66ch measure that
+   keeps a sentence readable would squeeze a 64-character digest and a
+   two-column tuple into two thirds of the page for no gain. */
+.rows > li,
+.markers > li {
+  max-width: none;
   margin-block: var(--s4);
 }
 
