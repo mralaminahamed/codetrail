@@ -163,6 +163,20 @@ var (
 		Help: "Tokens left in this PROCESS's rolling hourly budget. Not shared across replicas.",
 	})
 
+	// The incremental re-index's two counters. Both live in the INDEXER, which
+	// still has no /metrics endpoint — P3 recorded that gap, P4 widened it by
+	// four instruments and P7 widens it by two more. Recorded again rather than
+	// quietly closed with an exporter nothing scrapes.
+	reuseSpans = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "codetrail_reuse_spans_total",
+		Help: "Spans by how their vector was obtained: reused from an existing row, or embedded.",
+	}, []string{"outcome"})
+
+	cloneSkipped = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "codetrail_clone_skipped_total",
+		Help: "Jobs by what the pre-clone commit resolution decided: skipped, cloned, or unresolved.",
+	}, []string{"outcome"})
+
 	// Version strings as labels, against this package's own rule, and the
 	// exception is argued rather than assumed: a server version is bounded by
 	// the database, produces one series per running deployment, and changes
@@ -215,6 +229,12 @@ var (
 
 	// TokenDirections is llmTokens' whole vocabulary.
 	TokenDirections = []string{"input", "output"}
+
+	// The re-index vocabularies. unresolved is not a failure: it means the ref
+	// did not resolve to exactly one head and the job cloned, which is the
+	// fall-through the fast path is designed around.
+	ReuseOutcomes = []string{"reused", "embedded"}
+	CloneOutcomes = []string{"skipped", "cloned", "unresolved"}
 )
 
 // The label sets are closed, and these are their whole vocabularies — rag's
@@ -260,6 +280,12 @@ func init() {
 	}
 	for _, d := range TokenDirections {
 		llmTokens.WithLabelValues(d)
+	}
+	for _, o := range ReuseOutcomes {
+		reuseSpans.WithLabelValues(o)
+	}
+	for _, o := range CloneOutcomes {
+		cloneSkipped.WithLabelValues(o)
 	}
 	// datastore is deliberately not seeded: its labels are not known until a
 	// connection exists, and a series labelled with an empty version would
@@ -369,6 +395,17 @@ func ObserveLLM(steps, inputTokens, outputTokens int) {
 
 // SetLLMBudget publishes what is left of this process's hourly token budget.
 func SetLLMBudget(remaining int) { llmBudget.Set(float64(remaining)) }
+
+// CountReuse records how n spans got their vectors. Called once per outcome
+// per job, so "reused" and "embedded" always sum to the job's span count.
+func CountReuse(outcome string, n int) {
+	if n > 0 {
+		reuseSpans.WithLabelValues(outcome).Add(float64(n))
+	}
+}
+
+// CountCloneSkipped records what the pre-clone resolution decided for one job.
+func CountCloneSkipped(outcome string) { cloneSkipped.WithLabelValues(outcome).Inc() }
 
 // SetReady records the outcome of a readiness check. A service that never
 // calls it leaves the gauge at zero, which reads as not-ready — so callers set

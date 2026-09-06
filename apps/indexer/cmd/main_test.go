@@ -153,6 +153,12 @@ func testIndexer(t *testing.T, q *fakeQueue) (*indexer, *bytes.Buffer) {
 			typecheck: true,
 			goBin:     "/opt/codetrail-test/go",
 			goProxy:   symbols.ProxyOff,
+			// Off by default here and ON in production, deliberately: every
+			// test written before P7 drives the cloning path, and a fast path
+			// that silently short-circuited them would make those tests assert
+			// nothing. The fast-path tests turn it on explicitly.
+			skipClone: false,
+			reuse:     true,
 		},
 		// The embedder is a dependency, not a step: anything that reaches the
 		// chunker needs one, and spec §9 puts the fake in CI.
@@ -185,6 +191,30 @@ func testIndexer(t *testing.T, q *fakeQueue) (*indexer, *bytes.Buffer) {
 		evict: func(context.Context, int, int) (int, error) {
 			t.Error("evict ran when it should not have")
 			return 0, errors.New("unexpected evict")
+		},
+
+		// The incremental re-index's five reads. skipClone is OFF here so every
+		// existing test still drives the cloning path unchanged; a test that
+		// means to exercise the fast path turns it on and replaces resolve.
+		//
+		// resolve fails the test if it runs, like every other step. The four
+		// store reads answer rather than failing, because they are reads a job
+		// makes on its way past rather than steps a test opts into: reuse is an
+		// optimisation whose absence must not change any other assertion.
+		resolve: func(context.Context, string, string, clone.Limits) (string, error) {
+			t.Error("resolve ran when it should not have")
+			return "", errors.New("unexpected resolve")
+		},
+		getRepo: func(context.Context, string) (models.Repo, error) {
+			return models.Repo{}, store.ErrNotFound
+		},
+		countSpans:   func(context.Context, string) (int, error) { return 0, nil },
+		spanEmbedder: func(context.Context, string) (string, int, error) { return "", 0, store.ErrNotFound },
+		embeddings: func(context.Context, []string, string, int) (map[string][]float32, error) {
+			return map[string][]float32{}, nil
+		},
+		prevBlobs: func(context.Context, string, string) (map[string]string, error) {
+			return map[string]string{}, nil
 		},
 		now: time.Now,
 	}
@@ -313,6 +343,9 @@ func TestLimitsAreWiredToTheCapsTheyName(t *testing.T) {
 	t.Setenv("JOB_SWEEP_MINUTES", "222")
 	t.Setenv("TYPECHECK", "false")
 	t.Setenv("TYPECHECK_GOPROXY", "https://proxy.example")
+	// REINDEX_SKIP_CLONE and REINDEX_REUSE are deliberately left unset: their
+	// defaults are what this test pins. Their parsing is pinned separately by
+	// TestReuseKnobsAreParsedNotCompared.
 	lim, err := limitsFrom()
 	if err != nil {
 		t.Fatal(err)
@@ -333,6 +366,11 @@ func TestLimitsAreWiredToTheCapsTheyName(t *testing.T) {
 		// which is a downgrade rather than a boot failure.
 		goBin:   goToolchain(),
 		goProxy: "https://proxy.example",
+		// Both DEFAULT TO TRUE, and this test does not set either environment
+		// variable — so the values here are the shipped defaults, asserted in
+		// the one place every other cap's default is.
+		skipClone: true,
+		reuse:     true,
 	}
 	if lim != want {
 		t.Fatalf("want %+v, got %+v", want, lim)

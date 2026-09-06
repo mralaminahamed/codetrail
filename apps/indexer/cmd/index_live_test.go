@@ -178,6 +178,13 @@ type liveJob struct {
 	// tweak adjusts the worker itself, for the properties that are about when
 	// a stage runs rather than about what is on disk.
 	tweak func(ix *indexer)
+	// commit is what the clone stub reports. A field so two runs can be two
+	// commits of one repository, which is what the incremental re-index needs
+	// and what testCommit alone cannot express.
+	commit string
+	// remote overrides the derived one, so two runs can be two commits of the
+	// SAME repository rather than of two.
+	remote string
 }
 
 type liveRun struct {
@@ -225,15 +232,24 @@ func indexLive(t *testing.T, st *store.Store, j liveJob) liveRun {
 		t.Fatal(err)
 	}
 	ix.emb = emb
+	commit := j.commit
+	if commit == "" {
+		commit = testCommit
+	}
 	ix.clone = func(_ context.Context, _, _, dir string, _ clone.Limits) (clone.Result, error) {
 		copyFixture(t, dir)
 		if j.prepare != nil {
 			j.prepare(t, dir)
 		}
-		return clone.Result{Dir: dir, Commit: testCommit, Bytes: 1}, nil
+		return clone.Result{Dir: dir, Commit: commit, Bytes: 1}, nil
 	}
 	ix.walk = walk.Files
 	ix.put, ix.putSpans, ix.evict = st.PutRepo, st.PutSpans, st.Evict
+	// The REAL reuse reads, so a live job exercises the same query production
+	// would. testIndexer stubs them to "nothing known", which is right for the
+	// hermetic tests and would make every live reuse assertion vacuous.
+	ix.embeddings, ix.prevBlobs = st.EmbeddingsByDigest, st.PreviousBlobs
+	ix.getRepo, ix.countSpans, ix.spanEmbedder = st.GetRepo, st.CountSpans, st.SpanEmbedder
 	// The real type-checker on the real checkout, and the real write. The
 	// fixture repository is a module whose packages import only the standard
 	// library, so it type-checks with GOPROXY=off and nothing here reaches the
@@ -244,7 +260,10 @@ func indexLive(t *testing.T, st *store.Store, j liveJob) liveRun {
 		j.tweak(ix)
 	}
 
-	remote := "https://github.com/codetrail-live/" + j.name
+	remote := j.remote
+	if remote == "" {
+		remote = "https://github.com/codetrail-live/" + j.name
+	}
 	ix.runJob(ctx, jobs.Job{
 		ID: "live-" + j.name, Remote: remote, Ref: "main",
 		Status: jobs.StatusLeased, Attempts: 1,
@@ -257,7 +276,8 @@ func indexLive(t *testing.T, st *store.Store, j liveJob) liveRun {
 	}
 
 	var repoID string
-	if err := st.Pool().QueryRow(ctx, `SELECT id FROM repos WHERE remote = $1`, remote).Scan(&repoID); err != nil {
+	if err := st.Pool().QueryRow(ctx,
+		`SELECT id FROM repos WHERE remote = $1 ORDER BY indexed_at DESC, id LIMIT 1`, remote).Scan(&repoID); err != nil {
 		t.Fatalf("no repo row for %s: %v", remote, err)
 	}
 	return liveRun{
@@ -1218,4 +1238,212 @@ func edgeIDs(r liveRun) []string {
 	}
 	slices.Sort(out)
 	return out
+}
+
+// ---- the incremental re-index, on a live database --------------------------
+
+// touchOneFile is the two-commit fixture rules 7 and 8 ask for: ONE file
+// changed and one untouched, and the changed one produces a DIFFERENT NUMBER OF
+// SPANS.
+//
+// The span-count change is the load-bearing half. A reuse keyed on position
+// rather than on digest survives a fixture whose span count is stable, because
+// every index still lines up.
+func touchOneFile(t *testing.T, dir string) {
+	t.Helper()
+	p := filepath.Join(dir, "calc", "calc.go")
+	body, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body = append(body, []byte("\n\nfunc AddedInTheSecondCommit(n int) int { return n + 1 }\n")...)
+	if err := os.WriteFile(p, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// key identifies a span by what it is rather than by an id that contains the
+// commit: every row id changes between two commits, so the ids cannot be
+// compared and the content can.
+func spanKey(s spanRow) string {
+	return fmt.Sprintf("%s:%d-%d:%s", s.Path, s.Start, s.End, s.Digest)
+}
+
+func spansByKey(rows []spanRow) map[string]spanRow {
+	out := make(map[string]spanRow, len(rows))
+	for _, s := range rows {
+		out[spanKey(s)] = s
+	}
+	return out
+}
+
+// THE PROPERTY THAT MAKES THE WHOLE THING SAFE: reuse is unobservable in the
+// rows.
+//
+// A repository indexed WITH reuse and one indexed with REINDEX_REUSE=false
+// produce the same span ranges, the same digests and the same embeddings. The
+// counterfactual is what makes this a comparison rather than an assertion about
+// one run, exactly as TYPECHECK=false made P4's edge-count equality possible.
+func TestIncrementalAndFullIndexProduceIdenticalRowsLive(t *testing.T) {
+	st := liveStore(t)
+	const commitA = "1111111111111111111111111111111111111111"
+	const commitB = "2222222222222222222222222222222222222222"
+
+	// Commit A of one repository, embedded from scratch. This is what a later
+	// commit can borrow vectors from.
+	seed := indexLive(t, st, liveJob{
+		name: "reuse-a", strategy: chunk.StrategyAST, commit: commitA,
+		remote: "https://github.com/codetrail-live/reuse-same",
+		tweak:  func(ix *indexer) { ix.lim.reuse = false },
+	})
+	if len(seed.spans) == 0 {
+		t.Fatal("the seed commit produced no spans")
+	}
+
+	// Commit B, one file changed, WITH reuse.
+	withReuse := indexLive(t, st, liveJob{
+		name: "reuse-b", strategy: chunk.StrategyAST, commit: commitB,
+		remote:  "https://github.com/codetrail-live/reuse-same",
+		prepare: touchOneFile,
+		tweak:   func(ix *indexer) { ix.lim.reuse = true },
+	})
+	// The fixture is proved able to discriminate: reuse actually happened, and
+	// not for everything.
+	reused := reusedFromLog(t, withReuse.log)
+	if reused == 0 {
+		t.Fatalf("nothing was reused, so this comparison proves nothing:\n%s", withReuse.log)
+	}
+	if reused == len(withReuse.spans) {
+		t.Fatalf("everything was reused although one file changed: %d of %d", reused, len(withReuse.spans))
+	}
+
+	// The same commit B content in a SEPARATE repository, with reuse off, so
+	// nothing it writes can have been borrowed.
+	full := indexLive(t, st, liveJob{
+		name: "reuse-c", strategy: chunk.StrategyAST, commit: commitB,
+		remote:  "https://github.com/codetrail-live/reuse-other",
+		prepare: touchOneFile,
+		tweak:   func(ix *indexer) { ix.lim.reuse = false },
+	})
+
+	a, b := spansByKey(withReuse.spans), spansByKey(full.spans)
+	if len(a) != len(b) {
+		t.Fatalf("%d spans with reuse and %d without", len(a), len(b))
+	}
+	for k, ra := range a {
+		rb, ok := b[k]
+		if !ok {
+			t.Errorf("span %s exists only in the reused corpus", k)
+			continue
+		}
+		if ra.Digest != rb.Digest {
+			t.Errorf("%s: digest %s with reuse, %s without", k, ra.Digest, rb.Digest)
+		}
+		if ra.Model != rb.Model || ra.Dim != rb.Dim {
+			t.Errorf("%s: %s/%d with reuse, %s/%d without", k, ra.Model, ra.Dim, rb.Model, rb.Dim)
+		}
+		if len(ra.Vec) != len(rb.Vec) {
+			t.Fatalf("%s: %d components with reuse, %d without", k, len(ra.Vec), len(rb.Vec))
+		}
+		for i := range ra.Vec {
+			if ra.Vec[i] != rb.Vec[i] {
+				t.Fatalf("%s: component %d is %v with reuse and %v without", k, i, ra.Vec[i], rb.Vec[i])
+			}
+		}
+	}
+
+	// Fixture rule 8: the changed file really did produce a different number of
+	// spans, so a position-keyed reuse could not have lined up by accident.
+	countA, countB := spansIn(seed.spans, "calc/calc.go"), spansIn(withReuse.spans, "calc/calc.go")
+	if countA == countB {
+		t.Errorf("calc/calc.go produced %d spans in both commits; a position-keyed reuse would survive this fixture", countA)
+	}
+	// And one file really was untouched, so both paths ran in one job.
+	if spansIn(seed.spans, "big.go") != spansIn(withReuse.spans, "big.go") {
+		t.Errorf("big.go changed between the two commits; the fixture no longer exercises the reuse path")
+	}
+}
+
+func spansIn(rows []spanRow, path string) int {
+	n := 0
+	for _, s := range rows {
+		if s.Path == path {
+			n++
+		}
+	}
+	return n
+}
+
+// reusedFromLog reads the job line's reused count.
+func reusedFromLog(t *testing.T, log string) int {
+	t.Helper()
+	const key = `"reused":`
+	i := strings.LastIndex(log, key)
+	if i < 0 {
+		t.Fatalf("the job line reports no reused count:\n%s", log)
+	}
+	rest := log[i+len(key):]
+	j := strings.IndexAny(rest, ",}")
+	if j < 0 {
+		t.Fatalf("unparseable job line:\n%s", log)
+	}
+	n, err := strconv.Atoi(rest[:j])
+	if err != nil {
+		t.Fatalf("unparseable reused count %q: %v", rest[:j], err)
+	}
+	return n
+}
+
+// Re-submitting an already-indexed commit completes without cloning, and the
+// rows it did not write are still exactly the rows that were there.
+func TestReindexingTheSameCommitSkipsTheCloneAndKeepsTheRowsLive(t *testing.T) {
+	st := liveStore(t)
+	const commit = "3333333333333333333333333333333333333333"
+	const remote = "https://github.com/codetrail-live/skip-clone"
+
+	first := indexLive(t, st, liveJob{
+		name: "skip-1", strategy: chunk.StrategyAST, commit: commit, remote: remote,
+	})
+	if len(first.spans) == 0 {
+		t.Fatal("the first index produced no spans")
+	}
+
+	// The second run resolves to the SAME commit, so the fast path should
+	// complete it without touching the checkout at all. clone, walk, put and
+	// putSpans all fail the test if they run.
+	ctx := context.Background()
+	q := &fakeQueue{}
+	ix, logged := testIndexer(t, q)
+	ix.lim.skipClone = true
+	ix.lim.keepRepos = 100
+	ix.emb = embed.NewFake(store.EmbeddingDim)
+	ix.resolve = func(context.Context, string, string, clone.Limits) (string, error) { return commit, nil }
+	ix.getRepo, ix.countSpans, ix.spanEmbedder = st.GetRepo, st.CountSpans, st.SpanEmbedder
+	ix.evict = st.Evict
+	ix.runJob(ctx, jobs.Job{ID: "live-skip-2", Remote: remote, Ref: "main",
+		Status: jobs.StatusLeased, Attempts: 1})
+
+	if len(q.failed) > 0 {
+		t.Fatalf("the re-submission failed: %s", q.failed[0].reason)
+	}
+	if len(q.completed) != 1 {
+		t.Fatalf("the re-submission completed %d jobs, want 1", len(q.completed))
+	}
+	if q.repoIDs[0] != first.repoID {
+		t.Errorf("completed against repo %s, want %s", q.repoIDs[0], first.repoID)
+	}
+	if !strings.Contains(logged.String(), "completing without cloning") {
+		t.Errorf("the skip was not logged:\n%s", logged.String())
+	}
+
+	// The rows are untouched: same spans, same file rows, same file_count.
+	after := readSpans(t, st, first.repoID)
+	if len(after) != len(first.spans) {
+		t.Errorf("%d spans after the re-submission, want %d", len(after), len(first.spans))
+	}
+	afterFiles := readFiles(t, st, first.repoID)
+	if len(afterFiles) != len(first.files) {
+		t.Errorf("%d file rows after the re-submission, want %d: the fast path wrote to repos or files",
+			len(afterFiles), len(first.files))
+	}
 }
