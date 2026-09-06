@@ -4,8 +4,10 @@
 // a checkout: the indexer, and the eval harness, which generates its questions
 // from the same tree the indexer read (spec §9). Go's internal rule makes
 // apps/indexer/internal/walk unimportable from apps/evalrunner, so the choice
-// was this or a second copy of Files, ReadRegular and Indexable — and a second
-// copy is the drift the source-binding check exists to catch. Spec:45-46 lists
+// was this or a second copy of Files, ReadRegular, Lines and Indexable — and a
+// second copy is the drift the source-binding check exists to catch. Lines is
+// named because it WAS the copy: the harness held a correct one while this
+// package counted terminators, so the two disagreed about how long a file is. Spec:45-46 lists
 // packages/shared's contents and does not name walk; neither does it name
 // admit, jobs or testdb, which are already there.
 package walk
