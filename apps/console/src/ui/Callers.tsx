@@ -1,3 +1,4 @@
+import { Link } from "react-router";
 import type { Callers as CallersValue } from "../api/types";
 import Citation from "./Citation";
 import Provenance from "./Provenance";
@@ -19,15 +20,23 @@ export default function Callers({ callers }: { callers: CallersValue }) {
           {callers.callers.map((c) => (
             <li key={`${c.symbol.id}:${c.call.path}:${c.call.line}`}>
               <p>
-                {c.symbol.name} — <Provenance provenance={c.provenance} /> — depth {c.depth} — calls
-                at <code>{`${c.call.path}:${c.call.line}`}</code>
+                {/* A caller row is a definition, and this view is the one place
+                    a reader can walk to it: repo_id and symbol.id are both in
+                    hand and were being rendered as plain text. */}
+                <Link to={`/repos/${callers.repo_id}/symbols/${c.symbol.id}`}>{c.symbol.name}</Link>{" "}
+                — <Provenance provenance={c.provenance} /> — depth {c.depth} — calls at{" "}
+                <code>{`${c.call.path}:${c.call.line}`}</code>
               </p>
               <Citation citation={c.citation} symbol={c.symbol} />
             </li>
           ))}
         </ul>
       </section>
-      <Approximate approximate={callers.approximate} toName={callers.symbol.name} />
+      <Approximate
+        approximate={callers.approximate}
+        toName={callers.symbol.name}
+        repoId={callers.repo_id}
+      />
     </>
   );
 }

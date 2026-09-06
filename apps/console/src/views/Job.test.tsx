@@ -169,4 +169,19 @@ describe("the job view", () => {
     expect(await axe(container)).toHaveNoViolations();
     unmount();
   }, 30_000);
+
+  test("the browser tab tracks the job's phase, because nobody watches the page", async () => {
+    // PageTitle has taken a `title` prop since P5 and no caller passed one:
+    // every view's tab read one static string for its whole life, and this is
+    // the view where that costs the most — indexing takes minutes and the tab
+    // is backgrounded for all of them.
+    stubSequence("get", PATH, [jobPending, jobLeased, jobDone]);
+    renderJob();
+    await advance(0);
+    expect(document.title).toBe("Queued — codetrail");
+    await advance(1_000);
+    expect(document.title).toBe("Indexing — codetrail");
+    await advance(1_000);
+    expect(document.title).toBe("Indexed — codetrail");
+  });
 });

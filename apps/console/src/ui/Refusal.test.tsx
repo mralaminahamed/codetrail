@@ -27,8 +27,13 @@ describe("the floor, in words", () => {
     );
     expect(container.textContent).toContain("has never been calibrated");
     expect(container.textContent).toContain(
-      "It is a mechanism, not a measured threshold — the number is measured in P6.",
+      "it is a mechanism, not a measured threshold. This refusal reports the setting, not a judgement about the question",
     );
+    // The phase identifier is gone from the console's own sentence. "the number
+    // is measured in P6" shipped to users and named a plan they cannot read;
+    // the epistemic content it carried — a setting, not a finding — is in the
+    // clause above, and this asserts BOTH halves so a rewrite cannot drop one.
+    expect(container.textContent).not.toMatch(/\bP6\b/);
     assertNoScale(container);
   });
 

@@ -3,7 +3,7 @@ import { render, screen } from "@testing-library/react";
 import { axe } from "jest-axe";
 import { MemoryRouter, Route, Routes } from "react-router";
 import Corpus from "./Corpus";
-import { stub, stubUnreachable } from "../test/msw";
+import { stub, stubSlow, stubUnreachable } from "../test/msw";
 import repos from "../api/fixtures/repos.json";
 import error500 from "../api/fixtures/error-500.json";
 
@@ -15,6 +15,7 @@ function renderCorpus() {
       <Routes>
         <Route path="/repos" element={<Corpus />} />
         <Route path="/repos/:repo" element={<h1>Ask this repository</h1>} />
+        <Route path="/repos/:repo/symbols" element={<h1>Definitions</h1>} />
       </Routes>
     </MemoryRouter>,
   );
@@ -75,5 +76,28 @@ describe("the corpus listing", () => {
     const { container } = renderCorpus();
     await screen.findAllByRole("listitem");
     expect(await axe(container)).toHaveNoViolations();
+  });
+
+  test("a listing still being read is distinguishable from one that failed", async () => {
+    // Every data view rendered outcome.kind === "ok" and had no null branch, so
+    // a pending page and a failed page were the same page: an h1 and nothing.
+    stubSlow("get", PATH, 200, repos);
+    renderCorpus();
+    expect(screen.getByText("Reading the corpus…")).toBeInTheDocument();
+    await screen.findAllByRole("listitem");
+    expect(screen.queryByText("Reading the corpus…")).toBeNull();
+  });
+
+  test("every row offers the symbol graph as well as the ask page", async () => {
+    stub("get", PATH, 200, repos);
+    renderCorpus();
+    const items = await screen.findAllByRole("listitem");
+    items.forEach((li, i) => {
+      const row = repos.repos[i]!;
+      const links = [...li.querySelectorAll("a")].map((a) => a.getAttribute("href"));
+      // Ask first, definitions second: the order is the order of the two
+      // things a reader does with a repository.
+      expect(links).toEqual([`/repos/${row.id}`, `/repos/${row.id}/symbols`]);
+    });
   });
 });

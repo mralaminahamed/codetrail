@@ -137,4 +137,27 @@ describe("the caller lists", () => {
       unmount();
     }
   });
+
+  test("a caller row links to its own definition, in both lists", () => {
+    // repo_id and symbol.id were both in hand and the name was rendered as
+    // plain text, which made every caller row a dead end: the graph could be
+    // walked one hop and no further.
+    renderCallers();
+    for (const c of callers.callers) {
+      const link = screen.getAllByRole("link", { name: c.symbol.name })[0]!;
+      expect(link).toHaveAttribute("href", `/repos/${callers.repo_id}/symbols/${c.symbol.id}`);
+    }
+    // Only the in-app links: every row also renders a citation whose permalink
+    // is an absolute forge URL, and a bare getAllByRole("link") interleaves the
+    // two.
+    const approximate = within(section("Name-matched callers"))
+      .getAllByRole("link")
+      .filter((a) => a.getAttribute("href")?.startsWith("/repos/"));
+    for (const c of callers.approximate.callers) {
+      expect(approximate.map((a) => a.getAttribute("href"))).toContain(
+        `/repos/${callers.repo_id}/symbols/${c.symbol.id}`,
+      );
+    }
+    expect(approximate.length).toBe(callers.approximate.callers.length);
+  });
 });
