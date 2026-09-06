@@ -419,7 +419,14 @@ func (h *Handler) ask(c echo.Context) error {
 	if tryLoop {
 		a := h.LLM.Ask(ctx, r.ID, q, out)
 		metrics.CountLLMStop(string(a.Trace.Stop))
-		metrics.ObserveLLM(a.Trace.Steps, a.Trace.Usage.InputTokens, a.Trace.Usage.OutputTokens)
+		// Only where a model was actually called. codetrail_llm_steps counts
+		// model calls per loop and its buckets start at 1, so a 0 from busy or
+		// budget_exhausted — both decided before agent.Run is reached — lands
+		// in le="1" and reads as a loop that made one. The stop counter above
+		// is where those two are visible.
+		if a.Trace.Steps > 0 {
+			metrics.ObserveLLM(a.Trace.Steps, a.Trace.Usage.InputTokens, a.Trace.Usage.OutputTokens)
+		}
 		trace = &a.Trace
 		if a.Trace.Stop == agent.StopFinal {
 			newer, err := h.newer(ctx, r.ID)
