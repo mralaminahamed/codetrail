@@ -36,7 +36,7 @@ export default function Span() {
               whole text, so showing part of it under a digest of all of it is a
               citation that lies (answer.go:61-64). */}
           <pre>{outcome.value.span.text}</pre>
-          <Citation citation={outcome.value.citation} />
+          <Citation citation={outcome.value.citation} check="open" />
         </>
       )}
       {outcome && outcome.kind !== "ok" && (
