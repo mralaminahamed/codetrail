@@ -879,12 +879,18 @@ func (ix *indexer) embedAll(ctx context.Context, spans []store.EmbeddedSpan, tod
 			texts = append(texts, spans[i].Text)
 		}
 		vecs, err := ix.emb.Embed(ctx, texts)
+		// Indices into SPANS, not into todo. todo is the reuse pass's leftovers
+		// and exists nowhere else, so after a pass that filled most of the
+		// corpus "spans 0-31" names positions in a list nobody can look up —
+		// misleading exactly when someone is reading it. todo is ascending, so
+		// these two bracket the batch; the batch is not every index between
+		// them, and it does not claim to be.
 		if err != nil {
-			return fmt.Errorf("embedding spans %d-%d: %w", lo, hi-1, err)
+			return fmt.Errorf("embedding spans %d-%d: %w", todo[lo], todo[hi-1], err)
 		}
 		if len(vecs) != len(texts) {
 			return fmt.Errorf("embedding spans %d-%d: %s returned %d vectors for %d texts",
-				lo, hi-1, ix.emb.Model(), len(vecs), len(texts))
+				todo[lo], todo[hi-1], ix.emb.Model(), len(vecs), len(texts))
 		}
 		for i := range vecs {
 			spans[todo[lo+i]].Embedding = vecs[i]

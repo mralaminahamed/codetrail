@@ -1853,6 +1853,54 @@ func TestAShortEmbeddingBatchIsRefusedNamingTheEmbedder(t *testing.T) {
 	}
 }
 
+// The numbers in an embed failure are indices into SPANS, not positions in the
+// filtered list embedAll was handed.
+//
+// todo is what the reuse pass left to do and exists nowhere else, so after a
+// pass that filled most of the corpus "spans 0-1" names positions in a list
+// nobody can look up. Driven directly, because the whole point is a todo that
+// does not start at 0 — which through runJob would need a reuse pass staged to
+// fill exactly the right rows to say the same thing less clearly.
+func TestAnEmbedFailureNamesTheSpansAndNotThePositionsInTheBatch(t *testing.T) {
+	spans := make([]store.EmbeddedSpan, 40)
+	for i := range spans {
+		spans[i].Text = fmt.Sprintf("span %d", i)
+	}
+	// embedBatch is 2 here, so one batch covers todo[0] and todo[1] — spans 36
+	// and 39, which share no digit with 0 and 1.
+	todo := []int{36, 39}
+
+	for _, tc := range []struct {
+		name string
+		emb  embed.Embedder
+	}{
+		{"the embedder failed", brokenEmbedder{}},
+		{"the embedder answered short", shortEmbedder{Embedder: embed.NewFake(store.EmbeddingDim)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q := &fakeQueue{}
+			ix, _ := testIndexer(t, q)
+			ix.emb = tc.emb
+			err := ix.embedAll(context.Background(), spans, todo)
+			if err == nil {
+				t.Fatal("want an error")
+			}
+			if !strings.Contains(err.Error(), "spans 36-39") {
+				t.Errorf("the error says %q, want it to name spans 36-39", err)
+			}
+		})
+	}
+}
+
+// brokenEmbedder is the transport failure: it answers nothing at all.
+type brokenEmbedder struct{ embed.Embedder }
+
+func (brokenEmbedder) Model() string { return "broken" }
+func (brokenEmbedder) Dim() int      { return store.EmbeddingDim }
+func (brokenEmbedder) Embed(context.Context, []string) ([][]float32, error) {
+	return nil, errors.New("the embedder is down")
+}
+
 type shortEmbedder struct{ embed.Embedder }
 
 func (e shortEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
