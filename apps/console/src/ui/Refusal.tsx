@@ -48,7 +48,7 @@ export default function Refusal({
   topScore: number | null;
 }) {
   return (
-    <div role="status" aria-label="Answer outcome">
+    <div className="panel panel-refusal" role="status" aria-label="Answer outcome">
       <h2>No answer — and no error.</h2>
       {/* The server's sentence, one per reason (read.go:386-398). Never a
           single "no answer" string: spec §10 forbids a generic refusal and

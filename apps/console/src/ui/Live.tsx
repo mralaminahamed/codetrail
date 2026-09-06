@@ -10,6 +10,7 @@ import type { ReactNode } from "react";
 export default function Live({ children }: { children: ReactNode }) {
   return (
     <div
+      className="live"
       role="status"
       aria-live="polite"
       aria-atomic="true"

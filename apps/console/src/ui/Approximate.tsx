@@ -36,7 +36,7 @@ export default function Approximate({
       <p>Matched on: {approximate.matched_on}.</p>
       {approximate.truncated && <p>This list was truncated; there are more.</p>}
       {approximate.count === 0 && <p>Nothing in this repository calls a name spelled that way.</p>}
-      <ul>
+      <ul className="rows">
         {approximate.callers.map((c) => (
           <li key={`${c.symbol.id}:${c.call.path}:${c.call.line}`}>
             <p>

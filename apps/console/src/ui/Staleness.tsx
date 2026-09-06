@@ -8,10 +8,11 @@ import type { Staleness as StalenessValue } from "../api/types";
 // nothing checked; the server's claim is about codetrail's own knowledge.
 export default function Staleness({ staleness }: { staleness: StalenessValue }) {
   return (
-    <p>
+    <p className="stale">
       {staleness.state === "superseded" && (
-        // A word, not a colour. Colour alone is not a signal.
-        <span> superseded </span>
+        // A word, not a colour. Colour alone is not a signal: the badge below
+        // is a box drawn around the word, never a box instead of it.
+        <span className="stale-flag">superseded</span>
       )}
       {staleness.note}
     </p>

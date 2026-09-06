@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="codetrail">
+  <!-- Not a copy of assets/icon.svg. That mark has five code lines, a sheen and
+       a drop shadow, all of which are mush at 16px. This keeps the one idea
+       that survives the size: a bracket around two amber lines — a citation is
+       a line range, not a whole file. -->
+  <rect width="64" height="64" rx="14" fill="#1b1f27"/>
+  <g fill="#ffffff" fill-opacity="0.42">
+    <rect x="24" y="14" width="26" height="6" rx="3"/>
+    <rect x="24" y="44" width="18" height="6" rx="3"/>
+  </g>
+  <g fill="#e8a33f">
+    <rect x="24" y="26" width="30" height="6" rx="3"/>
+    <rect x="24" y="35" width="22" height="6" rx="3"/>
+  </g>
+  <path d="M18 24h-3a3 3 0 0 0-3 3v10a3 3 0 0 0 3 3h3"
+    fill="none" stroke="#e8a33f" stroke-width="4.5" stroke-linecap="round"/>
+</svg>

@@ -25,7 +25,7 @@ export default function Corpus() {
       {outcome?.kind === "ok" && (
         <>
           <p>{`${outcome.value.count} repositories, most recently used first.`}</p>
-          <ul>
+          <ul className="rows">
             {/* The server's order, rendered as given and never sorted:
                 ListRepos is ORDER BY last_queried_at DESC, id
                 (packages/shared/store/read.go:36) and that order is the API's

@@ -61,7 +61,7 @@ export default function Submit() {
         {/* Disabled only while the request is in flight. Disabling on a "looks
             invalid" heuristic is the client-side validation this view refuses,
             wearing different clothes. */}
-        <button type="submit" disabled={inFlight}>
+        <button type="submit" data-primary disabled={inFlight}>
           Index this repository
         </button>
       </form>
