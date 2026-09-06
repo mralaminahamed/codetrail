@@ -102,8 +102,10 @@ product does not run at, and every artefact carries the whole curve.
 **The floor is not calibrated.** That needs three repositories and this run
 produced one — see `corpora.md`. A floor read off one library's documentation
 style is the thing the "three, named before the run" discipline exists to
-prevent, so `rag.DefaultFloor` is unchanged and every surface that says the
-number is measured in P6 still says so.
+prevent, so `rag.DefaultFloor` is unchanged. Every shipped sentence about the
+floor now branches on `Floor.Calibrated` rather than asserting a state or
+naming a phase, and `TestNoShippedSurfaceAssertsTheFloorsCalibrationState`
+fails the build if one starts asserting again.
 
 ## Recipe
 
@@ -120,8 +122,9 @@ CHUNK_STRATEGY=window STRIP_DOC_COMMENTS=true DATABASE_URL=<window dsn> ./bin/in
 ```
 
 **Capture each job's log line.** `vanished`, `unstrippable`, `tokenless` and
-`unparsed` are in no table — the indexer has no `/metrics` endpoint — and the
-artefact cannot get them any other way. Paste them into `-ast-counters` and
+`unparsed` are in no table and in no instrument — the indexer's `/metrics`
+endpoint exports the job counters, not these four — and the artefact cannot get
+them any other way. Paste them into `-ast-counters` and
 `-window-counters`. P2 measured `tokenless=3` on `rs/zerolog`'s window arm; a
 corpus can shrink by exactly that much without anyone noticing.
 
