@@ -54,7 +54,7 @@ func FromEnv(ctx context.Context, schemaDim int, checkDim func(int) error, timeo
 			return nil, fmt.Errorf("OLLAMA_URL=%q is not an http:// or https:// address", raw)
 		}
 		o := NewOllama(raw, model, dim, timeout)
-		if err := probe(ctx, o); err != nil {
+		if err := Probe(ctx, o); err != nil {
 			return nil, fmt.Errorf("EMBED_MODEL=%q at OLLAMA_URL=%s: %w", model, raw, err)
 		}
 		return o, nil
@@ -77,10 +77,15 @@ func FromEnv(ctx context.Context, schemaDim int, checkDim func(int) error, timeo
 // A var so a test can shorten it; nothing writes it in production.
 var probeDeadline = 30 * time.Second
 
-// probe embeds one short text and checks the answer's shape. A model that was
+// Probe embeds one short text and checks the answer's shape. A model that was
 // never pulled answers 404 here, where the message can name EMBED_MODEL,
 // rather than on the first job where it names a span.
-func probe(ctx context.Context, e Embedder) error {
+//
+// Exported because the gateway's /ready runs it too: boot proves the embedder
+// once, and a readiness check that proved it a second way would be a second
+// definition of "working", agreeing with this one only on the day it was
+// written.
+func Probe(ctx context.Context, e Embedder) error {
 	ctx, cancel := context.WithTimeout(ctx, probeDeadline)
 	defer cancel()
 	v, err := e.Embed(ctx, []string{"codetrail"})
