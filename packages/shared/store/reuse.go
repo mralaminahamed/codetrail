@@ -106,3 +106,46 @@ func parseVec(s string) ([]float32, error) {
 	}
 	return out, nil
 }
+
+// previousBlobsSQL reads the file blobs of the most recently indexed OTHER
+// commit of the same remote.
+//
+// lower(remote), because the forge decides the display case of an owner and a
+// name and two case-variant submissions are one repository — the same folding
+// the jobs dedupe index applies. Ordered by indexed_at DESC and limited to one
+// repo, so "the previous commit" is a single well-defined row rather than a
+// union of every commit ever indexed.
+const previousBlobsSQL = `
+	SELECT f.path, f.blob
+	FROM files f
+	WHERE f.repo_id = (
+		SELECT r.id FROM repos r
+		WHERE lower(r.remote) = lower($1) AND r.id <> $2
+		ORDER BY r.indexed_at DESC, r.id
+		LIMIT 1
+	)`
+
+// PreviousBlobs is path → git blob hash for the last other commit of this
+// remote, or an empty map when there is no earlier one.
+//
+// It exists for one number: how much of the repository actually changed. That
+// is what tells an operator whether embedding reuse is working, and it is the
+// only job files.blob has — content.go promised the column would be read by
+// P7's incremental re-index, and this is the narrower way that promise is kept.
+// The blob is git's own object name, so a file is unchanged iff its blob is.
+func (s *Store) PreviousBlobs(ctx context.Context, remote, exceptRepoID string) (map[string]string, error) {
+	rows, err := s.pool.Query(ctx, previousBlobsSQL, remote, exceptRepoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var path, blob string
+		if err := rows.Scan(&path, &blob); err != nil {
+			return nil, err
+		}
+		out[path] = blob
+	}
+	return out, rows.Err()
+}
