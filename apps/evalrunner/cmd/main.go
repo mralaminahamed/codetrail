@@ -286,16 +286,26 @@ func openArm(ctx context.Context, name, dsn, repoID string, cfg Config) (*opened
 // not a code change.
 func readConfig(ctx context.Context) (Config, error) {
 	var cfg Config
+	// The weights before anything else, because rag.Params's zero value fuses
+	// every span to score 0 — a ranking that is really no ranking, presenting
+	// as a plausible result set rather than as an error. Retriever.validate
+	// refuses it; this is what stops the harness ever building one.
+	//
+	// They are set here and not read from the environment on purpose: P7 ships
+	// no RETRIEVAL_W_* knob. A sweep over weights is a struct copy —
+	// `c := cfg; c.Fusion.WLexical = 0.5` — which is what rag.Retriever's
+	// exported fields are for.
+	cfg.Fusion = rag.DefaultParams()
 	mode, err := rag.ParseMode(config.Get("RETRIEVAL_MODE", string(rag.ModeHybrid)))
 	if err != nil {
 		return cfg, err
 	}
 	cfg.Mode = mode
-	if cfg.K, err = config.GetInt("RETRIEVAL_RRF_K", 60); err != nil {
+	if cfg.Fusion.K, err = config.GetInt("RETRIEVAL_RRF_K", 60); err != nil {
 		return cfg, err
 	}
-	if cfg.K < 0 {
-		return cfg, fmt.Errorf("RETRIEVAL_RRF_K must not be negative, got %d", cfg.K)
+	if cfg.Fusion.K < 0 {
+		return cfg, fmt.Errorf("RETRIEVAL_RRF_K must not be negative, got %d", cfg.Fusion.K)
 	}
 	if cfg.Candidates, err = config.GetInt("RETRIEVAL_CANDIDATES", 40); err != nil {
 		return cfg, err
@@ -342,7 +352,7 @@ func readConfig(ctx context.Context) (Config, error) {
 func newRetriever(_ context.Context, s *store.Store, cfg Config) (*rag.Retriever, error) {
 	return &rag.Retriever{
 		Store: s, Emb: cfg.Emb, Mode: cfg.Mode,
-		K: cfg.K, Candidates: cfg.Candidates, Split: cfg.Split, Floor: cfg.Floor,
+		Fusion: cfg.Fusion, Candidates: cfg.Candidates, Split: cfg.Split, Floor: cfg.Floor,
 	}, nil
 }
 

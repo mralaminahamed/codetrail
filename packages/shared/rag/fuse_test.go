@@ -40,7 +40,7 @@ func eq(t *testing.T, got, want []string) {
 // k=60: A=1/61+1/62=0.0325224, C=1/63+1/61=0.0322664, B=1/62=0.0161290,
 // E=1/63=0.0158730, D=1/64=0.0156250.
 func TestFuseIsReciprocalRankOverBothArms(t *testing.T) {
-	got := Fuse(60, hits("A", "B", "C", "D"), hits("C", "A", "E"))
+	got := Fuse(DefaultParams(), hits("A", "B", "C", "D"), hits("C", "A", "E"))
 	eq(t, ids(got), []string{"A", "C", "B", "E", "D"})
 	if got[0].VectorRank != 1 || got[0].LexicalRank != 2 {
 		t.Fatalf("A has ranks v=%d l=%d, want v=1 l=2", got[0].VectorRank, got[0].LexicalRank)
@@ -67,10 +67,10 @@ func TestKChangesTheOrderWhereItShould(t *testing.T) {
 	}
 	lex[19] = Hit{SpanID: "X", Path: "X.go"}
 
-	if got := ids(Fuse(60, vec, lex))[0]; got != "Y" {
+	if got := ids(Fuse(DefaultParams(), vec, lex))[0]; got != "Y" {
 		t.Fatalf("k=60 ranked %q first, want Y", got)
 	}
-	if got := ids(Fuse(0, vec, lex))[0]; got != "X" {
+	if got := ids(Fuse(Params{K: 0, WVector: 1, WLexical: 1}, vec, lex))[0]; got != "X" {
 		t.Fatalf("k=0 ranked %q first, want X", got)
 	}
 }
@@ -83,7 +83,7 @@ func TestTiesBreakOnPathAndLineNotOnWalkOrder(t *testing.T) {
 	p := Hit{SpanID: "aaa", Path: "a.go", StartLine: 10}
 	q := Hit{SpanID: "bbb", Path: "a.go", StartLine: 5}
 	for i := 0; i < 50; i++ {
-		got := ids(Fuse(60, []Hit{p, q}, []Hit{q, p}))
+		got := ids(Fuse(DefaultParams(), []Hit{p, q}, []Hit{q, p}))
 		eq(t, got, []string{"bbb", "aaa"})
 	}
 }
@@ -92,8 +92,8 @@ func TestTiesBreakOnPathAndLineNotOnWalkOrder(t *testing.T) {
 // over a single list is a monotone function of rank, so anything that reorders
 // it is a bug in the sum rather than a policy.
 func TestSingleArmFusionPreservesThatArmsOrder(t *testing.T) {
-	eq(t, ids(Fuse(60, hits("A", "B", "C"), nil)), []string{"A", "B", "C"})
-	eq(t, ids(Fuse(60, nil, hits("C", "B", "A"))), []string{"C", "B", "A"})
+	eq(t, ids(Fuse(DefaultParams(), hits("A", "B", "C"), nil)), []string{"A", "B", "C"})
+	eq(t, ids(Fuse(DefaultParams(), nil, hits("C", "B", "A"))), []string{"C", "B", "A"})
 }
 
 // A span one arm never returned contributes nothing from that arm. Scoring it
@@ -118,7 +118,7 @@ func TestAbsentFromAnArmContributesNothing(t *testing.T) {
 		{SpanID: "zulu3", Path: "b.go"},
 		{SpanID: "mike4", Path: "c.go"},
 	}
-	eq(t, ids(Fuse(60, vector, lexical)), []string{"nine", "delta", "alpha", "zulu3", "mike4"})
+	eq(t, ids(Fuse(DefaultParams(), vector, lexical)), []string{"nine", "delta", "alpha", "zulu3", "mike4"})
 }
 
 // The claim the floor design rests on: a fused score says nothing about
@@ -128,7 +128,7 @@ func TestAbsentFromAnArmContributesNothing(t *testing.T) {
 func TestFusedScoreCarriesNoQualitySignal(t *testing.T) {
 	good := []Hit{{SpanID: "A", Path: "a.go", Score: 0.99}, {SpanID: "B", Path: "b.go", Score: 0.98}}
 	junk := []Hit{{SpanID: "A", Path: "a.go", Score: 0.01}, {SpanID: "B", Path: "b.go", Score: 0.002}}
-	g, j := Fuse(60, good, nil), Fuse(60, junk, nil)
+	g, j := Fuse(DefaultParams(), good, nil), Fuse(DefaultParams(), junk, nil)
 	if g[0].Score != j[0].Score {
 		t.Fatalf("a good arm fused to %v and a worthless one to %v", g[0].Score, j[0].Score)
 	}

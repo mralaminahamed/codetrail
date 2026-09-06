@@ -128,6 +128,55 @@ var (
 		Help: "Repository rows removed by LRU eviction.",
 	})
 
+	// A NEW COUNTER rather than a new label on codetrail_answer_total. Adding
+	// an answerer label there would change every series P3's tests assert as
+	// whole delta vectors and every query an operator has already written.
+	answerBy = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "codetrail_answer_by_total",
+		Help: "Answers by what produced the prose: extractive or llm. Never what was attempted.",
+	}, []string{"answerer"})
+
+	llmStops = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "codetrail_llm_stop_total",
+		Help: "Bounded-loop outcomes by stop reason. final is the only one that is not a degradation.",
+	}, []string{"reason"})
+
+	// Linear, not exponential: the ceiling is single digits and the question is
+	// "did it stop at 2 or at 6", which a bucket per step answers and a
+	// doubling one does not.
+	llmSteps = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "codetrail_llm_steps",
+		Help:    "Model calls per bounded loop, whatever the outcome.",
+		Buckets: prometheus.LinearBuckets(1, 1, 12),
+	})
+
+	llmTokens = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "codetrail_llm_tokens_total",
+		Help: "Tokens spent by the loop, by direction. Provider-reported where the provider reports them, estimated at four characters a token where it does not.",
+	}, []string{"direction"})
+
+	// A gauge, because it is a level rather than a rate: what is left of this
+	// process's hourly budget. PER PROCESS — with n replicas the real ceiling
+	// is n times this.
+	llmBudget = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "codetrail_llm_budget_remaining",
+		Help: "Tokens left in this PROCESS's rolling hourly budget. Not shared across replicas.",
+	})
+
+	// The incremental re-index's two counters. Both live in the INDEXER, which
+	// still has no /metrics endpoint — P3 recorded that gap, P4 widened it by
+	// four instruments and P7 widens it by two more. Recorded again rather than
+	// quietly closed with an exporter nothing scrapes.
+	reuseSpans = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "codetrail_reuse_spans_total",
+		Help: "Spans by how their vector was obtained: reused from an existing row, or embedded.",
+	}, []string{"outcome"})
+
+	cloneSkipped = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "codetrail_clone_skipped_total",
+		Help: "Jobs by what the pre-clone commit resolution decided: skipped, cloned, or unresolved.",
+	}, []string{"outcome"})
+
 	// Version strings as labels, against this package's own rule, and the
 	// exception is argued rather than assumed: a server version is bounded by
 	// the database, produces one series per running deployment, and changes
@@ -162,6 +211,30 @@ var (
 	// that test compare admit against itself.
 	JobOutcomes    = []string{JobDone, JobRetried, JobFailed}
 	AdmissionRules = []string{"form", "scheme", "host"}
+
+	// Answerers is the closed set answered_by may take, and LLMStopReasons the
+	// closed set of loop outcomes. Written out rather than imported from
+	// packages/shared/agent, because agent imports rag and rag imports this
+	// package — the same reason AdmissionRules is written out rather than
+	// imported from admit. A handler test pins these against agent.Stops, so
+	// the two lists cannot drift without something failing.
+	Answerers = []string{"extractive", "llm"}
+
+	LLMStopReasons = []string{
+		"final", "step_limit", "tool_call_limit", "token_budget", "deadline",
+		"malformed_tool_call", "tool_error", "repeated_tool_call", "uncited",
+		"busy", "budget_exhausted",
+		"rate_limited", "unauthorized", "provider_unavailable", "malformed_response",
+	}
+
+	// TokenDirections is llmTokens' whole vocabulary.
+	TokenDirections = []string{"input", "output"}
+
+	// The re-index vocabularies. unresolved is not a failure: it means the ref
+	// did not resolve to exactly one head and the job cloned, which is the
+	// fall-through the fast path is designed around.
+	ReuseOutcomes = []string{"reused", "embedded"}
+	CloneOutcomes = []string{"skipped", "cloned", "unresolved"}
 )
 
 // The label sets are closed, and these are their whole vocabularies — rag's
@@ -198,6 +271,21 @@ func init() {
 	}
 	for _, rule := range AdmissionRules {
 		admissionRejections.WithLabelValues(rule)
+	}
+	for _, a := range Answerers {
+		answerBy.WithLabelValues(a)
+	}
+	for _, r := range LLMStopReasons {
+		llmStops.WithLabelValues(r)
+	}
+	for _, d := range TokenDirections {
+		llmTokens.WithLabelValues(d)
+	}
+	for _, o := range ReuseOutcomes {
+		reuseSpans.WithLabelValues(o)
+	}
+	for _, o := range CloneOutcomes {
+		cloneSkipped.WithLabelValues(o)
 	}
 	// datastore is deliberately not seeded: its labels are not known until a
 	// connection exists, and a series labelled with an empty version would
@@ -287,6 +375,37 @@ func CountEvicted(n int) { evictions.Add(float64(n)) }
 func SetDatastoreInfo(postgres, pgvector string) {
 	datastore.WithLabelValues(postgres, pgvector).Set(1)
 }
+
+// CountAnswerBy records what wrote the prose the caller is reading — never
+// what was attempted. A degraded request counts as extractive here and as
+// answered on codetrail_answer_total, because the caller got an answer.
+func CountAnswerBy(answerer string) { answerBy.WithLabelValues(answerer).Inc() }
+
+// CountLLMStop records why one bounded loop ended, once per loop that ran.
+func CountLLMStop(reason string) { llmStops.WithLabelValues(reason).Inc() }
+
+// ObserveLLM records one loop's work: how many model calls it made and what it
+// spent. Called for every loop, including one that degraded — a degradation
+// that cost four steps and 9,000 tokens is spend an operator has to see.
+func ObserveLLM(steps, inputTokens, outputTokens int) {
+	llmSteps.Observe(float64(steps))
+	llmTokens.WithLabelValues("input").Add(float64(inputTokens))
+	llmTokens.WithLabelValues("output").Add(float64(outputTokens))
+}
+
+// SetLLMBudget publishes what is left of this process's hourly token budget.
+func SetLLMBudget(remaining int) { llmBudget.Set(float64(remaining)) }
+
+// CountReuse records how n spans got their vectors. Called once per outcome
+// per job, so "reused" and "embedded" always sum to the job's span count.
+func CountReuse(outcome string, n int) {
+	if n > 0 {
+		reuseSpans.WithLabelValues(outcome).Add(float64(n))
+	}
+}
+
+// CountCloneSkipped records what the pre-clone resolution decided for one job.
+func CountCloneSkipped(outcome string) { cloneSkipped.WithLabelValues(outcome).Inc() }
 
 // SetReady records the outcome of a readiness check. A service that never
 // calls it leaves the gauge at zero, which reads as not-ready — so callers set

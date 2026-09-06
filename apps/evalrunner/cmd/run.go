@@ -46,8 +46,11 @@ type ArmStats struct {
 // whatever the environment says: raising it improves the numbers by asking the
 // ANN index for more work, and the headline has to describe the product.
 type Config struct {
-	Mode       rag.Mode
-	K          int
+	Mode rag.Mode
+	// Fusion carries the rank discount and the per-arm weights. One field, one
+	// spelling: P7 replaced Retriever.K with Retriever.Fusion.K rather than
+	// leaving two names for one number.
+	Fusion     rag.Params
 	Candidates int
 	Split      bool
 	Emb        embed.Embedder

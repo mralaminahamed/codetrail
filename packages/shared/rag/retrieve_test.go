@@ -111,7 +111,7 @@ func retriever(t *testing.T, mode Mode) (*Retriever, *fakeSearcher, *countingEmb
 		model:   emb.Model(),
 		dim:     fixtureDim,
 	}
-	return &Retriever{Store: st, Emb: emb, Mode: mode, K: 60, Candidates: 40, Split: true}, st, emb
+	return &Retriever{Store: st, Emb: emb, Mode: mode, Fusion: DefaultParams(), Candidates: 40, Split: true}, st, emb
 }
 
 func ranked(r Result) []string {
@@ -369,7 +369,7 @@ func TestSearchRefusesAConfigurationFuseCannotSurvive(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r, _, _ := retriever(t, ModeHybrid)
-			r.K, r.Candidates = tc.k, tc.cand
+			r.Fusion.K, r.Candidates = tc.k, tc.cand
 			if _, err := r.Search(context.Background(), "repo-1", "q", tc.l); err == nil {
 				t.Fatal("accepted")
 			}

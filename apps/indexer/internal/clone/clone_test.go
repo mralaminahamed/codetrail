@@ -609,3 +609,314 @@ func TestDirSizeCountsRegularFilesOnly(t *testing.T) {
 		t.Fatalf("want 15 bytes of regular files, got %d", got)
 	}
 }
+
+// ---- Resolve --------------------------------------------------------------
+
+// twoBranches builds a repository carrying BOTH refs/heads/main and
+// refs/heads/a/main, at different commits.
+//
+// This is the whole point of the fixture. `git ls-remote --heads <url> main` is
+// a TAIL match, so it returns both, and a/main sorts FIRST — a Resolve that
+// read line one would return the wrong commit. A single-branch fixture matches
+// once and looks correct forever.
+func twoBranches(t *testing.T) (url, mainSHA, aMainSHA string) {
+	t.Helper()
+	dir := t.TempDir()
+	run := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.com",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.com")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	run("init", "-q", "-b", "main", ".")
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "-A")
+	run("commit", "-qm", "one")
+	mainSHA = run("rev-parse", "HEAD")
+
+	run("checkout", "-q", "-b", "a/main")
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("two"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "-A")
+	run("commit", "-qm", "two")
+	aMainSHA = run("rev-parse", "HEAD")
+	run("checkout", "-q", "main")
+
+	if mainSHA == aMainSHA {
+		t.Fatal("the two branches are at one commit; this fixture cannot separate them")
+	}
+	return "file://" + dir, mainSHA, aMainSHA
+}
+
+func TestResolveReturnsFortyLowercaseHexJustAsRevParseDoes(t *testing.T) {
+	url, want, _ := twoBranches(t)
+	got, err := Resolve(context.Background(), url, "main", Limits{MaxBytes: 1 << 20, Deadline: 30 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Errorf("Resolve = %q, want %q", got, want)
+	}
+	// The normalisation clone.head produces, asserted rather than assumed:
+	// RepoID hashes this string with a 0x00 after every part, so "abc\n", "abc"
+	// and "ABC" are three repositories.
+	if len(got) != 40 || got != strings.ToLower(got) || strings.TrimSpace(got) != got {
+		t.Errorf("Resolve returned %q, want 40 lowercase hex with no whitespace", got)
+	}
+}
+
+// The measured trap: a/main sorts first and a first-line read returns it.
+func TestResolveMatchesTheRefExactlyAndNotByTail(t *testing.T) {
+	url, mainSHA, aMainSHA := twoBranches(t)
+	lim := Limits{MaxBytes: 1 << 20, Deadline: 30 * time.Second}
+
+	// The fixture is proved able to trap: ls-remote really does return both,
+	// with a/main first.
+	out, err := exec.Command("git", "ls-remote", "--heads", "--", url, "main").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("ls-remote returned %d rows, want 2: this fixture cannot trap a tail match\n%s", len(lines), out)
+	}
+	if !strings.Contains(lines[0], "refs/heads/a/main") {
+		t.Fatalf("a/main does not sort first here, so a first-line read would be right by accident:\n%s", out)
+	}
+
+	got, err := Resolve(context.Background(), url, "main", lim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == aMainSHA {
+		t.Errorf("Resolve(\"main\") = %s (refs/heads/a/main), want %s", got, mainSHA)
+	}
+	if got != mainSHA {
+		t.Errorf("Resolve = %q, want %q", got, mainSHA)
+	}
+	// And the other branch resolves to its own commit, so the match is exact in
+	// both directions rather than merely preferring the shorter name.
+	got, err = Resolve(context.Background(), url, "a/main", lim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != aMainSHA {
+		t.Errorf("Resolve(\"a/main\") = %q, want %q", got, aMainSHA)
+	}
+}
+
+func TestResolveRefusesWhenTheRefMatchesNoneOrMany(t *testing.T) {
+	url, _, _ := twoBranches(t)
+	lim := Limits{MaxBytes: 1 << 20, Deadline: 30 * time.Second}
+	for _, ref := range []string{
+		// Exists only as a/main. ls-remote returns it and exits 0, so there is
+		// no error to notice — which is why the count is what refuses.
+		"nosuchbranch",
+		"a",
+		// A tag would need a peeled ^{} row too; exactly-one stays crisp.
+		"v1.0.0",
+	} {
+		t.Run(ref, func(t *testing.T) {
+			got, err := Resolve(context.Background(), url, ref, lim)
+			if err == nil {
+				t.Fatalf("Resolve(%q) = %q, want a refusal", ref, got)
+			}
+			if !errors.Is(err, ErrAmbiguousRef) {
+				t.Errorf("Resolve(%q) = %v, want ErrAmbiguousRef", ref, err)
+			}
+		})
+	}
+}
+
+func TestResolveReadsTheDefaultBranchForHead(t *testing.T) {
+	url, mainSHA, _ := twoBranches(t)
+	lim := Limits{MaxBytes: 1 << 20, Deadline: 30 * time.Second}
+	for _, ref := range []string{"", "HEAD"} {
+		got, err := Resolve(context.Background(), url, ref, lim)
+		if err != nil {
+			t.Fatalf("Resolve(%q): %v", ref, err)
+		}
+		if got != mainSHA {
+			t.Errorf("Resolve(%q) = %q, want the default branch %q", ref, got, mainSHA)
+		}
+	}
+}
+
+// The environment neutering, on the SAME helper Run uses. A fake git first on
+// the child's PATH records what it was handed, and a control invocation proves
+// the recorder fires — so a missing variable is a finding rather than an
+// absence.
+func TestResolveRunsUnderTheSameGitEnvironmentAsClone(t *testing.T) {
+	bin := t.TempDir()
+	out := filepath.Join(t.TempDir(), "env.txt")
+	script := "#!/bin/sh\nenv > " + out + "\nexit 7\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	if _, err := Resolve(context.Background(), "https://example.com/a/b", "main",
+		Limits{MaxBytes: 1 << 20, Deadline: 30 * time.Second}); err == nil {
+		t.Fatal("the fake git succeeded; this test measures nothing")
+	}
+	raw, err := os.ReadFile(out)
+	if err != nil {
+		// The control: the recorder has to have fired, or every assertion below
+		// would pass against an empty file.
+		t.Fatalf("the fake git never wrote its environment: %v", err)
+	}
+	env := string(raw)
+	for _, want := range []string{
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_ASKPASS=/bin/false",
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL=/dev/null",
+	} {
+		if !strings.Contains(env, want) {
+			t.Errorf("the child's environment has no %s:\n%s", want, env)
+		}
+	}
+	// The parent environment is INHERITED and only those five are closed. That
+	// is the right call for git and P4 records why it is the wrong call for go;
+	// asserted here so extracting gitCmd cannot have narrowed it.
+	if !strings.Contains(env, "PATH=") {
+		t.Errorf("the child inherited no PATH, so the environment is no longer append(os.Environ(), …)")
+	}
+}
+
+// spec §6's rule: one deadline for the whole job. Resolve derives none of its
+// own, so the CALLER's context is what ends it.
+//
+// Called DIRECTLY with a short context. A test that drove it through runJob
+// would be measuring jobCtx, and a mutation adding a fresh WithTimeout of the
+// same duration would be a semantic no-op — the void kill clone.Run's own
+// nested deadline already is under the indexer's caller.
+func TestResolveRunsOnTheCallersBudget(t *testing.T) {
+	bin := t.TempDir()
+	script := "#!/bin/sh\nsleep 5\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	// A Limits deadline an order of magnitude longer than the caller's, so
+	// whichever ends the call is unambiguous.
+	_, err := Resolve(ctx, "https://example.com/a/b", "main",
+		Limits{MaxBytes: 1 << 20, Deadline: 30 * time.Second})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("the blocking git succeeded")
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("returned after %v, want the caller's ~500ms deadline", elapsed.Round(10*time.Millisecond))
+	}
+}
+
+// The other half, and without it the mutation is VOID.
+//
+// "Resolve derives its own WithTimeout(ctx, lim.Deadline)" is a SEMANTIC NO-OP
+// whenever lim.Deadline is longer than the caller's remaining budget — which is
+// the indexer's actual configuration, since jobCtx is built with exactly
+// lim.clone.Deadline. Measured: with a 30s Limits deadline under a 500ms
+// caller, the mutant passes the test above unchanged.
+//
+// So this pins the inverse: under an UNBOUNDED parent, lim.Deadline must NOT
+// end the call. A Resolve that imposed it would return at 300ms here.
+func TestResolveDoesNotImposeItsOwnDeadline(t *testing.T) {
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\nsleep 1\nexit 9\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	start := time.Now()
+	_, err := Resolve(context.Background(), "https://example.com/a/b", "main",
+		Limits{MaxBytes: 1 << 20, Deadline: 300 * time.Millisecond})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("the fake git succeeded")
+	}
+	if elapsed < 900*time.Millisecond {
+		t.Errorf("returned after %v: lim.Deadline ended the call, but spec §6 says the job's one deadline does",
+			elapsed.Round(10*time.Millisecond))
+	}
+}
+
+func TestResolveRefusesAZeroDeadline(t *testing.T) {
+	if _, err := Resolve(context.Background(), "https://example.com/a/b", "main", Limits{}); err == nil {
+		t.Error("a zero Deadline was accepted")
+	}
+}
+
+// The exactly-one rule, against output no real remote emits.
+//
+// "many" is unreachable through a live fixture: with a byte-exact ref match it
+// needs two rows carrying identical names, and git does not produce those. That
+// makes `len(found) != 1` a guard a mutation could weaken to `== 0` with every
+// live test still passing — measured, it survived — so it is tested here on
+// synthetic bytes instead.
+func TestPickHeadRefusesZeroOrManyAndMatchesExactly(t *testing.T) {
+	const a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	for name, tc := range map[string]struct {
+		out  string
+		want string
+		sha  string
+		err  bool
+	}{
+		"exactly one": {
+			out:  a + "\trefs/heads/a/main\n" + b + "\trefs/heads/main\n",
+			want: "refs/heads/main", sha: b,
+		},
+		"the tail match is not taken": {
+			out:  a + "\trefs/heads/a/main\n",
+			want: "refs/heads/main", err: true,
+		},
+		"many": {
+			out:  a + "\trefs/heads/main\n" + b + "\trefs/heads/main\n",
+			want: "refs/heads/main", err: true,
+		},
+		"none": {out: "", want: "refs/heads/main", err: true},
+		"the symref line is skipped": {
+			out:  "ref: refs/heads/main\tHEAD\n" + b + "\tHEAD\n",
+			want: "HEAD", sha: b,
+		},
+		"a short sha is refused": {
+			out:  "abc\trefs/heads/main\n",
+			want: "refs/heads/main", err: true,
+		},
+		"an uppercase sha is refused": {
+			out:  strings.ToUpper(a) + "\trefs/heads/main\n",
+			want: "refs/heads/main", err: true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := pickHead([]byte(tc.out), tc.want)
+			if tc.err {
+				if err == nil {
+					t.Fatalf("pickHead = %q, want a refusal", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("pickHead: %v", err)
+			}
+			if got != tc.sha {
+				t.Errorf("pickHead = %q, want %q", got, tc.sha)
+			}
+		})
+	}
+}
