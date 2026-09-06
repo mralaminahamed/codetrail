@@ -1,5 +1,8 @@
 # Twelve rules in four categories, and each category is tested for the property
-# that defines it.
+# that defines it. Five of the twelve are state rules; the four below with a
+# no-traffic case are the ones proved to fire on an idle system, and
+# ScoreFloorUncalibrated is the fifth — it needs its gauge scraped, so its case
+# supplies a series and proves the service scope instead.
 #
 # For the six rules that carry a minimum-traffic conjunct, each gets two cases:
 # a series at *exactly* the conjunct's sample size, with the numerator ratio
@@ -130,7 +133,7 @@ tests:
               instance: gw:8080
             exp_annotations:
               summary: "the answer score floor is not calibrated"
-              description: "codetrail_score_floor is -1 and nothing this project measured produced it. Expected while P6 is unlanded; afterwards it means the deployment is not serving the calibrated value."
+              description: "codetrail_score_floor is -1 and nothing this project measured produced it. No calibrated floor exists yet — the eval declined to calibrate on one corpus — so this is expected and should be silenced, not chased. Once codetrail_score_floor_calibrated reads 1 anywhere, a deployment still reading 0 is serving the wrong value."
 
   # ---------------------------------------------------------------- count ---
   # One rule, and it is deliberately NOT given a no-traffic case. It reads like
