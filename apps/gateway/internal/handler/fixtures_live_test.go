@@ -157,6 +157,18 @@ func consoleIndex(t *testing.T, st *store.Store, remote, ref, commit string, str
 // computed *from*. Normalising either out of the fixture afterwards would let
 // the staleness sentence drift without this guard noticing, which is the one
 // drift it exists to catch.
+// pinEveryOtherRepo pushes every repository except the named ones out of the
+// way, so this file's listing fixture cannot be reordered by another test's
+// rows.
+func pinEveryOtherRepo(t *testing.T, st *store.Store, at time.Time, keep ...string) {
+	t.Helper()
+	if _, err := st.Pool().Exec(context.Background(),
+		`UPDATE repos SET indexed_at = $1, last_queried_at = $1 WHERE NOT (id = ANY($2))`,
+		at, keep); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func pinRepoClock(t *testing.T, st *store.Store, repoID string, indexedAt, lastUsedAt time.Time) {
 	t.Helper()
 	if _, err := st.Pool().Exec(context.Background(),
@@ -621,6 +633,15 @@ func TestConsoleFixturesMatchTheShippedHandlersLive(t *testing.T) {
 	pinRepoClock(t, st, moved.ID, consoleNow.Add(-30*day), consoleNow.Add(-30*day))
 	pinRepoClock(t, st, newer.ID, consoleNow.Add(-2*day), consoleNow.Add(-2*day))
 	pinRepoClock(t, st, evicted.ID, consoleNow.Add(-99*day), consoleNow.Add(-99*day))
+	// And every repository this emitter did NOT create, pushed far into the
+	// past. GET /api/repos lists the whole database ordered by last_queried_at,
+	// so any other live test in this package that indexes a fixture and asks a
+	// question puts its repository at the top of this listing — and the failure
+	// appears only when the two run together, which is the worst kind. The
+	// listing's order is a property of this fixture or it is a property of the
+	// test order.
+	pinEveryOtherRepo(t, st, consoleNow.Add(-999*day),
+		gl.ID, main.ID, cb.ID, empty.ID, moved.ID, newer.ID, evicted.ID)
 	rp := emit(t, "repos.json", http.StatusOK, consoleGet(hybrid, "/api/repos?limit=3"))
 	assertReposOrder(t, rp, glRemote, ghRemote, cbRemote)
 
@@ -631,8 +652,26 @@ func TestConsoleFixturesMatchTheShippedHandlersLive(t *testing.T) {
 		consoleGet(hybrid, "/api/jobs/0123456789abcdef0123456789abcdef"))
 
 	// 410, not 404: it existed, and that is a different fact (spec §10).
-	if n, err := st.Evict(ctx, 6, 10); err != nil || n != 1 {
+	//
+	// The keep is COMPUTED from the live row count rather than written as 6.
+	// This emitter shares a database with every other live test in the package,
+	// so a literal keep evicts however many rows those tests happened to leave
+	// — measured: 5 instead of 1, and only when they run together.
+	//
+	// The other repositories are pinned NEWER than evicted.ID first, so the one
+	// row this step means to remove is the least recently used and the eviction
+	// is a statement about this fixture rather than about test order.
+	pinEveryOtherRepo(t, st, consoleNow,
+		gl.ID, main.ID, cb.ID, empty.ID, moved.ID, newer.ID, evicted.ID)
+	var repoRows int
+	if err := st.Pool().QueryRow(ctx, `SELECT count(*) FROM repos`).Scan(&repoRows); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := st.Evict(ctx, repoRows-1, 10); err != nil || n != 1 {
 		t.Fatalf("evict: %d rows, err %v", n, err)
+	}
+	if _, err := st.GetRepo(ctx, evicted.ID); err == nil {
+		t.Fatal("the eviction removed some other repository")
 	}
 	emit(t, "error-410-repo.json", http.StatusGone, consoleGet(hybrid, "/api/repos/"+evicted.ID))
 
