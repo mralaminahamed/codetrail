@@ -351,6 +351,25 @@ func TestAToolNotFoundIsDataForTheModelAndNotAStop(t *testing.T) {
 	if ids := a.ReadIDs(); len(ids) != 1 || ids[0] != "elsewhere" {
 		t.Errorf("Read = %v, want [elsewhere]: a not-found opens nothing", ids)
 	}
+	// The model is TOLD it was a not-found. Result.NotFound is what sets
+	// ToolResult.IsError, and the provider wire format carries it — without it
+	// the model reads an error body as an ordinary answer. Found by the
+	// whole-branch sweep: dropping the field survived everything.
+	reqs := f.Requests()
+	if len(reqs) < 2 {
+		t.Fatalf("recorded %d requests", len(reqs))
+	}
+	var sawError bool
+	for _, m := range reqs[len(reqs)-1].Messages {
+		for _, r := range m.Results {
+			if r.IsError {
+				sawError = true
+			}
+		}
+	}
+	if !sawError {
+		t.Errorf("no tool result was marked IsError, so the model cannot tell a miss from an answer")
+	}
 }
 
 func TestAToolStoreErrorStopsTheLoopRatherThanLettingItRetry(t *testing.T) {

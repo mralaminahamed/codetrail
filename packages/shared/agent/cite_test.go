@@ -62,6 +62,23 @@ func TestAMarkerForASpanTheLoopNeverReadIsStrippedAndCounted(t *testing.T) {
 	if text == "real [1] and invented [9]" {
 		t.Errorf("answer still contains %q although citations_dropped is %d", "[9]", dropped)
 	}
+
+	// NOTHING IS RENUMBERED. Stripping [9] leaves [2] meaning read[1], because
+	// markers are positional and read is what they index.
+	//
+	// The surviving marker here is deliberately NOT the first one: with a text
+	// whose only survivor is [1], renumbering produces [1] as well and the
+	// mutation is invisible — measured, it survived the whole branch.
+	text2, order2, dropped2 := Resolve("invented [9] then real [2]", spans("read-a", "read-b"))
+	if !strings.Contains(text2, "[2]") {
+		t.Errorf("Resolve renumbered the surviving marker: %q", text2)
+	}
+	if strings.Contains(text2, "[1]") {
+		t.Errorf("Resolve introduced a marker the model did not write: %q", text2)
+	}
+	if !reflect.DeepEqual(order2, []int{1}) || dropped2 != 1 {
+		t.Errorf("Resolve = (%q, %v, %d), want the second span cited once", text2, order2, dropped2)
+	}
 }
 
 func TestAMarkerOfZeroIsNotASpan(t *testing.T) {
