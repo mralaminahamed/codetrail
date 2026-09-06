@@ -45,6 +45,15 @@ Four apps, matching the sibling repositories' layout.
 `packages/shared` holds `config`, `logger`, `health`, `metrics`, `models`, `store`, `chunk`,
 `embed`, `rag`, `symbols`.
 
+> **Superseded since.** That list is ten and the tree holds sixteen. The six the design did not
+> foresee are `admit` (P1, the admission policy, shared because the indexer re-checks what the
+> gateway admitted), `jobs` (P1, the queue), `walk` (P1, moved out of `apps/indexer/internal/walk`
+> in P6 when the eval runner needed it), `testdb` (the throwaway-database harness every live suite
+> uses, added mid-P2 after two suites were measured emptying the developer's own database),
+> `llm` and `agent` (P7, the provider client and the bounded loop). None of them
+> contradicts §2's split; the list was a snapshot, not a closed set, and P6's plan read it as closed
+> and had to argue its way out.
+
 **Why gateway and indexer are separate processes.** The indexer is the only thing that handles
 untrusted input, forks a subprocess, needs disk, and reaches the network. Splitting it makes the
 sandbox a *deployment boundary* rather than a code convention, and the two have opposite resource
@@ -95,6 +104,24 @@ No orphan sweep, no second system to disagree about what exists.
 dimension. `store.CheckDim` refuses an embedder of another width rather than letting two vector
 spaces share a table, where they would rank nonsense confidently and nothing about the query would
 look wrong.
+
+### Superseded since
+
+Two things this section names are no longer in the schema. Recorded here rather than edited out of
+the table above, so a reader can see what the design asked for and what implementation did with it.
+
+- **`repos.status` is gone**, dropped by migration `0006`. Nothing ever wrote or read it: a column
+  whose only value is its default is a claim the schema makes and the code does not keep. It is
+  also the fixture the expand-only migration rule was written against — from P8 forward a
+  destructive migration ships one release *after* the code that stopped using the thing it drops,
+  because `migrate()` runs at boot inside the new task while the old one is still serving.
+- **`UNIQUE (remote, commit_sha)` is gone**, dropped by migration `0007`, and `remote` is no longer
+  part of a repository's identity. `RepoID` became `hash(admit.Remote.Key, commit_sha)` — a key that
+  folds case — so `remote` now holds the first submitter's spelling for display only, and two rows
+  agreeing on both columns already agree on `id`, which `ON CONFLICT (id)` arbitrates. The
+  constraint could only fire when that hash function changed under the table, which is exactly what
+  happened: job `e797a006` burned all three attempts on SQLSTATE 23505 because retrying never
+  removes a stale row.
 
 ---
 
@@ -214,6 +241,17 @@ pgvector cosine over spans, filtered by repo, fused by reciprocal rank with a le
 symbol names and identifiers. Both arms are measurable, so fusion-versus-vector-only is a second
 experiment the eval settles rather than an assertion.
 
+> **Superseded since.** Those two sentences contradict each other and the second one won. The first
+> reads as a *definition* of retrieval; the second, and §14, make fusion an open question to be
+> decided with evidence. A mechanism cannot be both the definition and the experiment. The
+> experiment ran in P7 on `google/uuid` at `2d3c2a9`, 74 mechanically generated cases: the AST arm's
+> MRR was **vector 0.7492, hybrid 0.4023, lexical 0.1637**, a gap of 0.347 against a pre-registered
+> threshold of 0.104. **Fusion lost**, and `RETRIEVAL_MODE` therefore defaults to `vector`. All
+> three modes still ship and the per-arm ranks still travel with every hit, so this is a default
+> that moved on evidence rather than a mechanism that was deleted. `rag/rag.go` names it as a
+> deviation from these three lines. One corpus, one question distribution — the limits are in the
+> README's Retrieval section, and they are not small.
+
 ### Citations
 
 `(repo, commit, path, startLine, endLine, digest)`, rendered as a forge permalink
@@ -250,6 +288,21 @@ distribution, the same way triagepilot's was, and recorded with the numbers that
 
 CI runs the harness on a deterministic fake embedder to prove the mechanics still work end to end,
 and **the figures that run prints are not quality** — the same banner triagepilot carries.
+
+> **Superseded since — the yield.** "Hundreds of cases for free" was an estimate and it was
+> optimistic for a small library. The one published run yielded **74** on `google/uuid` at
+> `2d3c2a9`: 23 files, 203 declarations, of which 98 carry no doc comment and 11 are unexported.
+> `rs/zerolog` would have yielded 514 and `sirupsen/logrus` 191, so the estimate holds for a corpus
+> and not for a repository — but the harness runs per repository, which is the number that matters.
+>
+> **Deferred, not met — the calibration.** The floor "is calibrated from the resulting distribution"
+> is this spec's own requirement and it is **knowingly unmet**. P6 built the harness, generated the
+> golden set, published the distribution, and then *declined* to read a threshold off it, because a
+> floor calibrated on one repository is a floor calibrated on one library's documentation style.
+> Three corpora were named before the run and two were refused by the leakage probe
+> (`docs/eval/corpora.md` accounts for all three). The requirement stands; it is deferred, and
+> `rag.DefaultFloor` is still `{-1, false}` — a value that refuses nothing on score alone, so no
+> answer is being filtered by a number nobody measured.
 
 ---
 
@@ -306,22 +359,59 @@ unconfigured) deliberately carry none.
 Nine phases, not the eight estimated before this design existed — the ingestion subsystem and its
 sandbox were not in that estimate.
 
+> **Superseded since.** P3's row says **measured floor** and P3 did not measure one. It could not:
+> §14 below puts the value in P6, so what P3 delivered was the *mechanism* — the refusal path, the
+> `ANSWER_SCORE_FLOOR` knob, the two gauges and the top-score histogram a calibration would read.
+> P6 then declined to calibrate, so the row is still unmet by a phase later than the one that was
+> supposed to close it. The rest of the table is delivered: all nine phases are merged.
+
 ---
 
 ## 14. Open questions
 
 None blocking P0–P2. Deferred deliberately, to be decided with evidence rather than now:
 
-- **The score floor's value.** Measured in P6; picking it earlier would be guessing.
-- **Whether lexical fusion helps, and by how much.** An experiment in P6/P7, not an assumption.
-- **The second language.** Not before Go is measured.
-- **How much job history to keep.** The `jobs` table is unbounded: only active jobs dedupe, so
-  every re-submission of a finished repository appends a row. A retention rule has to say what a
-  caller may still poll for, which is the P3 read endpoints' question — so it is decided there, not
-  guessed at in P1.
+- **The score floor's value.** **Still open, and it is the one that matters.** P6 was where this was
+  to be measured; P6 produced the distribution and declined to read a threshold off a single
+  library's documentation style, which is the discipline the "three corpora, named before the run"
+  rule exists for and not a task anyone skipped. Two of the three named corpora were refused by the
+  leakage probe. What ships is `{-1, false}`: a value that refuses nothing on score alone, published
+  on two gauges and in every answer's payload, so nobody can mistake it for a measurement. Picking
+  it now would still be guessing, and it would be guessing with more machinery in front of it.
+- **The second language.** **Still open, and its precondition has now been cleared rather than its
+  question answered.** "Not before Go is measured" — Go has been measured: 74 generated cases on
+  `google/uuid`, both chunking arms, three retrieval modes, with `rs/zerolog`'s and
+  `sirupsen/logrus`'s corpora built and characterised beside it. Nothing has decided which language
+  comes next or what it would cost, and the gate should be restated as what it always meant: not
+  before there is a **Go quality baseline worth regressing against**, which one corpus is not.
 
 ### Decided since
 
+- **Whether lexical fusion helps, and by how much.** Settled in P7, against a rule written down
+  before the data: **it does not help**, on this evidence. `google/uuid` at `2d3c2a9`, 74
+  mechanically generated cases, live `nomic-embed-text`, `k = 60`, 40 candidates per arm, only
+  `RETRIEVAL_MODE` differing between runs. On the AST arm, MRR was **vector 0.7492, hybrid 0.4023,
+  lexical 0.1637**. The primary endpoint was MRR and the threshold was `max(2σ, δ)` with `δ = 0.02`
+  pre-registered and σ the bootstrap standard error of the difference over 1,000 resamples of the
+  74 questions; σ came out at 0.052, so the threshold was 0.104 and the observed gap was **−0.347**,
+  3.3× it in the losing direction. The window arm agrees in direction by a narrower margin. So
+  `RETRIEVAL_MODE` defaults to `vector`, which is a deviation from §8 and is recorded there.
+  **What this does not settle:** one corpus, one small single-package library, and a question
+  distribution that is doc-comment prose — close to the best case for embeddings and close to the
+  worst for a lexical arm, containing no identifier-lookup question at all. The honest claim is
+  that fusion does not help *on doc-comment prose queries, on this corpus, at these settings*.
+  The mechanism, the per-arm weights and the per-arm ranks all still ship, which is what makes the
+  comparison re-runnable against a second golden set.
+- **How much job history to keep.** Settled in P3, as §14 said it would be — by **age, not by
+  count, and never on re-enqueue**: `JOB_HISTORY_HOURS` (168, a week) is how long a terminal job
+  stays pollable and `JOB_SWEEP_MINUTES` (60) is how often that is enforced, with the sweep
+  restricted to `status IN ('done','failed')` as a safety property rather than a filter — a pending
+  or leased row *is* the lease. The two rejected rules are why: dropping a repository's terminal
+  jobs when it is submitted again `404`s a job id a caller still holds, at a moment chosen by an
+  unrelated stranger; "keep the newest N" does the same thing under a flood, to jobs that are
+  minutes old and still being polled. An age window is the only one of the three that can be
+  *stated to a caller*. What it does not bound is a flood inside the window; that control is a rate
+  limit on submission, which does not exist.
 - **Which forges the default allowlist contains.** Settled in P1: `github.com` and
   `codeberg.org`, not `gitlab.com`. Both of the first two serve exactly `/owner/name`
   (Codeberg has run Forgejo, the 2022 Gitea fork, since 2023), which is the shape the
