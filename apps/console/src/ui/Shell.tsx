@@ -18,13 +18,17 @@ export default function Shell() {
       <a className="skip" href="#main">
         Skip to content
       </a>
-      <header>
-        <Link to="/">codetrail</Link>
-      </header>
-      <nav aria-label="Corpus">
-        <NavLink to="/">Home</NavLink>
-        <NavLink to="/repos">Corpus</NavLink>
-      </nav>
+      {/* One row, brand then nav. The screenshot this replaces read "HomeCorpus"
+          — two links with no border, no colour and no gap between them. */}
+      <div className="bar">
+        <header>
+          <Link to="/">codetrail</Link>
+        </header>
+        <nav aria-label="Corpus">
+          <NavLink to="/">Home</NavLink>
+          <NavLink to="/repos">Corpus</NavLink>
+        </nav>
+      </div>
       <main id="main" tabIndex={-1}>
         <Outlet />
       </main>

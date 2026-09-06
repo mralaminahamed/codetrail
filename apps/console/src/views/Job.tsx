@@ -27,17 +27,43 @@ function announcement(phase: Phase, job: JobValue | null): string {
   }
 }
 
+// The browser tab, which is where a job is actually watched: a repository takes
+// minutes to index and nobody sits on the page for it. PageTitle has taken a
+// `title` prop since P5 and no caller ever passed one, so every view's tab read
+// the same string for its whole life.
+//
+// Deliberately NOT the live region's sentence. That one is a pure function of
+// status with no counter in it because a screen reader re-reads the region on
+// every change; a tab title is not announced and can be shorter.
+function tabName(phase: Phase, job: JobValue | null): string {
+  switch (phase) {
+    case "done":
+      return "Indexed";
+    case "failed":
+      return "Indexing failed";
+    case "missing":
+      return "Unknown job";
+    case "ceiling":
+      return "Still indexing";
+    case "unreachable":
+    case "error":
+      return "Indexing job";
+    case "polling":
+      return job?.status === "leased" ? "Indexing" : "Queued";
+  }
+}
+
 export default function Job() {
   const { id = "" } = useParams();
   const { job, phase, detail, requestId, checkNow } = useJob(id);
 
   return (
     <>
-      <PageTitle>Indexing job</PageTitle>
+      <PageTitle title={tabName(phase, job)}>Indexing job</PageTitle>
       <Live>{announcement(phase, job)}</Live>
 
       {job !== null && (
-        <dl>
+        <dl className="tuple">
           <dt>Repository</dt>
           <dd>{job.remote}</dd>
           <dt>Ref</dt>
@@ -70,7 +96,7 @@ export default function Job() {
             Still indexing after 30 minutes. codetrail has stopped checking automatically; a
             repository this large is possible, and so is an indexer that is not running.
           </p>
-          <button type="button" onClick={checkNow}>
+          <button type="button" data-primary onClick={checkNow}>
             Check again
           </button>
         </>

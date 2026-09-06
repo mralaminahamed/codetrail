@@ -16,7 +16,7 @@ export default function ErrorPanel({
   requestId: string | null;
 }) {
   return (
-    <div role="alert">
+    <div className="panel panel-error" role="alert">
       <h2>{title}</h2>
       <p>{detail}</p>
       {requestId === null ? (

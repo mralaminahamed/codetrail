@@ -25,7 +25,7 @@ export default function Answer({ answer }: { answer: Answered }) {
         <p>{`${answer.dropped} more ranked spans did not fit the answer's budget.`}</p>
       )}
 
-      <ol>
+      <ol className="markers">
         {answer.citations.map((c) => (
           <li key={c.span_id}>
             <p>
