@@ -41,6 +41,13 @@ import (
 // rank identically — PutRepo sets indexed_at to now() on the same writes — but
 // could not use repos_lru_idx and would make this ordering an expression.
 //
+// The id is a TIEBREAK, not decoration, and it matches the tombstone trim
+// below. now() is transaction time, so a batch of repositories written together
+// shares last_queried_at to the microsecond, and ordering on that column alone
+// is a partial order: which of a tied group falls beyond OFFSET is then the
+// planner's choice. Two indexers evicting at once can each choose a different
+// row at the boundary and delete both, leaving keep-1.
+//
 // A negative keep is rejected by Postgres ("OFFSET must not be negative")
 // rather than clamped here, so a caller that computes one gets an error
 // instead of an emptied corpus.
@@ -49,7 +56,7 @@ func (s *Store) Evict(ctx context.Context, keep, keepTombstones int) (int, error
 		WITH gone AS (
 			DELETE FROM repos WHERE id IN (
 				SELECT id FROM repos
-				ORDER BY last_queried_at DESC
+				ORDER BY last_queried_at DESC, id DESC
 				OFFSET $1
 			)
 			RETURNING id, remote, ref, commit_sha, indexed_at
