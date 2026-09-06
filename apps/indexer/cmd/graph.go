@@ -118,11 +118,7 @@ func (ix *indexer) buildGraph(ctx context.Context, j graphJob) graphRows {
 				continue
 			}
 			id := store.SymbolID(j.repoID, d.Path, d.StartLine, string(d.Kind), d.Name)
-			// Containment, not an exact range match: the chunker sub-windows a
-			// declaration longer than MaxDeclLines, so the biggest
-			// declarations have no span with their range and an exact match
-			// would leave exactly them uncitable.
-			spanID, _ := mostSpecific(spans[d.Path], d.StartLine)
+			spanID, _ := spanFor(spans[d.Path], d.StartLine, d.EndLine)
 			g.symbols = append(g.symbols, models.Symbol{
 				ID: id, RepoID: j.repoID, FileID: fileID, Path: d.Path,
 				Name: d.Name, Pkg: d.Pkg, Kind: d.Kind,
@@ -201,6 +197,70 @@ func (ix *indexer) resolveCalls(ctx context.Context, j graphJob) (map[symbols.Ke
 type container struct {
 	id         string
 	start, end int
+}
+
+// spanFor is the span a definition is cited by: the one holding its first
+// line, or failing that the first one its range overlaps.
+//
+// Containment first, and never an exact range match: the chunker sub-windows a
+// declaration longer than MaxDeclLines, so the biggest declarations have no
+// span with their range and an exact match would leave exactly them uncitable.
+//
+// The overlap is not a widening for its own sake — it is what makes the link
+// survive STRIP_DOC_COMMENTS. index parses the RAW body and chunks the
+// STRIPPED one (main.go), deliberately, because go/packages keys its offsets
+// against the file on disk. StripDocs blanks a doc comment into empty lines,
+// an empty line is not an *ast.CommentGroup, so chunk.Decl no longer sees d.Doc
+// and starts the span at the `func` keyword — while the definition's own range
+// still starts at the comment, one or more lines ABOVE every span in the file.
+// Start-line containment then misses, and the miss is silent: the symbol is
+// written with a NULL span_id and the answering loop hands the model a
+// span_id it cannot read (agent/tools.go).
+//
+// Measured over this repository's own 156 Go files, 2,092 definitions:
+//
+//	strategy=ast     span_id NULL: unstripped 0 (0.0%)   stripped 1339 (64.0%)
+//	strategy=window  span_id NULL: unstripped 0 (0.0%)   stripped 0    (0.0%)
+//
+// Production keeps its doc comments, so this is not a production number — but
+// BOTH eval corpora are built stripped (the Makefile's eval-corpus target), and
+// the asymmetry above falls on exactly the two arms spec §9 exists to compare.
+//
+// The start line is still tried first, so no link that already resolved moves:
+// under CHUNK_STRATEGY=window a definition's first line is inside two windows
+// and mostSpecific's tie-break is what picks between them.
+func spanFor(cs []container, start, end int) (string, bool) {
+	if id, ok := mostSpecific(cs, start); ok {
+		return id, true
+	}
+	return firstOverlapping(cs, start, end)
+}
+
+// firstOverlapping is the container intersecting [start,end] that begins
+// earliest — the one a start-line lookup would have found had the definition's
+// first line not moved out from under the spans.
+//
+// Earliest and not most specific, because a declaration over MaxDeclLines is
+// several windows and the head window is the one its first line would have
+// picked. Top-level declarations do not overlap each other, so the only spans
+// that can intersect a definition's range are its own. Ties are broken the way
+// mostSpecific breaks them, on the end and then on the id, so the answer does
+// not depend on the order rows came back in.
+func firstOverlapping(cs []container, start, end int) (string, bool) {
+	var best container
+	found := false
+	for _, c := range cs {
+		if c.end < start || c.start > end {
+			continue
+		}
+		switch {
+		case !found, c.start < best.start,
+			c.start == best.start && c.end < best.end,
+			c.start == best.start && c.end == best.end && c.id < best.id:
+			best, found = c, true
+		}
+	}
+	return best.id, found
 }
 
 // mostSpecific is the container holding line — the greatest start, then the

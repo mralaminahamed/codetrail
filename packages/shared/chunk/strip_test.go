@@ -119,9 +119,14 @@ func TestStrippedSourceWindowsToTheSameRanges(t *testing.T) {
 //
 // The start line does move: it was the doc comment's, and a blanked comment is
 // no longer a comment, so the parser starts the declaration at its keyword.
-// That is the one thing blanking does not preserve, and it is harmless — the
-// span still covers all of the code it did. What must not move is the end,
-// because everything below a deleted comment would shift.
+// That is the one thing blanking does not preserve, and it is NOT harmless:
+// the span still covers all of the code it did, but a caller holding a range
+// taken from the RAW bytes now holds one that starts above every span in the
+// file. That is what put a NULL span_id on 64.0% of the symbols in a stripped
+// corpus, and why the indexer links a definition to a span by range OVERLAP
+// (apps/indexer/cmd/graph.go spanFor) rather than by containment of the
+// definition's first line. What must not move is the end, because everything
+// below a deleted comment would shift.
 //
 // The equality below is this fixture's, not an invariant. Measured: a
 // declaration 201 lines long *including* a four-line doc comment goes from 7
