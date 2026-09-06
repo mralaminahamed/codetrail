@@ -100,8 +100,17 @@ func Run(ctx context.Context, remote, ref, dir string, lim Limits) (Result, erro
 	return Result{Dir: dir, Commit: sha, Bytes: size}, nil
 }
 
+// head reads the commit that was actually fetched.
+//
+// Through gitCmd, like every other fork in this package. It was hand-written
+// once and got none of the containment: no environment overrides, no process
+// group, no WaitDelay — inside the binary spec §4 designates as the
+// untrusted-input boundary. The last of those is the one that bites here,
+// because cmd.Output() is precisely the unbounded wait gitCmd's own doc
+// describes: a descendant that escapes the group kill holds the output pipe
+// open, and waiting on that pipe has no timeout of its own.
 func head(ctx context.Context, dir string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "HEAD")
+	cmd := gitCmd(ctx, filepath.Dir(dir), "-C", dir, "rev-parse", "HEAD")
 	// Stdout carries the sha, so the error has to carry stderr: an empty
 	// repository clones cleanly and fails only here, and "exit status 128" on
 	// its own does not say that is what happened.

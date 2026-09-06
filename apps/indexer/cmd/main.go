@@ -11,11 +11,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
@@ -91,6 +91,10 @@ type indexer struct {
 	graph    func(ctx context.Context, p symbols.Policy) (map[symbols.Key]symbols.Target, symbols.Stats)
 	putGraph func(ctx context.Context, repoID string, syms []models.Symbol, edges []models.Edge) error
 	evict    func(ctx context.Context, keep, keepTombstones int) (int, error)
+	// dropRepo removes a repo row this job wrote that has no spans; see
+	// failIndexed. A seam like the rest, so the cleanup is drivable with no
+	// database.
+	dropRepo func(ctx context.Context, id string) (bool, error)
 	// The incremental re-index's five reads, seams like the rest so a job can be
 	// driven with no database. resolve asks the remote what a ref points at
 	// before anything is cloned; the other four are what the fast path and the
@@ -174,6 +178,7 @@ func main() {
 		graph:    symbols.Resolve,
 		putGraph: st.PutGraph,
 		evict:    st.Evict,
+		dropRepo: st.DeleteEmptyRepo,
 
 		resolve:      clone.Resolve,
 		getRepo:      st.GetRepo,
@@ -195,6 +200,10 @@ func main() {
 	// too: with a fresh id each start that normally finds nothing, and one
 	// syscall is cheaper than depending on it having found nothing.
 	ix.sweepHome()
+	// After sweepHome, so this worker's own (empty) tree is not a candidate,
+	// and before the loop, so a killed predecessor's checkout is off the disk
+	// before this one starts filling it.
+	ix.sweepStale()
 	defer ix.sweepHome()
 
 	ix.logToolchain()
@@ -247,12 +256,19 @@ func (ix *indexer) probeServer(ping func(context.Context) error) *echo.Echo {
 // definition would otherwise serve the wrong process on the right port.
 func probeAddr() string { return ":" + config.Get("PROBE_PORT", "9090") }
 
-// allowedHosts reads the exact-host allowlist the same way the gateway does:
-// ALLOWED_HOSTS, comma-separated, replacing the default rather than extending
-// it. Duplicated rather than shared because the two binaries are separate
-// packages; if a third reader appears, this belongs in admit.
+// allowedHosts reads the exact-host allowlist: ALLOWED_HOSTS, comma-separated,
+// replacing the default rather than extending it. Duplicated rather than shared
+// because the two binaries are separate packages; if a third reader appears,
+// this belongs in admit.
+//
+// Through config.GetList and not config.Get, and that is the whole content of
+// this function. Get reads present-but-empty as unset, so ALLOWED_HOSTS=""
+// handed back the built-in allowlist and admitted github.com — an operator
+// clearing the only SSRF control codetrail has got it back, while a single
+// space refused everything. GetList reads a cleared permission as granting
+// nothing.
 func allowedHosts() []string {
-	return strings.Split(config.Get("ALLOWED_HOSTS", strings.Join(admit.DefaultHosts, ",")), ",")
+	return config.GetList("ALLOWED_HOSTS", admit.DefaultHosts)
 }
 
 // home is this worker's own scratch subtree. Per worker, because two indexers
@@ -264,12 +280,58 @@ func allowedHosts() []string {
 func (ix *indexer) home() string { return filepath.Join(ix.scratch, ix.id) }
 
 // sweepHome removes this worker's subtree and nothing else. A peer's tree is
-// left alone deliberately: nothing here distinguishes a crashed worker's
-// directory from a live one's, and removing the wrong one is the collision
-// above with extra steps. A worker killed hard therefore still leaks its tree.
+// left alone deliberately: removing a live one is the collision above with
+// extra steps. What reclaims a dead peer's is sweepStale, at boot.
 func (ix *indexer) sweepHome() {
 	if err := removeScratch(ix.home()); err != nil {
 		ix.log.Warn().Err(err).Str("dir", ix.home()).Msg("could not clear the worker's scratch tree")
+	}
+}
+
+// sweepStale removes the scratch entries that cannot belong to a live worker.
+//
+// Without it the tree leaks without bound across hard kills. home() is
+// scratch/<random id> and workerID generates a fresh id every boot, so
+// sweepHome removes only the tree of the process running it — and no future
+// worker ever cleans up after a killed one. Every OOM-kill therefore strands
+// up to MAX_REPO_BYTES, permanently, on a volume sized for one checkout.
+//
+// AGE is what distinguishes a dead worker's directory from a live one's, and
+// it is the only thing that does without a registry. The window is the job's
+// deadline plus the lease that outlasts it (run leases for Deadline+1m), so an
+// entry untouched for longer than a worker can legally hold one job is not a
+// worker still working: a live one's home is stamped afresh every time a job
+// directory is made or removed inside it, and a job cannot outlive jobCtx.
+// That is the bound sweepHome's warning is about — inside the window a peer's
+// in-flight clone is untouchable, which is what makes this safe to run against
+// a shared SCRATCH_DIR.
+//
+// At boot rather than on the lease loop: the leak it repairs is one per killed
+// process, and a periodic sweep would spend the syscalls to find nothing.
+// This worker's own tree is not a candidate — it is created by the first job,
+// after this has run.
+func (ix *indexer) sweepStale() {
+	entries, err := os.ReadDir(ix.scratch)
+	if err != nil {
+		// A scratch directory that does not exist yet is the normal first boot.
+		if !errors.Is(err, fs.ErrNotExist) {
+			ix.log.Warn().Err(err).Str("dir", ix.scratch).Msg("could not read the scratch directory")
+		}
+		return
+	}
+	cutoff := ix.now().Add(-(2*ix.lim.clone.Deadline + time.Minute))
+	for _, e := range entries {
+		info, ierr := e.Info()
+		if ierr != nil || !info.ModTime().Before(cutoff) {
+			continue
+		}
+		p := filepath.Join(ix.scratch, e.Name())
+		if rerr := removeScratch(p); rerr != nil {
+			ix.log.Warn().Err(rerr).Str("dir", p).Msg("could not clear an abandoned scratch tree")
+			continue
+		}
+		ix.log.Info().Str("dir", p).Time("modified", info.ModTime()).
+			Msg("removed a scratch tree no live worker can own")
 	}
 }
 
@@ -490,8 +552,16 @@ func (ix *indexer) doJob(ctx context.Context, job jobs.Job) string {
 		l.Error().Err(err).Msg("could not clear the scratch directory")
 		return ix.fail(ctx, l, job, err.Error())
 	}
-	defer removeScratch(dir)
-	defer removeScratch(goHome)
+	// The error is logged, not discarded. This is the removal removeScratch's
+	// own doc was written for — measured to leak not the module cache but the
+	// whole tree it is in, one job at a time — and it is the one that runs
+	// after the last thing that could report anything. A silent failure here
+	// is a volume filling up with no line saying so.
+	defer func() {
+		if err := errors.Join(removeScratch(dir), removeScratch(goHome)); err != nil {
+			l.Warn().Err(err).Str("dir", dir).Msg("could not clear the scratch directory after the job")
+		}
+	}()
 
 	// One deadline for the whole job (spec §6): clone, read, chunk, embed and
 	// write share it, so a slow clone cannot buy itself extra time by failing
@@ -548,6 +618,21 @@ func (ix *indexer) doJob(ctx context.Context, job jobs.Job) string {
 	res, err := ix.clone(jobCtx, remote.URL, job.Ref, dir, ix.lim.clone)
 	if err != nil {
 		l.Warn().Err(err).Msg("clone failed")
+		// Over the size cap is terminal, and it is the only clone failure that
+		// is. The cap is checked AFTER the fetch — clone.Run concedes that
+		// nothing bounds what reaches the disk while git runs except the
+		// deadline — so a retried over-cap repository is downloaded again in
+		// full: three attempts is up to 3 × MAX_REPO_BYTES through the
+		// ephemeral volume, at the choosing of whoever submitted it.
+		//
+		// The counter-argument is the one an unlisted host gets above: an
+		// operator can raise MAX_REPO_BYTES, so a retry is not certainly
+		// futile. The difference is the cost. Refusing an unlisted host happens
+		// before any network and its retries are free; this one is paid in full
+		// each time, and an operator who raises the cap can re-submit.
+		if errors.Is(err, clone.ErrTooLarge) {
+			return ix.failFinally(ctx, l, job.ID, err.Error())
+		}
 		return ix.fail(ctx, l, job, err.Error())
 	}
 	files, err := ix.walk(jobCtx, res.Dir, ix.lim.walk)
@@ -575,7 +660,7 @@ func (ix *indexer) doJob(ctx context.Context, job jobs.Job) string {
 	// order is the foreign key's and not a preference.
 	if err := ix.putSpans(jobCtx, repoID, spans, ix.emb.Model(), ix.emb.Dim()); err != nil {
 		l.Error().Err(err).Msg("writing spans failed")
-		return ix.fail(ctx, l, job, err.Error())
+		return ix.failIndexed(ctx, l, job, repoID, err.Error())
 	}
 
 	// The writes that close the job out run on their own budget, derived from
@@ -594,7 +679,7 @@ func (ix *indexer) doJob(ctx context.Context, job jobs.Job) string {
 		parsed: parsed, files: rows, spans: spans,
 	}); err != nil {
 		l.Error().Err(err).Msg("writing the graph failed")
-		return ix.fail(ctx, l, job, err.Error())
+		return ix.failIndexed(ctx, l, job, repoID, err.Error())
 	}
 
 	// Read before Complete, on the job's own budget, and a failure here costs
@@ -802,12 +887,18 @@ func (ix *indexer) embedAll(ctx context.Context, spans []store.EmbeddedSpan, tod
 			texts = append(texts, spans[i].Text)
 		}
 		vecs, err := ix.emb.Embed(ctx, texts)
+		// Indices into SPANS, not into todo. todo is the reuse pass's leftovers
+		// and exists nowhere else, so after a pass that filled most of the
+		// corpus "spans 0-31" names positions in a list nobody can look up —
+		// misleading exactly when someone is reading it. todo is ascending, so
+		// these two bracket the batch; the batch is not every index between
+		// them, and it does not claim to be.
 		if err != nil {
-			return fmt.Errorf("embedding spans %d-%d: %w", lo, hi-1, err)
+			return fmt.Errorf("embedding spans %d-%d: %w", todo[lo], todo[hi-1], err)
 		}
 		if len(vecs) != len(texts) {
 			return fmt.Errorf("embedding spans %d-%d: %s returned %d vectors for %d texts",
-				lo, hi-1, ix.emb.Model(), len(vecs), len(texts))
+				todo[lo], todo[hi-1], ix.emb.Model(), len(vecs), len(texts))
 		}
 		for i := range vecs {
 			spans[todo[lo+i]].Embedding = vecs[i]
@@ -833,6 +924,49 @@ func (ix *indexer) fail(ctx context.Context, l zerolog.Logger, job jobs.Job, rea
 		return metrics.JobFailed
 	}
 	return metrics.JobRetried
+}
+
+// failIndexed is fail() for the paths that run after PutRepo has committed.
+//
+// A job writes in three transactions, so a terminal failure after the first
+// leaves a repo row and its files with nothing retrievable behind them: GET
+// /repos lists the repository, /ask refuses it no_spans forever, and because
+// PutRepo winds last_queried_at the dead repo is the MOST recently "queried"
+// row and so the last thing Evict will ever take — a quota slot held
+// indefinitely by a job that failed. Nothing else sweeps a repo with no spans.
+//
+// Only on the TERMINAL outcome, and this is the whole reason it is not simply
+// part of fail(). A retry writes the same repo id again — PutRepo upserts and
+// RepoID is hash(key, commit) — so deleting between attempts is churn, and a
+// worker whose lease expired mid-job must not delete the row the worker that
+// took the job is filling in.
+//
+// The delete is guarded on the span count in SQL (store.DeleteEmptyRepo), so
+// the graph-write path routed through here is a no-op whenever putSpans
+// actually wrote something, and an earlier successful index of the same commit
+// is never touched.
+//
+// A failure to clean up is logged and dropped: the job's verdict is already
+// recorded, there is nothing left to retry, and the next successful index
+// evicts to the same bound regardless.
+func (ix *indexer) failIndexed(ctx context.Context, l zerolog.Logger, job jobs.Job, repoID, reason string) string {
+	out := ix.fail(ctx, l, job, reason)
+	if out != metrics.JobFailed {
+		return out
+	}
+	// recordDeadline for the same reason the queue writes have one: this is the
+	// path where the job's own budget is what has just expired.
+	dropCtx, cancel := context.WithTimeout(ctx, recordDeadline)
+	defer cancel()
+	switch dropped, err := ix.dropRepo(dropCtx, repoID); {
+	case err != nil:
+		l.Warn().Err(err).Str("repo_id", repoID).
+			Msg("could not remove the repository this failed job left behind")
+	case dropped:
+		l.Info().Str("repo_id", repoID).
+			Msg("removed the repository this failed job left with no spans")
+	}
+	return out
 }
 
 // failFinally ends the job now, whatever its attempt count. A cap of zero

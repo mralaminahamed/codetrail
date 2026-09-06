@@ -132,6 +132,54 @@ func TestCountsLinesAndDetectsLanguage(t *testing.T) {
 	}
 }
 
+// A terminator ENDS a line, it does not add one. files.lines is the only thing
+// that says how long a file is, and chunk names its ranges out of the same
+// bytes — so a count that is one short of what the chunker cites is a row
+// saying the code its own spans point at is not there.
+//
+// The unterminated cases are the ones that were wrong: "package b\nvar X = 1"
+// recorded 1 while a span cited 1..1, and a one-line file with no terminator
+// recorded 0.
+func TestLinesCountsATerminatorAsEndingALineAndNotAsAddingOne(t *testing.T) {
+	for _, tc := range []struct {
+		body string
+		want int
+	}{
+		{"", 0},
+		{"a", 1},
+		{"a\n", 1},
+		{"package b\nvar X = 1", 2},
+		{"package b\nvar X = 1\n", 2},
+		{"\n", 1},
+		{"\n\n", 2},
+		{"a\r\nb\r\n", 2},
+	} {
+		if got := Lines([]byte(tc.body)); got != tc.want {
+			t.Errorf("Lines(%q) = %d, want %d", tc.body, got, tc.want)
+		}
+	}
+}
+
+// And the walk reports what Lines says, so a file row cannot disagree with the
+// span ranges taken from the same bytes.
+func TestAWalkedFileWithNoTrailingNewlineCountsItsLastLine(t *testing.T) {
+	root := tree(t, map[string]string{
+		"terminated.go":   "package b\nvar X = 1\n",
+		"unterminated.go": "package b\nvar X = 1",
+		"oneline.go":      "package b",
+	})
+	got, err := Files(context.Background(), root, Limits{MaxFiles: 100, MaxFileBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]int{"terminated.go": 2, "unterminated.go": 2, "oneline.go": 1}
+	for _, f := range got {
+		if w, ok := want[f.Path]; ok && f.Lines != w {
+			t.Errorf("%s: %d lines, want %d", f.Path, f.Lines, w)
+		}
+	}
+}
+
 // A file over the cap is skipped, not fatal: one enormous generated file
 // should not lose the repository.
 func TestSkipsOversizedFiles(t *testing.T) {

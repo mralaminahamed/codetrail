@@ -14,9 +14,17 @@ import "github.com/mralaminahamed/codetrail/packages/shared/models"
 // A definition exists whether or not a span does: chunk sub-windows a
 // declaration longer than MaxDeclLines into kind=file spans, so the biggest
 // functions in a repository have no span of their own — and they are the ones
-// most worth asking who calls them. StartLine and EndLine are 1-based and
-// inclusive and include the doc comment, so they agree with the span's range
-// for a declaration that produced one.
+// most worth asking who calls them.
+//
+// StartLine and EndLine are 1-based and inclusive and include the doc comment,
+// because they come from the same chunk.Decl a span's range does. They do NOT
+// always AGREE with that range, and the difference is not cosmetic: a caller
+// that parses the raw body and chunks StripDocs' output — which the indexer
+// does, deliberately, and which is how both eval corpora are built — is
+// comparing a definition that starts at the doc comment against a span that
+// starts at the keyword. Measured: 64.0% of this repository's own definitions
+// have a first line no span contains under those two settings. Link by range
+// overlap, not by containment of StartLine.
 type Def struct {
 	Kind      models.SpanKind
 	Name      string

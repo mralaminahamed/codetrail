@@ -491,6 +491,10 @@ var wantWindowSpans = []string{
 // Every regular file the walk saw, span-bearing or not. go.mod and logo.png are
 // here on purpose: a file row without spans is what says the walk covered the
 // repository even where the chunker declined it.
+//
+// logo.png is also the only fixture with no trailing newline — 2 newlines and
+// a final 0xff — so its 3 is the end-to-end assertion that a terminator ends a
+// line rather than adding one. It read 2 while walk counted terminators.
 var wantFiles = []fileRow{
 	{Path: "README.md", Lang: "markdown", Lines: 4},
 	{Path: "big.go", Lang: "go", Lines: 208},
@@ -500,7 +504,7 @@ var wantFiles = []fileRow{
 	{Path: "config.yaml", Lang: "yaml", Lines: 3},
 	{Path: "doc.go", Lang: "go", Lines: 5},
 	{Path: "go.mod", Lang: "", Lines: 3},
-	{Path: "logo.png", Lang: "", Lines: 2},
+	{Path: "logo.png", Lang: "", Lines: 3},
 	{Path: "tools.go", Lang: "go", Lines: 9},
 	{Path: "use.go", Lang: "go", Lines: 13},
 }
