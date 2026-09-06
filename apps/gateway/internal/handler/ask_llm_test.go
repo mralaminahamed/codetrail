@@ -1209,3 +1209,37 @@ func TestTheBudgetCeilingHoldsWhenEightRequestsArriveAtOnce(t *testing.T) {
 		<-done
 	}
 }
+
+// codetrail_llm_steps counts MODEL CALLS PER LOOP and its buckets start at 1,
+// so an observation of 0 lands in le="1" and reads as a loop that made one
+// call. busy and budget_exhausted are both decided before agent.Run is ever
+// reached: no model call, and so no sample of how many a loop makes.
+//
+// budget_exhausted here because it needs no goroutines; the guard is on
+// Steps == 0, which is what the two have in common.
+func TestALoopThatNeverRanFilesNoStepObservation(t *testing.T) {
+	before := llmCounters(t)
+	h := hermeticHandler(newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)})
+	h.LLM = NewLoop(llm.NewFake(answeringTurns("never [1]")...),
+		&fakeCorpus{res: result(rag.ModeHybrid, 0.83, true)},
+		agent.DefaultBounds(), agent.DefaultToolLimits(), false, 2, 100,
+		func() time.Time { return fixtureNow })
+	h.AnswerDefault = answererLLM
+
+	out := body(t, askBody(t, h, `{"q":"sampler"}`))
+	deg, _ := out["degraded"].(map[string]any)
+	if deg == nil || deg["reason"] != string(agent.StopBudgetExhausted) {
+		t.Fatalf("degraded %v, want reason budget_exhausted", out["degraded"])
+	}
+	moved := llmMovedSince(t, before)
+	if moved["codetrail_llm_steps_count"] != 0 {
+		t.Errorf("codetrail_llm_steps_count moved %v for a loop that made no model call; "+
+			"the bucket that 0 lands in is the one that means a single call",
+			moved["codetrail_llm_steps_count"])
+	}
+	// The degradation is still counted — a stop nothing records is a
+	// degradation nobody can see, which is the opposite defect.
+	if got := moved[`codetrail_llm_stop_total{reason="budget_exhausted"}`]; got != 1 {
+		t.Errorf(`codetrail_llm_stop_total{reason="budget_exhausted"} moved %v, want 1`, got)
+	}
+}
