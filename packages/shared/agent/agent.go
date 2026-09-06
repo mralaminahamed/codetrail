@@ -20,7 +20,9 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -195,13 +197,9 @@ func (l *loop) dispatch(ctx context.Context, calls []llm.ToolCall) (Stop, bool) 
 		}
 		l.tr.ToolCalls++
 
-		// Byte-identical on (name, args). Not semantically equal: a normaliser
-		// would be a second parser of the model's arguments and a second place
-		// to be wrong, and two read_span calls for two different spans are
-		// ordinary traversal rather than a loop.
-		key := c.Name + "\x00" + string(c.Args)
-		repeat := l.seen[key]
-		l.seen[key]++
+		k := repeatKey(c)
+		repeat := l.seen[k]
+		l.seen[k]++
 		if repeat > 0 {
 			l.tr.Tools = append(l.tr.Tools, ToolInvocation{Name: c.Name})
 			if repeat > l.b.MaxRepeats {
@@ -244,6 +242,37 @@ func (l *loop) dispatch(ctx context.Context, calls []llm.ToolCall) (Stop, bool) 
 	}
 	l.msgs = append(l.msgs, llm.Message{Role: llm.RoleUser, Results: results})
 	return "", false
+}
+
+// repeatKey identifies a tool call for the repeat guard.
+//
+// The arguments are JSON the model writes, so {"span_id":"x"} and
+// {"span_id": "x"} are one call. Keyed on bytes they were two: read_span ran
+// twice for one span, charged the character budget twice, and put that span at
+// two positions in Read — from which two markers resolve to two citations
+// carrying one span_id, which is the id a console keys its list on.
+//
+// The objection to normalising is real and is answered rather than dropped:
+// this is a second parser of the model's arguments, so it must not be able to
+// be wrong in a new way. It re-encodes through encoding/json — which sorts
+// object keys — and on ANY failure falls back to the raw bytes, the behaviour
+// that shipped. UseNumber keeps numeric literals as they were written rather
+// than through float64, so two different large integers cannot round into one
+// key. What is left can only ever collapse two spellings of one call.
+//
+// Two read_span calls for two different spans stay two calls: they differ in a
+// value, not in whitespace.
+func repeatKey(c llm.ToolCall) string {
+	args := string(c.Args)
+	dec := json.NewDecoder(bytes.NewReader(c.Args))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err == nil {
+		if b, err := json.Marshal(v); err == nil {
+			args = string(b)
+		}
+	}
+	return c.Name + "\x00" + args
 }
 
 // correctable counts one recoverable mistake and reports whether the loop has
