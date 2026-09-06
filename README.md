@@ -14,18 +14,25 @@
 
 </div>
 
-> **Status: in development. Nothing here is deployed, and most of it is not built yet.**
-> The [design spec](docs/superpowers/specs/2026-08-31-codetrail-design.md) is written and approved.
-> [P1](docs/superpowers/plans/2026-08-31-p1-ingestion.md) — ingestion —
-> [P2](docs/superpowers/plans/2026-09-01-p2-chunking.md) — chunking, embeddings and spans — and
-> [P3](docs/superpowers/plans/2026-09-01-p3-retrieval.md) — retrieval, citations and the extractive
-> ask — and [P4](docs/superpowers/plans/2026-09-02-p4-symbol-graph.md) — the symbol graph, per-edge
-> provenance and the graph endpoints — are merged and green in CI. A repository goes in, citable
-> spans come out, a question gets an answer whose citations check byte for byte against the file at
-> that commit, and its call graph can be walked with every edge saying how much it knows about its
-> target. **The score floor ships uncalibrated and the chunking experiment has not been run** —
-> both are P6, and nothing here yet says which chunking retrieves better.
-> This README says plainly which parts exist. See [Status](#status).
+> **Status: every phase the spec plans — P0 through P8 — is built and merged. Nothing is deployed.**
+> The [design spec](docs/superpowers/specs/2026-08-31-codetrail-design.md) is written and approved,
+> P0's skeleton, schema and CI landed with P1, and the eight planned phases —
+> [P1](docs/superpowers/plans/2026-08-31-p1-ingestion.md) ingestion ·
+> [P2](docs/superpowers/plans/2026-09-01-p2-chunking.md) chunking, embeddings and spans ·
+> [P3](docs/superpowers/plans/2026-09-01-p3-retrieval.md) retrieval, citations and the extractive
+> ask · [P4](docs/superpowers/plans/2026-09-02-p4-symbol-graph.md) the symbol graph and its per-edge
+> provenance · [P5](docs/superpowers/plans/2026-09-03-p5-console.md) the React console ·
+> [P6](docs/superpowers/plans/2026-09-03-p6-eval.md) the eval harness and its generated golden set ·
+> [P7](docs/superpowers/plans/2026-09-03-p7-llm-loop.md) the bounded LLM tool loop, hybrid fusion and
+> the incremental re-index · [P8](docs/superpowers/plans/2026-09-03-p8-deploy.md) Terraform, images,
+> alerts and CD — are each merged and green in CI. A repository goes in, citable spans come out, a
+> question gets an answer whose citations check byte for byte against the file at that commit, and
+> its call graph can be walked with every edge saying how much it knows about its target.
+> **The two experiments ran and one of them changed the default:** fusion lost, so
+> `RETRIEVAL_MODE` is `vector`. **The score floor still ships uncalibrated** — P6 measured a
+> distribution on one corpus and *declined* to calibrate from it, which is the honest outcome and
+> not a missing task. **`terraform apply` has never run**, no image has been pushed, and there is no
+> live instance. This README says plainly which parts exist. See [Status](#status).
 
 ## What it is
 
@@ -37,10 +44,11 @@ second half to the top of the next one. codetrail chunks on the AST — one span
 and then *measures* that against a fixed-window baseline instead of asserting it is better. Both
 arms exist and both index a real repository end to end as of P2 — in the production corpus **and**
 in the doc-stripped corpus the eval indexes, which is the one §9 needs and the one the baseline arm
-could not build at all until this phase's last fix. The measurement itself is
-[§9 of the spec](docs/superpowers/specs/2026-08-31-codetrail-design.md#9-the-eval), it is designed
-so the questions cannot be authored to flatter the chunker under test, and **it has not been run
-yet**.
+could not build at all until P2's last fix. The measurement itself is
+[§9 of the spec](docs/superpowers/specs/2026-08-31-codetrail-design.md#9-the-eval); it is designed
+so the questions cannot be authored to flatter the chunker under test, and **it has been run once,
+on one corpus**. AST led. What that does and does not license is in
+[Chunking](#chunking-and-the-two-corpora).
 
 **A code citation can be checked.** A prose citation can only be quoted back at you. A code
 citation is `(repo, commit, path, line range, digest)` — it either still holds what was claimed or
@@ -75,11 +83,14 @@ set contains no `parseConfig`-shaped question at all.
 codetrail refuses when retrieval returns nothing, when the top cosine similarity falls under
 `ANSWER_SCORE_FLOOR`, and when that similarity is not a number at all. **That floor ships
 uncalibrated**: its default is `-1`, the bottom of the cosine range, which refuses nothing on score
-alone, and every answer carries `"floor": {"value": -1, "calibrated": false}`. The number is
-**measured in P6**, from the eval's distribution over a generated golden set, and will be recorded
-here with the figures that produced it. What P3 ships is the mechanism and the instrument — the
-refusal path, the knob, and the top-score histogram the calibration reads — because picking a
-threshold before measuring one is a guess wearing a measurement's clothes.
+alone, and every answer carries `"floor": {"value": -1, "calibrated": false}`. **Nobody has measured
+one, and the eval that was meant to declined:** it produced a top-score distribution on a single
+library and refused to read a threshold off it, because a floor calibrated on one repository is a
+floor calibrated on one library's documentation style. What ships is the mechanism and the
+instrument — the refusal path, the knob, the two gauges and the top-score histogram a calibration
+would read — because picking a threshold before measuring one is a guess wearing a measurement's
+clothes. When somebody does measure one, `calibrated` flips to `true` and every sentence about the
+floor changes with it: they all branch on that field rather than stating one of the two.
 
 A refusal is a `200` carrying `"refused": true` and a reason from a closed set (`no_spans`,
 `below_floor`, `unscored`). It is never an HTTP error: filing "we had nothing to say" inside every
@@ -100,7 +111,7 @@ Set a provider key and the same pipeline runs a bounded agentic tool loop over `
 `read_span`, `definition_of` and `callers_of` — and **the response names which one answered it**:
 `"answered_by"` is `"extractive"` or `"llm"` on every `/ask` response, refusal included, and a
 request that tried the model and fell back also carries `"degraded": {"from": "llm", "reason": …}`
-naming which of eleven things went wrong. A silent downgrade from a model to a fallback is the kind
+naming which of fourteen things went wrong. A silent downgrade from a model to a fallback is the kind
 of failure that costs a week before anyone notices. See [The answering loop](#the-answering-loop).
 
 ## Architecture
@@ -269,10 +280,18 @@ indistinguishable from the baseline arm's. The arm is a property of the run, not
 
 **Fixed windows are a first-class strategy, not only a fallback.** `CHUNK_STRATEGY=window` chunks
 the whole corpus into 40-line windows with 10 lines of overlap and never parses anything. It exists
-so P6 has a baseline to compare against that was not retrofitted after the fact. **No comparison
-has been run, and nothing here claims AST chunking retrieves better** — that is exactly the
-question the eval exists to settle, and asserting it in a README is the failure this design is
-built to avoid.
+so P6 has a baseline to compare against that was not retrofitted after the fact.
+
+**The comparison has now been run, once, and it is a measurement rather than a verdict.** On
+`google/uuid` at `2d3c2a9`, 74 generated cases, in the shipped `vector` mode, MRR is **0.749** for
+the AST arm against **0.606** for the window arm under the lenient gold rule and **0.510** under the
+strict one. Unlike the fusion comparison, no decision rule was pre-registered for this endpoint and
+no default moved, and the two arms are **not comparable on that number alone**: the window arm's
+mean lenient gold set is 1.5 spans against the AST arm's 1.0, so the lenient rule hands it more
+chances while the strict rule penalises it for tiling, and its haystack is smaller (110 spans
+against 189). Both directions are real and neither is corrected for. So this README claims that AST
+chunking *led on one corpus at the shipped settings* — not that AST chunking retrieves better. The
+figures, both gold rules and every qualifier are in [`docs/eval/README.md`](docs/eval/README.md).
 
 **The two corpora differ deliberately** (spec §5). The production index **keeps** doc comments,
 because there they are the best retrieval signal a span has. The eval indexes the same repositories
@@ -329,7 +348,10 @@ leased job that spends an attempt against its cap for something no retry can fix
 
 ## Retrieval
 
-Two arms over one repository, fused by reciprocal rank.
+Two arms over one repository. Both ship, all three modes stay switchable — and **the default runs
+the vector arm alone**, because the fusion the design specified was measured and lost. The fusion
+machinery is described first because it is still there and still one setting away; what the
+measurement said, and how narrow the claim is, is nineteen lines down.
 
 **The vector arm** is pgvector cosine similarity, filtered by `repo_id`, ordered on the distance
 operator so it can use the HNSW index — sorting on the computed similarity gives the same order and
@@ -425,6 +447,16 @@ on purpose — a question in a query string is logged by every proxy, load balan
 between the caller and the process, and it is the one string here that must not be. It is not in
 any of codetrail's own log lines either.
 
+**The body's one other field is `limit`, and its default differs by route.** `/search` defaults to
+**10**; `/ask` defaults to `ANSWER_MAX_SPANS` (**5**), because the span budget *is* the retrieval
+depth an answer can hold — an ask that says nothing retrieves exactly what it can use, and a caller
+who asks for more gets the assembler dropping what does not fit and saying how many. Both routes
+refuse a `limit` outside 1..50 with a `400` naming the bound rather than clamping, and an explicit
+`0` is refused rather than read as absent: the field is a pointer for that reason alone. `k`,
+`w_vector` and `w_lexical` are declared **only so they can be refused**, for the same reason `mode`
+is — retrieval is configured per process, so a body that named one would change nothing while
+looking as though it had.
+
 **`mode` is a response field, not a request one.** A body that names one is a `400` naming the rule
 — including when it names the mode this process happens to run, which is not something a caller can
 know. Retrieval mode is set once by `RETRIEVAL_MODE` and `Retriever.Search` takes no argument for
@@ -456,12 +488,14 @@ integers and a floor is not one.
 ### What this phase measured
 
 `rs/zerolog` at `dfd11cca`, 1,303 spans, embedded with `nomic-embed-text`, asked seven real
-questions about the library. **These are costs and ranges, not a quality result** — there is no
-golden set yet, so nothing below says retrieval is good.
+questions about the library. **These are costs and ranges, not a quality result** — there was no
+golden set when they were taken, so nothing below says retrieval is good. The generated golden set
+that came later is `google/uuid`'s, and its top-score distribution is wider on both sides:
+0.6239 to 0.8507 over 74 cases on the AST arm.
 
 - **Top cosine similarity: 0.664 to 0.744** across the seven. That is a distribution, not a
-  recommendation, and it is exactly the kind of figure that becomes a floor only after P6 measures
-  it against labelled answers. A histogram of the same quantity is exported as
+  recommendation, and it is exactly the kind of figure that becomes a floor only once something
+  measures it against labelled answers — which has still not happened. A histogram of the same quantity is exported as
   `codetrail_retrieval_top_score` for that purpose; its `Help` string says it is an instrument and
   not a calibration, because a confident wrong answer and a confident right one land in the same
   bucket.
@@ -536,9 +570,11 @@ ways: the fake model's request recorder (the work actually done), the `llm` bloc
 `codetrail_llm_stop_total`. Each is driven at N−1, N and N+1, and the just-under case has to
 *succeed* — otherwise the test cannot tell "the bound fired" from "the loop never worked".
 
-### Eleven ways it degrades, each with its own branch
+### Fourteen ways it degrades, each with its own branch
 
-`final` is the only outcome that is not a degradation. The rest —
+`agent.Stops` is the whole vocabulary — eleven written out plus every `llm.Kind` not already in the
+list, which is fifteen, pinned by `bounds_test.go` asserting the length rather than ranging over a
+mutated slice. `final` is the only outcome that is not a degradation, so fourteen are. The rest —
 `rate_limited`, `unauthorized`, `provider_unavailable`, `deadline`, `malformed_response`,
 `malformed_tool_call`, `tool_error`, `repeated_tool_call`, `step_limit`, `tool_call_limit`,
 `token_budget`, `uncited`, `busy`, `budget_exhausted` — each get their own branch, their own test and
@@ -792,12 +828,12 @@ while CI is not, which is the silent downgrade that costs a week.
   So "who calls this" reads as "who **else** calls this" once a cycle is involved, and the
   asymmetry between direct and indirect self-calls is real. Found by the branch-wide mutation
   sweep, against a comment claiming the opposite.
-- **The indexer has no `/metrics` endpoint, and this phase gave it three instruments anyway** —
-  edges by provenance, type-checks by reason, type-check duration. They are the *only* Prometheus
-  instruments on the indexer side, they are written on every job, and the indexer runs no HTTP
-  server, so nothing can scrape them. Giving it a probe server is its own task and is not smuggled
-  in here; the per-job log line is what an operator actually has today, which is why every number
-  above is on it.
+- **This phase gave the indexer its first three Prometheus instruments** — edges by provenance,
+  type-checks by reason, type-check duration. They are the *only* instruments on the indexer side
+  and they are written on every job. When P4 shipped they had nowhere to be scraped from; P8 gave
+  the indexer a probe server on `PROBE_PORT` (9090) serving `/health`, `/ready` and `/metrics`, and
+  they are reachable now. The per-job log line is still what carries the numbers below, because
+  `vanished`, `unstrippable`, `tokenless` and `unparsed` are in no instrument.
 - **The go command's caches are outside every cap.** `MAX_REPO_BYTES` is measured on the clone;
   `GOCACHE` and `GOMODCACHE` are written afterwards, beside the checkout, and removed with the job.
   Measured at ~0.7MB per job on the default policy, because `NeedDeps` keeps `go list` from
@@ -928,9 +964,20 @@ not at the newline after it.
 
 React 19, TypeScript and Tailwind v4 in `apps/console`, built by Vite into a static bundle. It
 does the four things §2 names — submit, watch indexing, ask, jump to source — plus the symbol
-graph browsing P4's three endpoints have had no consumer for two phases.
+graph browsing P4's three endpoints have had no consumer for two phases. Every one of its tests
+runs against MSW over fixtures the shipped handlers emit, and **none of them asserts a class name**,
+which is what makes the design safe to change. It has a real visual design, a dark mode driven by
+`prefers-color-scheme`, and citation cards with a copy button for the verification command; the
+design is argued in [`apps/console/README.md`](apps/console/README.md).
 
-<img src="assets/screenshots/console-ask-answered.png" alt="An answered question, with the extractive answer, its markers and three citations" width="880">
+> **The screenshots below are stale and are kept as a record rather than as a claim.** They were
+> taken before the console had any styling at all — the whole stylesheet was Tailwind's preflight —
+> and the shipped console does not look like this. Regenerating them needs a browser against a
+> running stack, which nothing in this change had; they are marked rather than quietly left
+> presented as current. Every *behavioural* statement in this section was re-read against the
+> code and holds.
+
+<img src="assets/screenshots/console-ask-answered.png" alt="STALE — an answered question in the console's pre-design state, with the extractive answer, its markers and three citations" width="880">
 
 **A refusal is not an error, and the console renders them differently.** A refusal is
 `role="status"` headed *"No answer — and no error."*, and it carries the server's own sentence for
@@ -940,7 +987,7 @@ the client rather than a convention: `Outcome<T>` has six members and none of th
 so a refusal arrives inside `kind: "ok"` and reaching the error renderer with one means writing
 `{kind: "failed"}` by hand.
 
-<img src="assets/screenshots/console-ask-refused.png" alt="A refusal: no answer and no error, with the reason and the uncalibrated floor stated in words" width="880">
+<img src="assets/screenshots/console-ask-refused.png" alt="STALE — a refusal in the console's pre-design state: no answer and no error, with the reason and the uncalibrated floor stated in words" width="880">
 
 **The score floor is −1 and uncalibrated**, the same banner the rest of this file carries, and the
 console draws **no scale from it at all** — no bar, no meter, no percentage, no "N% above the
@@ -948,8 +995,8 @@ floor" — while `floor.calibrated` is false. A scale drawn from a number nobody
 guess as a measurement. The floor is a sentence, and the sentence says it is not a measurement.
 At the shipped default the only reachable refusals are `no_spans` and `unscored`: `Decide` refuses
 when the top score is *below* the floor, and a cosine similarity is never below −1, so
-`below_floor` — the refusal §8 describes as the main event — is the one nobody will see until P6
-sets a number.
+`below_floor` — the refusal §8 describes as the main event — is unreachable, and stays unreachable
+until somebody ships a measured floor.
 
 **Some citations have no link at all, and that is not a bug.** The permalink table knows two
 forges, `github.com` and `codeberg.org`, because their URL shapes genuinely differ; the *clone*
@@ -1028,22 +1075,29 @@ inferred.
 | **P0** | Skeleton, schema, migrations, compose, CI with live Postgres | done; CI landed with P1 |
 | **P1** | Ingestion: admission, sandbox, job queue, caps, LRU eviction | done |
 | **P2** | AST chunking, embeddings, spans, window fallback | done |
-| **P3** | Retrieval, citations, extractive ask, the floor as a mechanism | done; the floor's *value* is P6 |
-| **P4** | Symbol graph, per-edge provenance, graph endpoints | done; the eval that would say whether it helps is P6 |
+| **P3** | Retrieval, citations, extractive ask, the floor as a mechanism | done; the floor's *value* was handed to P6, which declined to set one |
+| **P4** | Symbol graph, per-edge provenance, graph endpoints | done; no eval has yet asked whether the graph helps retrieval |
 | **P5** | React console | done; the floor it reports refusals against is still a mechanism at −1 |
 | **P6** | Eval harness: generated golden set, AST versus window | done; ran on `google/uuid`, 74 cases. The floor is still **not** calibrated — one corpus was not enough |
 | **P7** | LLM tool loop, hybrid retrieval fusion, incremental re-index | done; **fusion lost the experiment** and `RETRIEVAL_MODE` now defaults to `vector` (branch 4 of a rule fixed before the data). No paid request was ever made — the loop is proved against a deterministic fake |
 | **P8** | Terraform, CD, deploy | done; **never applied** — see [Deployment](#deployment) |
 
-Nothing above is deployed. There is no live instance, no cloud account behind this repository, and
-no benchmark result to quote yet — when there is one, it will come with the numbers that produced
-it. The figures in [Chunking](#chunking-and-the-two-corpora), [Retrieval](#retrieval) and
+Nothing above is deployed. There is no live instance and no cloud account behind this repository.
+The figures in [Chunking](#chunking-and-the-two-corpora), [Retrieval](#retrieval) and
 [The symbol graph](#the-symbol-graph-and-its-honesty) are what indexing and querying one repository
-**cost and produced**. Nothing yet says which chunking retrieves better, nothing says whether
-fusing the two arms beats either alone, the score floor is a knob at `-1` rather than a measured
-threshold, and just under one edge in eight resolving is a measurement rather than a target. All of
-them are P6, and all of them are questions this repository is built to answer with evidence rather
-than to assert.
+**cost and produced**, and the eval's figures come from **one** corpus, `google/uuid`.
+
+Of the four questions this repository was built to answer with evidence, three now have one:
+**fusion does not beat the vector arm** on that corpus's question distribution, by 3.3× a
+pre-registered threshold, and the default moved to `vector` because of it; **AST chunking led the
+window baseline** in the shipped mode, on one corpus, with no pre-registered rule and two
+uncorrected asymmetries in the comparison; and **just under one edge in eight resolves**, which is a
+measurement rather than a target. The fourth is still open and is the one this file will not
+round off: **the score floor is a knob at `-1` rather than a measured threshold.** P6 produced the
+distribution and then declined to calibrate from a single library's documentation style — the
+discipline the "three corpora, named before the run" rule exists for. Two of the three named
+corpora were refused by the leakage probe; [`docs/eval/corpora.md`](docs/eval/corpora.md) accounts
+for every one of them.
 
 ## Deployment
 
@@ -1058,8 +1112,8 @@ request:
 | | Verified with no cloud account | Needs a live account |
 | --- | --- | --- |
 | **Images** | Both application images build and are asserted by `infra/image_test.sh`: one `go` on `PATH` at `/usr/local/go/bin/go`, no `GO*`/`GIT_*`/`*_PROXY` in either `Config.Env`, uid 65532 under a read-only root filesystem answering `/health`, `/ready` and `/metrics`, the RDS trust store readable by the runtime user, and `git clone https://…` succeeding from inside the indexer. | Every push to a registry. The Ollama image has never been built at all. |
-| **Terraform** | `fmt`, `validate`, an offline `plan` under mock credentials on empty state, and 26 assertions over the plan JSON. Two plans of one configuration are identical. | `apply`. Every resource identifier. The destroy → apply → empty-plan cycle. |
-| **Alerts** | `promtool check rules`, `check config` on both scrape files, and `test rules` over 20 cases — every conjunct proved to decide its outcome, and every state alert proved to fire with no traffic at all. | That Prometheus in the deployed VPC can discover either service. |
+| **Terraform** | `fmt`, `validate`, an offline `plan` under mock credentials on empty state, and 29 assertions over the plan JSON. Two plans of one configuration are identical. | `apply`. Every resource identifier. The destroy → apply → empty-plan cycle. |
+| **Alerts** | `promtool check rules`, `check config` on both scrape files, and `test rules` over 21 cases — every conjunct proved to decide its outcome, and four of the five state alerts proved to fire with no traffic at all. | That Prometheus in the deployed VPC can discover either service. |
 | **Smoke test** | All nine assertions, against the built images over `docker compose`, including an end-to-end index of `rs/zerolog`. | The same script against a deployed URL. |
 | **Workflows** | `actionlint` with shellcheck; every third-party action pinned to a resolved commit SHA. | One run. Of anything. |
 
@@ -1158,10 +1212,12 @@ the command that would close it, in
 
 ### Alerts
 
-Twelve rules in `infra/prometheus/alerts.yml`, in four categories: four state
-alerts that carry no minimum-traffic conjunct and are proved to fire with no
-traffic at all, one count rule that is neither, five ratios each carrying a
-conjunct proved to decide its outcome, and one quantile. **No Alertmanager is
+Twelve rules in `infra/prometheus/alerts.yml`, in four categories: **five** state
+alerts that carry no minimum-traffic conjunct, **four** of which are proved to fire
+with no traffic at all (the fifth, `ScoreFloorUncalibrated`, reads a gauge, so its
+case supplies the series and proves the `service` scope instead); one count rule
+that is neither; five ratios each carrying a conjunct proved to decide its outcome;
+and one quantile. **No Alertmanager is
 deployed and nothing pages anyone** — the rules evaluate and are visible in
 Prometheus, and that is the whole claim.
 
@@ -1177,6 +1233,93 @@ rate. So `alb_allowed_cidrs` **has no default and the plan fails without it**.
 `["0.0.0.0/0"]` is a legitimate answer for a public demo — it just has to be an
 answer somebody wrote down.
 
+
+## Configuration
+
+Every environment variable the code reads, with the default it reads when the variable is unset.
+There is no configuration file and no flags apart from the eval runner's; a knob not on this list
+does not exist. The **integer** knobs are range-checked at boot on both binaries and a value that
+does not parse is a refusal to boot naming the setting and the value, not a silent fall back to the
+default.
+
+**Both processes**
+
+| Knob | Default | What it does |
+| --- | --- | --- |
+| `DATABASE_URL` | `postgres://codetrail:codetrail@localhost:55432/codetrail?sslmode=disable` | Postgres. Migrations run at boot. |
+| `ALLOWED_HOSTS` | `github.com,codeberg.org` | Exact-host clone allowlist, replacing the default rather than extending it. **Set to the empty string it admits nothing**, which is a usable way to freeze ingestion. |
+| `EMBED_PROVIDER` | `ollama` | `ollama` or `fake`. The gateway needs it to embed the question; the live suite refuses anything but `fake`. |
+| `EMBED_MODEL` | `nomic-embed-text` | Written into `spans.embed_model`. A corpus indexed by another model is an error, not a low score. |
+| `EMBED_DIM` | `768` | Checked against the schema's `vector(768)` before the first job. |
+| `OLLAMA_URL` | `http://localhost:11435` | Probed once at boot; an unreachable one is a refusal to boot. |
+
+**Gateway**
+
+| Knob | Default | What it does |
+| --- | --- | --- |
+| `PORT` | `8080` | The API listener. |
+| `RETRIEVAL_MODE` | `vector` | `vector`, `lexical` or `hybrid`. Not a request field — see [Retrieval](#retrieval). |
+| `RETRIEVAL_RRF_K` | `60` | Fusion's rank discount. From the paper, not measured here. |
+| `RETRIEVAL_CANDIDATES` | `40` | Per-arm search depth; pgvector's own `hnsw.ef_search` default. |
+| `LEXICAL_SPLIT_IDENTIFIERS` | `true` | Adds a query's camel-case parts to its lexical terms. |
+| `ANSWER_SCORE_FLOOR` | `-1` | The refusal threshold. Setting it never marks it calibrated: the flag means *codetrail* measured the number. |
+| `ANSWER_MAX_SPANS` | `5` | Spans one answer may hold. Also `/ask`'s default `limit`. |
+| `ANSWER_MAX_CHARS` | `8000` | Characters one answer may hold. |
+| `ANSWER_DEFAULT` | `extractive` | What a request that names no `answerer` gets, **even when a provider is configured**. |
+| `LLM_PROVIDER` | `none` | `none`, `fake` or `anthropic`. At `none` no client is built and no key is read. |
+| `LLM_MODEL` | `claude-opus-5` | Not a cost choice — see the cost line below. |
+| `LLM_BASE_URL` | `https://api.anthropic.com` | `https` only, against a compiled-in host allowlist. |
+| `LLM_API_KEY` / `LLM_API_KEY_FILE` | unset | The file is read once at boot. Never a `.env`. |
+| `LLM_MAX_CONCURRENT` | `2` | A semaphore that degrades with `busy` rather than queueing. |
+| `LLM_TOKENS_PER_HOUR` | `200000` | A rolling in-memory budget, **per process**. |
+| `LLM_BELOW_FLOOR` | `false` | Whether a below-floor retrieval may still spend a model call. |
+
+**Indexer**
+
+| Knob | Default | What it does |
+| --- | --- | --- |
+| `PROBE_PORT` | `9090` | `/health`, `/ready` and `/metrics`. Deliberately not `PORT`: a copy-pasted task definition would otherwise serve the wrong process on the right port. |
+| `SCRATCH_DIR` | `$TMPDIR/codetrail` | Where clones land, and the only writable path in the image. Two workers must not share one. |
+| `MAX_REPO_BYTES` | `268435456` (256 MB) | Cap on the clone. The `go` command's caches are outside it. |
+| `MAX_REPO_FILES` | `20000` | Cap on the walk. |
+| `MAX_FILE_BYTES` | `1048576` (1 MB) | Cap on one read. |
+| `JOB_DEADLINE_SECONDS` | `600` | One wall-clock budget for the **whole** job, type-check included. |
+| `MAX_ATTEMPTS` | `3` | Attempts before a job is terminal. |
+| `POLL_SECONDS` | `2` | Lease poll interval. |
+| `KEEP_REPOS` | `50` | Corpus size, enforced by LRU eviction. |
+| `KEEP_TOMBSTONES` | `500` | How many evicted repositories still answer `410` instead of `404`. |
+| `JOB_HISTORY_HOURS` | `168` | How long a terminal job stays pollable. This is spec §14's job-retention question, answered. |
+| `JOB_SWEEP_MINUTES` | `60` | How often that window is enforced. |
+| `EMBED_BATCH` | `32` | Span texts per `Embed` call. |
+| `TYPECHECK` | `true` | The graph stage's kill switch. Off means every edge is `syntactic`. |
+| `TYPECHECK_GOPROXY` | `off` | `off`, or a module proxy an operator trusts. This is the whole network posture of the type-check. |
+| `REINDEX_SKIP_CLONE` | `true` | Resolve the ref first and complete without cloning when that commit is already indexed. |
+| `REINDEX_REUSE` | `true` | Reuse an existing embedding keyed on `(digest, embed_model, embed_dim)`. |
+| `CHUNK_STRATEGY` | `ast` | `ast` or `window`. A property of the run, never of a row. |
+| `CHUNK_WINDOW_LINES` | `40` | Window size for the baseline arm and for the AST arm's fallbacks. |
+| `CHUNK_WINDOW_OVERLAP` | `10` | Window overlap. |
+| `CHUNK_MAX_DECL_LINES` | `200` | Above this a declaration is sub-windowed instead of becoming one useless span. |
+| `STRIP_DOC_COMMENTS` | `false` | Builds the eval corpus of §5. Blanks comment bytes and keeps their newlines, so no line number moves. |
+
+**Tooling, not a deployment knob:** `CODETRAIL_TFPLAN_JSON` points `infra/policy` at a
+`terraform show -json` file; `UPDATE_CONSOLE_FIXTURES` lets the live suite rewrite the console's
+committed fixtures.
+
+**`REINDEX_SKIP_CLONE=false` is the switch that disarms the re-index no-op** described in
+[Re-indexing](#re-indexing-the-same-repository) — the case where changing `EMBED_MODEL` and
+re-submitting everything completes in seconds with the old vectors in place. The three-condition hit
+already guards it, and these two knobs are how an operator turns the fast path off outright, or runs
+the counterfactual that shows what it saved. They default to `true`, so a deployment that has never
+heard of them is running both.
+
+**What one paid request can cost.** `LLM_PROVIDER=anthropic` at the shipped bounds spends at most
+`MaxInputTokens + MaxOutputTokens` = 13,500 tokens on one `/ask`, because both are cumulative
+totals for the whole loop. At Anthropic's list price for the default `claude-opus-5` — $5 per
+million input tokens and $25 per million output, published 2026-06 — that worst case is
+**$0.060 + $0.038 ≈ $0.10 per request**, and `LLM_TOKENS_PER_HOUR` at 200,000 bounds one process at
+roughly fifteen of them an hour. This is arithmetic over a published price list, not a measurement:
+**no paid request has ever been made from this repository.** An operator who wants a cheaper model
+sets `LLM_MODEL`, and this is the number that choice sits in front of.
 
 ## Running what exists
 
@@ -1198,7 +1341,34 @@ DATABASE_URL='postgres://codetrail:codetrail@localhost:55432/codetrail?sslmode=d
 docker compose -f infra/docker-compose.yml --profile ai up -d ollama
 docker compose -f infra/docker-compose.yml exec ollama ollama pull nomic-embed-text
 OLLAMA_URL=http://localhost:11435 go test -tags=ollama ./packages/shared/embed/
+
+# The one suite that COSTS MONEY, behind its own tag for that reason: it is the
+# only thing in this repository that has ever been written to make a paid request,
+# and it never has. See the cost line under Configuration before you run it.
+LLM_PROVIDER=anthropic LLM_API_KEY=sk-… go test -tags=llm ./packages/shared/llm/
 ```
+
+**`_live_test.go` is a naming convention, not a build tag, and it maps to three of them.** `live`
+is the Postgres suite; `ollama` is `embed/ollama_live_test.go`; `llm` is
+`llm/anthropic_live_test.go`. So `go test -tags=live ./...` **silently skips two files whose names
+say "live"** — nothing errors, they are simply not in the build. Run all three tags to run
+everything the convention suggests.
+
+The rest of the checks. `make test` runs the Go suites and the console's; **none of these**, and CI
+runs each of them as its own step:
+
+```bash
+make policy          # terraform plan under mock credentials, then the assertions over its JSON
+make smoke           # the nine-assertion end-to-end script against the built images over compose
+make alerts-test     # promtool check rules + check config on both scrape files + test rules
+make images          # build both application images
+make image-test      # assert what is inside them: uid, filesystem, PATH, trust store, egress
+make migrations-lint # refuse a destructive migration that is not expand-only
+make eval-corpus     # the two indexer passes spec §9's comparison needs, as one command
+```
+
+`make policy` runs `make tf-plan` first, so it needs `terraform` on `PATH`; `make alerts-test` needs
+`promtool`; `make smoke`, `make images` and `make image-test` need Docker.
 
 To actually ask something, run the two binaries against that Postgres and the model above. The
 gateway embeds every question, so it needs an embedder to boot at all:
@@ -1227,10 +1397,20 @@ curl -s "localhost:8080/api/repos/$REPO/symbols/$SYM" | jq .
 curl -s "localhost:8080/api/repos/$REPO/symbols/$SYM/callers?depth=2&limit=10" | jq .
 ```
 
-`depth` defaults to 1 and is refused outside 1..5 with a `400` naming the bound, rather than
-clamped — a caller asking for 40 has misunderstood the endpoint, and quietly serving 5 hides that.
+`depth` defaults to 1 and is refused outside 1..3 with a `400` naming the bound, rather than
+clamped — a caller asking for 40 has misunderstood the endpoint, and quietly serving 3 hides that.
+The ceiling is **3**, lowered from 5 and measured: fan-out in a call graph is multiplicative and the
+depth bound is the only thing that caps it, and `EXPLAIN (ANALYZE)` over 20 mutually-calling symbols
+walks 1,494,559 rows at depth 5 before `LIMIT` sees any of them, and 30 symbols at depth 4 exceeds
+the statement timeout. At 3 the same graphs answer in 79 ms and 1.5 s. Three is also what
+`agent.DefaultToolLimits` gives the model's `callers_of`, so the endpoint and the tool bound the
+same walk the same way.
 `?suffix=true` on the first route opts in to matching a method by its last segment, and the
 response says `"matched":"exact"` or `"matched":"suffix"` so a widening is never silent.
+`?pkg=` narrows the symbol lookup to one package — `…/symbols?name=Logger.Info&pkg=zerolog` — which
+is what makes the route usable on a repository where the same method name appears in several
+packages; the console sends it. `?limit=` bounds the returned list on the symbol
+lookup and the caller walk, defaulting to 20 on each.
 
 The `content-type` header is not optional: without it the body is bound as a form, `q` is empty,
 and the answer is a `400` naming that rule rather than the question you meant to ask.
