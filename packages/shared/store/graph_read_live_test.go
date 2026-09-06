@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mralaminahamed/codetrail/packages/shared/models"
 )
@@ -656,5 +657,133 @@ func TestRepoStatsSplitsEdgesByProvenanceLive(t *testing.T) {
 	}
 	if otherGot != otherWant {
 		t.Errorf("repo B stats %+v, want %+v", otherGot, otherWant)
+	}
+}
+
+// defaultTestLimit is the caller limit the endpoint defaults to
+// (handler.defaultCallerLimit), so the walks below ask for what a request asks
+// for.
+const defaultTestLimit = 20
+
+// seedDenseGraph writes one repository of n definitions in which every
+// definition calls every other.
+//
+// That is not a pathological corpus, it is an ordinary internal util package,
+// and it is the shape the caller walk is worst on: the cycle guard bounds walks
+// that revisit a node and c.depth < $3 bounds hops, but neither bounds FAN-IN,
+// which is what multiplies.
+func seedDenseGraph(t *testing.T, n int) (*Store, string, string) {
+	t.Helper()
+	ctx := context.Background()
+	remote, commit, id := graphIDs(fmt.Sprintf("dense%d", n))
+	s := fresh(t, id)
+	fileID := FileID(id, "a.go")
+	if err := s.PutRepo(ctx, models.Repo{ID: id, Remote: remote, Ref: "main", Commit: commit},
+		[]models.File{{ID: fileID, RepoID: id, Path: "a.go", Blob: "b", Lang: "go", Lines: 4 * n}}); err != nil {
+		t.Fatal(err)
+	}
+	syms := make([]models.Symbol, 0, n)
+	for i := range n {
+		syms = append(syms, mkSym(id, fileID, "a.go", 3+4*i, 5+4*i, models.KindFunc,
+			fmt.Sprintf("f%d", i), ""))
+	}
+	off := 0
+	edges := make([]models.Edge, 0, n*(n-1))
+	for i := range n {
+		for j := range n {
+			if i == j {
+				continue
+			}
+			off += 10
+			edges = append(edges, mkEdge(id, syms[i].ID, "a.go", off, 4+4*i, syms[j].Name, syms[j].ID))
+		}
+	}
+	if err := s.PutGraph(ctx, id, syms, edges); err != nil {
+		t.Fatal(err)
+	}
+	// syms[0] is the target every walk below runs backwards from; every other
+	// definition calls it directly, and each other.
+	return s, id, syms[0].ID
+}
+
+// The measurement the bound exists for. Rows the recursive union produces
+// before LIMIT, from EXPLAIN (ANALYZE) over definitions that all call each
+// other — LIMIT applies after the whole CTE materialises, so none of it is
+// saved by asking for 20 rows:
+//
+//	definitions  depth 1  depth 2  depth 3  depth 4    depth 5
+//	          8        7       49      259      1099       3619
+//	         16       15      225    2,955    35,715    396,075
+//	         20       19      361    6,175    99,199  1,494,559
+//	         30       29      841   22,765     >20s        >20s
+//
+// And what CallersOf itself then does, with the timeout in force: 20 answer in
+// 79ms at depth 3 and 3.4s at depth 4; 30 answer in 1.5s at depth 3 and are
+// cancelled at depth 4; 40 are cancelled at depth 3. A 40-definition package
+// where everything calls everything is an ordinary internal util package.
+//
+// depth 5 over 40 is chosen here because it is the one combination that cannot
+// plausibly finish on a faster machine — the plan for the smaller ones varies
+// between runs, and a test that asserts cancellation on a walk that sometimes
+// completes is a flake.
+func TestADenseFanInWalkIsBoundedByTheServerAndNotByGoLive(t *testing.T) {
+	s, repo, target := seedDenseGraph(t, 40)
+	// A deadline well past the server's, so an unbounded walk fails this test
+	// in seconds rather than in minutes — and so the two bounds are
+	// distinguishable in the error.
+	ctx, cancel := context.WithTimeout(context.Background(), 4*callersTimeout)
+	defer cancel()
+
+	start := time.Now()
+	_, err := s.CallersOf(ctx, repo, target, 5, defaultTestLimit)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatalf("the walk returned in %v; it materialises millions of rows unbounded, "+
+			"so either the fixture stopped being dense or something else answered", elapsed)
+	}
+	if !strings.Contains(err.Error(), "statement timeout") {
+		t.Fatalf("the walk ended after %v with %v, want the SERVER's statement timeout: "+
+			"this endpoint has no request-timeout middleware in front of it, so a bound "+
+			"that only exists in Go is a bound production does not have", elapsed, err)
+	}
+}
+
+// And the walk the endpoint serves still answers over a dense corpus, so the
+// bound above is on the pathological case and not on the read.
+func TestADenseFanInWalkStillAnswersAtTheDepthAnEndpointAsksForLive(t *testing.T) {
+	s, repo, target := seedDenseGraph(t, 20)
+	cs, err := s.CallersOf(context.Background(), repo, target, 3, defaultTestLimit)
+	if err != nil {
+		t.Fatalf("depth 3 over 20 mutually-calling definitions: %v", err)
+	}
+	// Every other definition calls the target directly, so 19 at depth 1.
+	if len(cs) != 19 {
+		t.Errorf("%d callers, want 19", len(cs))
+	}
+}
+
+// readTx's own contract, because the two tests above cannot separate "the
+// timeout is set" from "the query was fast enough anyway".
+func TestAReadTransactionCarriesAStatementTimeoutThatFiresLive(t *testing.T) {
+	ctx := context.Background()
+	s := fresh(t)
+	tx, err := s.readTx(ctx, 100*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+
+	var got string
+	if err := tx.QueryRow(ctx, `SHOW statement_timeout`).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != "100ms" {
+		t.Errorf("statement_timeout inside the read is %q, want %q", got, "100ms")
+	}
+	// Set is not the same as enforced: a server that ignored it would still
+	// report it here.
+	if _, err := tx.Exec(ctx, `SELECT pg_sleep(2)`); err == nil ||
+		!strings.Contains(err.Error(), "statement timeout") {
+		t.Errorf("a two-second statement under a 100ms timeout failed with %v, want cancellation", err)
 	}
 }

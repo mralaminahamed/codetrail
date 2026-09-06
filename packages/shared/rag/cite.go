@@ -117,11 +117,22 @@ func staleness(r models.Repo, newer Newer, now time.Time) Staleness {
 
 // ago is coarse because the claim is "this is how old the index is". Minutes
 // would imply a freshness check that did not happen.
+//
+// Under an hour is a phrase rather than "0 hours", which said the same thing
+// about three seconds and about fifty-nine minutes while quoting a unit this
+// deliberately does not claim. Negative lands there too: Postgres writes
+// indexed_at from its own now() and this compares it against the gateway's
+// clock, so a few seconds of skew between two hosts rendered "indexed -1 hours
+// ago" — a note that reads as a broken corpus rather than as two clocks
+// disagreeing.
 func ago(d time.Duration) string {
-	if days := int(d.Hours() / 24); days >= 1 {
-		return plural(days, "day")
+	switch {
+	case d < time.Hour:
+		return "less than an hour"
+	case d < 24*time.Hour:
+		return plural(int(d.Hours()), "hour")
 	}
-	return plural(int(d.Hours()), "hour")
+	return plural(int(d.Hours()/24), "day")
 }
 
 func plural(n int, unit string) string {

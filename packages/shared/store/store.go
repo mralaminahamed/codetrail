@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -107,6 +108,21 @@ func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 // agrees on it.
 const migrateLockKey int64 = 0x0C0DE7241
 
+// migrateTimeout bounds the whole run.
+//
+// The transaction below holds pg_advisory_xact_lock from before it reads the
+// ledger until it commits, so a migration that wedges — a lock wait on a busy
+// table, a statement that does not return — blocks every OTHER process trying
+// to boot against this database for as long as it lasts. Both binaries call New
+// before they serve anything and both pass context.Background(), so without a
+// deadline of its own "as long as it lasts" is forever.
+//
+// 60s is far above any migration in this tree, which applies the whole set to
+// an empty database in well under a second, and far below how long a deploy
+// would sit before anyone looked. A var so a test can shorten it; nothing
+// writes it in production.
+var migrateTimeout = 60 * time.Second
+
 // migrate applies every embedded migration whose name is not already recorded,
 // in filename order. Names are sorted rather than globbed in directory order so
 // 0010 cannot run before 0002.
@@ -121,10 +137,17 @@ const migrateLockKey int64 = 0x0C0DE7241
 // One transaction rather than one per migration: a half-applied schema is worse
 // than none, and the lock has to span the whole run anyway.
 func (s *Store) migrate(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, migrateTimeout)
+	defer cancel()
+
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
+	// On the deadline this rollback is a no-op on an expired context, and the
+	// connection is then destroyed rather than returned to the pool. Either way
+	// the session ends and the advisory lock goes back, which is what the
+	// deadline is for.
 	defer tx.Rollback(ctx)
 
 	// Before the CREATE TABLE too — concurrent CREATE TABLE IF NOT EXISTS is
