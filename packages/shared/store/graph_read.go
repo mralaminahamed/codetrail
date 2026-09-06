@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -125,14 +126,71 @@ const callersSQL = `
 	ORDER BY depth, s.path, s.start_line, s.id
 	LIMIT $4`
 
+// callersTimeout is how long the SERVER will spend on one caller walk before
+// cancelling it.
+//
+// The two controls in callersSQL bound cycles and hops. Neither bounds FAN-IN,
+// which is what multiplies, and LIMIT applies only after the whole CTE has
+// materialised. Measured with EXPLAIN (ANALYZE) over definitions that all call
+// each other: 20 of them produce 6,175 rows at depth 3 and 1,494,559 at depth
+// 5; 30 of them do not finish inside 20 seconds at depth 4. A package where
+// everything calls everything is an ordinary internal util package.
+//
+// Nothing else bounds it. There is no rate limit, no request-timeout
+// middleware and no statement_timeout on the server, and pgxpool's default
+// MaxConns is max(4, NumCPU) — so a handful of such GETs hold every connection
+// in the pool and /ready cannot get one to Ping with.
+//
+// 5s because it separates the two populations rather than splitting either:
+// the widest bounded walk measured here is 1.4s and the unbounded ones need
+// 5.7s and up.
+const callersTimeout = 5 * time.Second
+
+// readTx begins a read whose statements the server itself will cancel after
+// timeout.
+//
+// SET LOCAL inside a transaction, not statement_timeout in the DSN: one
+// DATABASE_URL serves this process's read path AND the indexer's bulk writes,
+// so a number on the connection string is either too long to bound a read or
+// short enough to kill an index.
+//
+// set_config's third argument is is_local, and it takes a bind parameter where
+// SET LOCAL does not — the habit rather than the risk, since the value here is
+// a constant. is_local buys nothing measurable while this transaction only ever
+// rolls back, because a rollback undoes a session SET too: no test in this
+// suite can tell the two apart. It is written for the day one of these commits,
+// when a session SET would ride the pooled connection into whatever borrows it
+// next.
+func (s *Store) readTx(ctx context.Context, timeout time.Duration) (pgx.Tx, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `SELECT set_config('statement_timeout', $1, true)`, timeout.String()); err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, err
+	}
+	return tx, nil
+}
+
 // CallersOf walks edges backwards from one symbol, nearest first.
 //
 // repo_id is in both terms although to_symbol_id already pins the repository —
 // SymbolID hashes the repo id, so an id cannot collide across two of them. The
 // clause is what stops a cross-repo traversal the day that stops being true,
 // and it costs nothing today.
+//
+// The transaction is here only to scope callersTimeout, so it rolls back:
+// nothing in it writes, and a Commit would be a claim about work that was not
+// done.
 func (s *Store) CallersOf(ctx context.Context, repoID, symbolID string, depth, limit int) ([]Caller, error) {
-	rows, err := s.pool.Query(ctx, callersSQL, repoID, symbolID, depth, limit)
+	tx, err := s.readTx(ctx, callersTimeout)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	rows, err := tx.Query(ctx, callersSQL, repoID, symbolID, depth, limit)
 	if err != nil {
 		return nil, err
 	}
