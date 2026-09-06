@@ -3,12 +3,10 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -321,18 +319,10 @@ func goToolchain() string {
 	return p
 }
 
-// typecheckEnabled reads the kill switch, and parses it rather than comparing
-// against "true" for stripDocs' reason: TYPECHECK=no would otherwise read as
-// enabled, and a knob an operator believes is in force and is not is the shape
-// of bug this project has already shipped.
-func typecheckEnabled() (bool, error) {
-	v := config.Get("TYPECHECK", "true")
-	b, err := strconv.ParseBool(v)
-	if err != nil {
-		return false, fmt.Errorf("TYPECHECK must be a boolean, got %q", v)
-	}
-	return b, nil
-}
+// typecheckEnabled reads the graph stage's kill switch. Through config.GetBool,
+// so TYPECHECK=no is a refusal to boot rather than a switch an operator
+// believes is in force and is not.
+func typecheckEnabled() (bool, error) { return config.GetBool("TYPECHECK", true) }
 
 // typecheckProxy reads the module proxy the type-check may use, and refuses a
 // bad one at boot.

@@ -71,6 +71,30 @@ func GetInt(key string, def int) (int, error) {
 	return n, nil
 }
 
+// GetBool reads a boolean setting, or def when it is unset or empty.
+//
+// PARSED, never compared against "true". TYPECHECK=no and
+// STRIP_DOC_COMMENTS=yes would otherwise read as their opposites, and a knob an
+// operator believes is in force and is not is the shape of bug this project has
+// already shipped. A value that is not a boolean is an error rather than the
+// default, for GetInt's reason.
+//
+// Here rather than once per binary. The rule was written out five times — one
+// helper per package plus three call sites, two of them byte-identical — which
+// is the drift GetInt was extracted to stop after RETRIEVAL_CANDIDATES=4O ran
+// at 40 and said nothing.
+func GetBool(key string, def bool) (bool, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return def, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("%s must be a boolean, got %q", key, v)
+	}
+	return b, nil
+}
+
 func MustGet(key string) string {
 	v, ok := os.LookupEnv(key)
 	if !ok || v == "" {
