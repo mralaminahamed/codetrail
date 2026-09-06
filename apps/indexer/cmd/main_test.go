@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -771,6 +772,48 @@ func TestSweepHomeLeavesAPeersTreeAlone(t *testing.T) {
 	}
 	if _, err := os.Stat(peer); err != nil {
 		t.Errorf("a peer's checkout was swept away: %v", err)
+	}
+}
+
+// A repository over the size cap is refused for good, and everything else the
+// clone can fail with keeps its attempts.
+//
+// The cap is checked after the fetch — nothing bounds what reaches the disk
+// while git runs except the deadline (clone.Run) — so a retry is a second and
+// third full download of a repository that cannot fit, up to 3 × MAX_REPO_BYTES
+// through the ephemeral volume for one anonymous submission.
+//
+// The transport failure is asserted alongside, because "terminal" is only a
+// property if something is still retried: a mutant that failed every clone
+// finally would pass the first case on its own.
+func TestAnOverSizedRepositoryIsRefusedForGoodAndOtherCloneFailuresAreRetried(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		err     error
+		wantMax int // 0 is terminal; the attempt budget is a retry
+	}{
+		{"over the size cap", fmt.Errorf("%w: 300 bytes > 200", clone.ErrTooLarge), 0},
+		{"the forge hung up", errors.New("clone: exit status 128: could not read from remote"), -1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q := &fakeQueue{}
+			ix, _ := testIndexer(t, q)
+			ix.clone = func(context.Context, string, string, string, clone.Limits) (clone.Result, error) {
+				return clone.Result{}, tc.err
+			}
+			want := tc.wantMax
+			if want == -1 {
+				want = ix.lim.tries
+			}
+			ix.runJob(context.Background(), aJob())
+
+			if len(q.failed) != 1 || q.failed[0].max != want {
+				t.Fatalf("want one failure with max %d, got %+v", want, q.failed)
+			}
+			if !strings.Contains(q.failed[0].reason, tc.err.Error()) {
+				t.Errorf("the recorded reason is %q, want git's own words", q.failed[0].reason)
+			}
+		})
 	}
 }
 

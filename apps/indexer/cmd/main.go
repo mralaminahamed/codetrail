@@ -554,6 +554,21 @@ func (ix *indexer) doJob(ctx context.Context, job jobs.Job) string {
 	res, err := ix.clone(jobCtx, remote.URL, job.Ref, dir, ix.lim.clone)
 	if err != nil {
 		l.Warn().Err(err).Msg("clone failed")
+		// Over the size cap is terminal, and it is the only clone failure that
+		// is. The cap is checked AFTER the fetch — clone.Run concedes that
+		// nothing bounds what reaches the disk while git runs except the
+		// deadline — so a retried over-cap repository is downloaded again in
+		// full: three attempts is up to 3 × MAX_REPO_BYTES through the
+		// ephemeral volume, at the choosing of whoever submitted it.
+		//
+		// The counter-argument is the one an unlisted host gets above: an
+		// operator can raise MAX_REPO_BYTES, so a retry is not certainly
+		// futile. The difference is the cost. Refusing an unlisted host happens
+		// before any network and its retries are free; this one is paid in full
+		// each time, and an operator who raises the cap can re-submit.
+		if errors.Is(err, clone.ErrTooLarge) {
+			return ix.failFinally(ctx, l, job.ID, err.Error())
+		}
 		return ix.fail(ctx, l, job, err.Error())
 	}
 	files, err := ix.walk(jobCtx, res.Dir, ix.lim.walk)
