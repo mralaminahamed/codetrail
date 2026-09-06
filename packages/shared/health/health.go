@@ -30,9 +30,9 @@ func Register(e *echo.Echo, ready func() bool) {
 
 // Readiness answers /ready from a live dependency check, cached for ttl.
 //
-// Both binaries refuse to boot without Postgres, so the case this exists for is
-// the one boot cannot cover: losing it afterwards. Without this, /ready keeps
-// answering 200 while every query behind it fails. The cache is why a
+// Both binaries refuse to boot without their dependencies, so the case this
+// exists for is the one boot cannot cover: losing one afterwards. Without this,
+// /ready keeps answering 200 while every query behind it fails. The cache is why a
 // struggling database is not probed hardest exactly when it can least answer.
 //
 // Here rather than copied into the indexer: a second implementation would agree
@@ -40,7 +40,7 @@ func Register(e *echo.Echo, ready func() bool) {
 // that are easy to lose in a copy — the gauge on every check and the seeded
 // true — are the two that are silent when they go.
 type Readiness struct {
-	ping    func(context.Context) error
+	deps    []Dep
 	timeout time.Duration
 	ttl     time.Duration
 	log     zerolog.Logger
@@ -51,7 +51,17 @@ type Readiness struct {
 	ok      bool
 }
 
-func NewReadiness(log zerolog.Logger, ping func(context.Context) error) *Readiness {
+// Dep is one dependency /ready covers: the name that reaches the log line, and
+// the check. Named, because "not ready" with no dependency in it sends an
+// operator to the wrong system.
+type Dep struct {
+	Name  string
+	Check func(context.Context) error
+}
+
+// NewReadiness takes the Postgres ping positionally because both binaries have
+// exactly one, and any further dependency by name.
+func NewReadiness(log zerolog.Logger, ping func(context.Context) error, also ...Dep) *Readiness {
 	// The TTL sits under the 30s probe interval an orchestrator uses, so a
 	// probe never reads an answer it could have refreshed; the timeout is well
 	// inside the 5s a container health check allows for the whole command.
@@ -59,7 +69,8 @@ func NewReadiness(log zerolog.Logger, ping func(context.Context) error) *Readine
 	// Seeded true, not zero: this is only reached after boot proved Postgres
 	// reachable, and an unset gauge reads 0, which would alert on every start.
 	metrics.SetReady(true)
-	return &Readiness{ping: ping, timeout: 2 * time.Second, ttl: 10 * time.Second, log: log, now: time.Now}
+	deps := append([]Dep{{Name: "postgres", Check: ping}}, also...)
+	return &Readiness{deps: deps, timeout: 2 * time.Second, ttl: 10 * time.Second, log: log, now: time.Now}
 }
 
 func (r *Readiness) Ready() bool {
@@ -70,17 +81,35 @@ func (r *Readiness) Ready() bool {
 		return r.ok
 	}
 	was, first := r.ok, r.checked.IsZero()
-	ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
-	err := r.ping(ctx)
-	cancel()
+	name, err := r.check()
 	r.ok, r.checked = err == nil, now
 	if err != nil {
-		r.log.Warn().Err(err).Str("dependency", "postgres").Msg("not ready")
+		r.log.Warn().Err(err).Str("dependency", name).Msg("not ready")
 	} else if !was && !first {
 		r.log.Info().Msg("ready again")
 	}
 	metrics.SetReady(r.ok)
 	return r.ok
+}
+
+// check runs the dependencies in order and stops at the first failure: one is
+// enough to be not ready, and asking the rest is a round trip whose answer
+// changes nothing.
+//
+// Each gets its own timeout rather than sharing one, so a slow dependency
+// cannot make a healthy one look broken. The worst case is therefore
+// len(deps) * timeout, which stays under the interval an orchestrator probes
+// on.
+func (r *Readiness) check() (string, error) {
+	for _, d := range r.deps {
+		ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
+		err := d.Check(ctx)
+		cancel()
+		if err != nil {
+			return d.Name, err
+		}
+	}
+	return "", nil
 }
 
 // probeTimeout bounds the container health check's one request. Well inside the
