@@ -547,7 +547,14 @@ func TestAnExhaustedTokenBudgetDegradesAndSaysSo(t *testing.T) {
 func TestTheBudgetIsSpentFromReportedUsageWhenTheProviderReportsIt(t *testing.T) {
 	now := fixtureNow
 	b := newBudget(100_000, func() time.Time { return now })
-	b.spend(9000)
+	// Reserved at the worst case and settled at the reported one, which is the
+	// pairing the loop makes: the reservation comes back off, and only what was
+	// actually used stays charged.
+	const worstCase = 13_500
+	if !b.allow(worstCase) {
+		t.Fatalf("a worst-case request did not fit an empty budget of 100,000")
+	}
+	b.spend(worstCase, 9000)
 	if got := b.remaining(); got != 91_000 {
 		t.Errorf("budget_remaining %d, want 91000", got)
 	}
@@ -579,7 +586,10 @@ func TestTheBudgetIsSpentFromReportedUsageWhenTheProviderReportsIt(t *testing.T)
 func TestTheBudgetWindowRolls(t *testing.T) {
 	now := fixtureNow
 	b := newBudget(1000, func() time.Time { return now })
-	b.spend(900)
+	if !b.allow(900) {
+		t.Fatalf("900 did not fit an empty budget of 1000")
+	}
+	b.spend(900, 900)
 	if b.allow(200) {
 		t.Errorf("a request over the budget was allowed")
 	}
@@ -587,6 +597,9 @@ func TestTheBudgetWindowRolls(t *testing.T) {
 	if !b.allow(200) {
 		t.Errorf("the budget did not roll after an hour")
 	}
+	// Settled, because a reservation is not a spend: the gauge below would
+	// otherwise still be holding what the allow above put aside.
+	b.spend(200, 0)
 	if got := b.remaining(); got != 1000 {
 		t.Errorf("budget_remaining %d after the window rolled, want 1000", got)
 	}
@@ -657,6 +670,32 @@ func TestABelowFloorRefusalStillRefusesWhenTheLoopDegrades(t *testing.T) {
 	}
 	if _, ok := out["llm"]; !ok {
 		t.Errorf("no llm block on a refusal after the loop ran: %s", rec2s(out))
+	}
+}
+
+// LLM_BELOW_FLOOR says what it does: it lets the loop run on a result the FLOOR
+// refused. unscored is not a floor refusal — it is a top score that is not a
+// number at all, so there is nothing for a floor to have been lenient about —
+// and before this the knob silently enabled a second, undocumented behaviour.
+func TestTheBelowFloorKnobDoesNotRunTheLoopOnAnUnscoredRefusal(t *testing.T) {
+	res := result(rag.ModeHybrid, math.NaN(), true)
+	h, f := llmHandler(t, newStore(), &fakeRetriever{res: res}, answeringTurns("never [1]")...)
+	h.LLM.(*Loop).BelowFloor = true
+
+	out := body(t, askBody(t, h, `{"q":"sampler"}`))
+	if out["refused"] != true || out["reason"] != string(rag.ReasonUnscored) {
+		t.Fatalf("response %s, want an unscored refusal", rec2s(out))
+	}
+	// The recorder, because the response is a refusal either way and the
+	// payload alone cannot tell whether spend happened.
+	if n := len(f.Requests()); n != 0 {
+		t.Errorf("the model was called %d time(s) on an unscored refusal with LLM_BELOW_FLOOR=true, want 0", n)
+	}
+	if _, ok := out["llm"]; ok {
+		t.Errorf("an llm block on a refusal the loop never ran for: %s", rec2s(out))
+	}
+	if _, ok := out["degraded"]; ok {
+		t.Errorf("a short-circuit is not a degradation: %v", out["degraded"])
 	}
 }
 
@@ -1039,5 +1078,168 @@ func TestAnswererIsRefusedOnSearchAndHonouredOnAsk(t *testing.T) {
 	}
 	if len(f.Requests()) == 0 {
 		t.Errorf("ask with answerer:llm called no model")
+	}
+}
+
+// The two degradations the gateway decides before agent.Run is ever called
+// build their own trace, and it reaches a client as llm.tools. Before this it
+// was null on exactly those and [] on every loop that ran one — one field, two
+// spellings of empty, chosen by which stop fired.
+func TestADegradationThatCalledNoToolServesToolsAsAnEmptyList(t *testing.T) {
+	h := hermeticHandler(newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)})
+	// A budget under one worst-case request, so the loop is refused before any
+	// model call and the trace is the handler's own.
+	h.LLM = NewLoop(llm.NewFake(answeringTurns("never [1]")...),
+		&fakeCorpus{res: result(rag.ModeHybrid, 0.83, true)},
+		agent.DefaultBounds(), agent.DefaultToolLimits(), false, 2, 100,
+		func() time.Time { return fixtureNow })
+	h.AnswerDefault = answererLLM
+
+	rec := askBody(t, h, `{"q":"sampler"}`)
+	out := body(t, rec)
+	deg, _ := out["degraded"].(map[string]any)
+	if deg == nil || deg["reason"] != string(agent.StopBudgetExhausted) {
+		t.Fatalf("degraded %v, want reason budget_exhausted", out["degraded"])
+	}
+	if !strings.Contains(rec.Body.String(), `"tools":[]`) {
+		t.Errorf("llm.tools is not an empty list: %s", rec.Body)
+	}
+}
+
+// A bound that reads the total and lets go is a report, not a ceiling: the
+// spend it is guarding happens up to a minute later, so every request that
+// starts inside that window sees a total none of them has added to yet.
+func TestTheBudgetReservesTheWorstCaseRatherThanOnlyReadingIt(t *testing.T) {
+	now := fixtureNow
+	b := newBudget(1000, func() time.Time { return now })
+	if !b.allow(400) || !b.allow(400) {
+		t.Fatalf("two 400-token worst cases did not fit a budget of 1000")
+	}
+	// Nothing has been spent yet — spent is empty and total is 0 — so a check
+	// that only read the total would allow this and every one after it.
+	if b.allow(400) {
+		t.Errorf("a third worst case was allowed against 1000 with 800 already in flight")
+	}
+	if got := b.remaining(); got != 200 {
+		t.Errorf("budget_remaining %d with 800 reserved, want 200", got)
+	}
+	// And the reservation is released by the settlement, not held for the
+	// window: two loops that used almost nothing leave the budget almost whole.
+	b.spend(400, 10)
+	b.spend(400, 10)
+	if got := b.remaining(); got != 980 {
+		t.Errorf("budget_remaining %d after two 10-token loops settled, want 980", got)
+	}
+	if !b.allow(400) {
+		t.Errorf("a settled budget refused a worst case it has room for")
+	}
+}
+
+// gateModel holds every call until release is closed and counts how many
+// arrived, so a test can see how many requests got past the spend controls
+// while none of them had finished paying. blockingModel holds only the first.
+type gateModel struct {
+	release chan struct{}
+	mu      sync.Mutex
+	entered int
+}
+
+func (g *gateModel) Name() string { return "fake-gate" }
+
+func (g *gateModel) Complete(_ context.Context, _ llm.Request) (llm.Response, error) {
+	g.mu.Lock()
+	g.entered++
+	g.mu.Unlock()
+	<-g.release
+	// No tool call and no marker, so every loop that got here stops uncited
+	// without touching a shared fixture from eight goroutines.
+	return llm.Response{Text: "nothing to cite", Usage: llm.Usage{InputTokens: 11000, OutputTokens: 0}}, nil
+}
+
+func (g *gateModel) arrived() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.entered
+}
+
+// The concurrent case, which is the only one the defect shows in. The budget is
+// one worst-case request and the concurrency cap is eight, so the semaphore
+// admits all eight and the budget is the only thing between them and the
+// provider.
+//
+// Measured before the reservation: 8 of 8 reached the model, and at 11,000
+// reported input tokens each that is 88,000 spent against a budget of 13,500.
+func TestTheBudgetCeilingHoldsWhenEightRequestsArriveAtOnce(t *testing.T) {
+	const concurrent = 8
+	const worstCase = 13_500 // agent.DefaultBounds(): 12,000 in + 1,500 out.
+
+	g := &gateModel{release: make(chan struct{})}
+	t.Cleanup(func() {
+		select {
+		case <-g.release:
+		default:
+			close(g.release)
+		}
+	})
+
+	h := hermeticHandler(newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)})
+	h.LLM = NewLoop(g, &fakeCorpus{res: result(rag.ModeHybrid, 0.83, true)},
+		agent.DefaultBounds(), agent.DefaultToolLimits(), false, concurrent, worstCase,
+		func() time.Time { return fixtureNow })
+	h.AnswerDefault = answererLLM
+	e := mount(h)
+
+	done := make(chan struct{}, concurrent)
+	for range concurrent {
+		go func() {
+			do(e, http.MethodPost, "/api/repos/repo-1/ask", `{"q":"sampler"}`)
+			done <- struct{}{}
+		}()
+	}
+	// Every request has either reached the model or been turned away; without
+	// this the count below could be read before the eighth goroutine started.
+	waitFor(t, func() bool { return g.arrived()+len(done) == concurrent })
+
+	if n := g.arrived(); n != 1 {
+		t.Errorf("%d of %d requests reached the model against a budget of one worst case (%d tokens); "+
+			"they would spend %d", n, concurrent, worstCase, n*11000)
+	}
+	close(g.release)
+	for range concurrent {
+		<-done
+	}
+}
+
+// codetrail_llm_steps counts MODEL CALLS PER LOOP and its buckets start at 1,
+// so an observation of 0 lands in le="1" and reads as a loop that made one
+// call. busy and budget_exhausted are both decided before agent.Run is ever
+// reached: no model call, and so no sample of how many a loop makes.
+//
+// budget_exhausted here because it needs no goroutines; the guard is on
+// Steps == 0, which is what the two have in common.
+func TestALoopThatNeverRanFilesNoStepObservation(t *testing.T) {
+	before := llmCounters(t)
+	h := hermeticHandler(newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)})
+	h.LLM = NewLoop(llm.NewFake(answeringTurns("never [1]")...),
+		&fakeCorpus{res: result(rag.ModeHybrid, 0.83, true)},
+		agent.DefaultBounds(), agent.DefaultToolLimits(), false, 2, 100,
+		func() time.Time { return fixtureNow })
+	h.AnswerDefault = answererLLM
+
+	out := body(t, askBody(t, h, `{"q":"sampler"}`))
+	deg, _ := out["degraded"].(map[string]any)
+	if deg == nil || deg["reason"] != string(agent.StopBudgetExhausted) {
+		t.Fatalf("degraded %v, want reason budget_exhausted", out["degraded"])
+	}
+	moved := llmMovedSince(t, before)
+	if moved["codetrail_llm_steps_count"] != 0 {
+		t.Errorf("codetrail_llm_steps_count moved %v for a loop that made no model call; "+
+			"the bucket that 0 lands in is the one that means a single call",
+			moved["codetrail_llm_steps_count"])
+	}
+	// The degradation is still counted — a stop nothing records is a
+	// degradation nobody can see, which is the opposite defect.
+	if got := moved[`codetrail_llm_stop_total{reason="budget_exhausted"}`]; got != 1 {
+		t.Errorf(`codetrail_llm_stop_total{reason="budget_exhausted"} moved %v, want 1`, got)
 	}
 }
