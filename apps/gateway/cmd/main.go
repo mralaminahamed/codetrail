@@ -103,7 +103,7 @@ func answering(log zerolog.Logger, rd handler.Reader, r *rag.Retriever) (handler
 			Msg("no model provider configured; every answer is extractive and nothing is a degradation")
 		return nil, def, nil
 	}
-	belowFloor, err := boolEnv("LLM_BELOW_FLOOR", "false")
+	belowFloor, err := config.GetBool("LLM_BELOW_FLOOR", false)
 	if err != nil {
 		return nil, "", err
 	}
@@ -138,18 +138,6 @@ func answering(log zerolog.Logger, rd handler.Reader, r *rag.Retriever) (handler
 		Int("worst_case_tokens", b.MaxInputTokens+b.MaxOutputTokens).
 		Msg("answering loop configured; the token budget is per process and is not shared across replicas")
 	return handler.NewLoop(m, corpusOf(rd, r), b, lim, belowFloor, concurrent, perHour, time.Now), def, nil
-}
-
-// boolEnv parses rather than comparing against "true". The house rule, stated
-// three times in this codebase: a knob an operator believes is in force and is
-// not is the shape of bug this project has already shipped.
-func boolEnv(key, def string) (bool, error) {
-	v := config.Get(key, def)
-	b, err := strconv.ParseBool(v)
-	if err != nil {
-		return false, fmt.Errorf("%s must be a boolean, got %q", key, v)
-	}
-	return b, nil
 }
 
 // answerBudget reads what one answer may hold. Both knobs are validated rather
@@ -264,12 +252,7 @@ func newRetriever(ctx context.Context, log zerolog.Logger, st rag.Searcher) (*ra
 // LEXICAL_SPLIT_IDENTIFIERS=yes would otherwise read as false and quietly
 // narrow every lexical query.
 func splitIdentifiers() (bool, error) {
-	v := config.Get("LEXICAL_SPLIT_IDENTIFIERS", "true")
-	b, err := strconv.ParseBool(v)
-	if err != nil {
-		return false, fmt.Errorf("LEXICAL_SPLIT_IDENTIFIERS must be a boolean, got %q", v)
-	}
-	return b, nil
+	return config.GetBool("LEXICAL_SPLIT_IDENTIFIERS", true)
 }
 
 // scoreFloor reads ANSWER_SCORE_FLOOR and refuses what a cosine similarity
