@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -192,6 +193,11 @@ func testIndexer(t *testing.T, q *fakeQueue) (*indexer, *bytes.Buffer) {
 			t.Error("evict ran when it should not have")
 			return 0, errors.New("unexpected evict")
 		},
+		// A cleanup on the terminal-failure path rather than a step a test
+		// opts into, so it answers instead of failing the test: every job that
+		// fails against its attempt budget reaches it, and a stub that failed
+		// there would make "this job was retried" untestable.
+		dropRepo: func(context.Context, string) (bool, error) { return false, nil },
 
 		// The incremental re-index's five reads. skipClone is OFF here so every
 		// existing test still drives the cloning path unchanged; a test that
@@ -585,6 +591,48 @@ func TestRunJobRemovesTheScratchTreeOnEveryPath(t *testing.T) {
 	}
 }
 
+// The post-job removal reports what it could not remove.
+//
+// removeScratch's own doc records the measurement this is about: with a proxy
+// configured, the module cache's directories are written 0555 and RemoveAll
+// then leaks not the cache but the whole tree it is in, one job at a time. The
+// pre-clone call at the top of doJob logged; the two deferred calls after the
+// work discarded their error, so the disk filled with nothing saying why.
+func TestAScratchTreeThatCannotBeRemovedAfterTheJobIsLogged(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root unlinks from a read-only directory")
+	}
+	ix, rec := fakeIndexer(t)
+	inner := ix.clone
+	ix.clone = func(ctx context.Context, remote, ref, d string, lim clone.Limits) (clone.Result, error) {
+		res, err := inner(ctx, remote, ref, d, lim)
+		// After the pre-clone removal, so this is the deferred one failing and
+		// not the guarded one. Freezing the PARENT is what makes it fail:
+		// removeScratch restores the permissions of the tree it is removing,
+		// and unlinking needs write permission on the directory above it.
+		home := filepath.Dir(d)
+		if cerr := os.Chmod(home, 0o500); cerr != nil {
+			t.Fatal(cerr)
+		}
+		t.Cleanup(func() { _ = os.Chmod(home, 0o700) })
+		return res, err
+	}
+	ix.runJob(context.Background(), aJob())
+
+	if len(rec.completed) != 1 {
+		t.Fatalf("the job did not complete: %+v", rec.failed)
+	}
+	out := rec.logged.String()
+	if !strings.Contains(out, "could not clear the scratch directory after the job") {
+		t.Errorf("the leaked tree is not in the log: %s", out)
+	}
+	// The control: the checkout really is still there, so the log line is
+	// reporting something rather than describing a removal that worked.
+	if _, err := os.Stat(filepath.Join(ix.home(), "job1")); err != nil {
+		t.Errorf("the checkout was removed after all, so this test proves nothing: %v", err)
+	}
+}
+
 // git clone refuses a non-empty destination, so a checkout left by a crash
 // would fail every retry of that job on the leftover rather than on the
 // repository.
@@ -771,6 +819,213 @@ func TestSweepHomeLeavesAPeersTreeAlone(t *testing.T) {
 	}
 	if _, err := os.Stat(peer); err != nil {
 		t.Errorf("a peer's checkout was swept away: %v", err)
+	}
+}
+
+// A repository over the size cap is refused for good, and everything else the
+// clone can fail with keeps its attempts.
+//
+// The cap is checked after the fetch — nothing bounds what reaches the disk
+// while git runs except the deadline (clone.Run) — so a retry is a second and
+// third full download of a repository that cannot fit, up to 3 × MAX_REPO_BYTES
+// through the ephemeral volume for one anonymous submission.
+//
+// The transport failure is asserted alongside, because "terminal" is only a
+// property if something is still retried: a mutant that failed every clone
+// finally would pass the first case on its own.
+func TestAnOverSizedRepositoryIsRefusedForGoodAndOtherCloneFailuresAreRetried(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		err     error
+		wantMax int // 0 is terminal; the attempt budget is a retry
+	}{
+		{"over the size cap", fmt.Errorf("%w: 300 bytes > 200", clone.ErrTooLarge), 0},
+		{"the forge hung up", errors.New("clone: exit status 128: could not read from remote"), -1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q := &fakeQueue{}
+			ix, _ := testIndexer(t, q)
+			ix.clone = func(context.Context, string, string, string, clone.Limits) (clone.Result, error) {
+				return clone.Result{}, tc.err
+			}
+			want := tc.wantMax
+			if want == -1 {
+				want = ix.lim.tries
+			}
+			ix.runJob(context.Background(), aJob())
+
+			if len(q.failed) != 1 || q.failed[0].max != want {
+				t.Fatalf("want one failure with max %d, got %+v", want, q.failed)
+			}
+			if !strings.Contains(q.failed[0].reason, tc.err.Error()) {
+				t.Errorf("the recorded reason is %q, want git's own words", q.failed[0].reason)
+			}
+		})
+	}
+}
+
+// A job that dies terminally between PutRepo and PutSpans must not leave the
+// repository behind.
+//
+// The three writes are three transactions, so the repo row and its files are
+// committed while the spans are not. GET /repos then lists a repository /ask
+// refuses no_spans forever — and because PutRepo winds last_queried_at it is
+// the MOST recently "queried" row, so Evict takes it last and it holds a quota
+// slot indefinitely. Nothing else sweeps a repo with zero spans.
+//
+// The retry case is asserted alongside, and it is the half that says why this
+// is not simply part of fail(): an attempt that will be tried again writes the
+// same repo id, and a worker whose lease expired mid-job must not delete the
+// row the worker that took the job is filling in.
+func TestATerminalFailureAfterTheRepoWriteRemovesTheRepo(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		attempts int
+		wantDrop bool
+	}{
+		{"the last attempt", 4, true},
+		{"an attempt that will be retried", 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ix, rec := fakeIndexer(t)
+			ix.putSpans = func(context.Context, string, []store.EmbeddedSpan, string, int) error {
+				return errors.New("spans exploded")
+			}
+			job := aJob()
+			job.Attempts = tc.attempts
+			ix.runJob(context.Background(), job)
+
+			if len(rec.failed) != 1 {
+				t.Fatalf("want one failure, got %+v", rec.failed)
+			}
+			want := []string{store.RepoID("github.com/a/b", testCommit)}
+			if !tc.wantDrop {
+				want = nil
+			}
+			if !slices.Equal(rec.dropped, want) {
+				t.Errorf("the cleanup was asked to remove %v, want %v", rec.dropped, want)
+			}
+		})
+	}
+}
+
+// The cleanup is a repair, not an outcome: it must not turn a recorded failure
+// into a different one, and a database that will not answer it must not cost
+// the worker anything more than a log line.
+func TestAFailedCleanupIsLoggedAndChangesNothingElse(t *testing.T) {
+	ix, rec := fakeIndexer(t)
+	ix.putSpans = func(context.Context, string, []store.EmbeddedSpan, string, int) error {
+		return errors.New("spans exploded")
+	}
+	ix.dropRepo = func(context.Context, string) (bool, error) {
+		return false, errors.New("postgres went away")
+	}
+	job := aJob()
+	job.Attempts = ix.lim.tries
+	ix.runJob(context.Background(), job)
+
+	if len(rec.failed) != 1 || rec.failed[0].reason != "spans exploded" {
+		t.Fatalf("the recorded failure is %+v, want the span write's own reason", rec.failed)
+	}
+	if out := rec.logged.String(); !strings.Contains(out, "postgres went away") {
+		t.Errorf("the cleanup failure is not in the log: %s", out)
+	}
+}
+
+// ALLOWED_HOSTS is the only SSRF control codetrail has (admit's package doc),
+// and clearing it must grant NOTHING rather than hand the default back.
+//
+// Read through config.Get it failed open, because Get treats present-but-empty
+// as unset. Measured:
+//
+//	ALLOWED_HOSTS=""   -> ["github.com" "codeberg.org"], github.com ADMITTED
+//	ALLOWED_HOSTS=" "  -> [" "],                         github.com refused
+//
+// A single space was the difference between fail-open and fail-closed, for an
+// operator clearing the control on purpose.
+//
+// Asserted through the POLICY and not through the slice: an empty list that
+// admit still admitted from would pass a length check and refuse nothing.
+func TestClearingTheAllowlistAdmitsNoHost(t *testing.T) {
+	for _, v := range []string{"", " "} {
+		t.Run(strconv.Quote(v), func(t *testing.T) {
+			t.Setenv("ALLOWED_HOSTS", v)
+			p := admit.NewPolicy(allowedHosts())
+			for _, remote := range []string{"https://github.com/a/b", "https://codeberg.org/a/b"} {
+				if _, err := p.Check(remote); err == nil {
+					t.Errorf("ALLOWED_HOSTS=%q admitted %s: the default allowlist is back", v, remote)
+				}
+			}
+		})
+	}
+	// The control: an unset knob still gets the default, or the assertion above
+	// would pass against an allowlist reader that returned nothing ever.
+	t.Setenv("ALLOWED_HOSTS", "")
+	os.Unsetenv("ALLOWED_HOSTS")
+	if _, err := admit.NewPolicy(allowedHosts()).Check("https://github.com/a/b"); err != nil {
+		t.Errorf("with ALLOWED_HOSTS unset, github.com is refused: %v", err)
+	}
+}
+
+// The tree leaked without bound across hard kills: workerID generates a fresh
+// id every boot, so sweepHome removes only the running process's own subtree
+// and no future worker ever reached a killed one's. Every OOM-kill stranded up
+// to MAX_REPO_BYTES for good.
+//
+// The boot sweep takes what cannot belong to a live worker and nothing else.
+// The window is the job's deadline plus the lease that outlasts it, and the
+// peer just inside it is the assertion that matters: it is the in-flight clone
+// sweepHome's warning is about, and a sweep that reached it would be the
+// worker-on-worker collision with extra steps.
+func TestTheBootSweepTakesAnAbandonedTreeAndLeavesALiveOne(t *testing.T) {
+	q := &fakeQueue{}
+	ix, logged := testIndexer(t, q)
+	window := 2*ix.lim.clone.Deadline + time.Minute
+
+	trees := map[string]time.Duration{
+		"killed-worker":  window + time.Second,
+		"working-worker": window - time.Second,
+		"fresh-worker":   0,
+	}
+	for name, age := range trees {
+		checkout := filepath.Join(ix.scratch, name, "job1")
+		if err := os.MkdirAll(checkout, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(checkout, "f.go"), []byte("package p\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		at := time.Now().Add(-age)
+		if err := os.Chtimes(filepath.Join(ix.scratch, name), at, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ix.sweepStale()
+
+	for name := range trees {
+		_, err := os.Stat(filepath.Join(ix.scratch, name, "job1", "f.go"))
+		gone := errors.Is(err, os.ErrNotExist)
+		if want := name == "killed-worker"; gone != want {
+			t.Errorf("%s: swept=%v, want %v (%v)", name, gone, want, err)
+		}
+	}
+	if out := logged.String(); !strings.Contains(out, "killed-worker") {
+		t.Errorf("the sweep says nothing about what it removed: %s", out)
+	}
+}
+
+// A scratch directory that does not exist yet is the normal first boot, not a
+// fault to warn about.
+func TestTheBootSweepIsQuietWhenThereIsNothingToSweep(t *testing.T) {
+	q := &fakeQueue{}
+	ix, logged := testIndexer(t, q)
+	ix.scratch = filepath.Join(ix.scratch, "not-created-yet")
+
+	ix.sweepStale()
+
+	if out := logged.String(); out != "" {
+		t.Errorf("a first boot logged %s", out)
 	}
 }
 
@@ -1034,6 +1289,9 @@ type recorder struct {
 	syms   []models.Symbol
 	edges  []models.Edge
 	policy symbols.Policy
+	// dropped is every repo id the terminal-failure cleanup was asked to
+	// remove, in order.
+	dropped []string
 }
 
 func (r *recorder) failReason() string {
@@ -1211,6 +1469,10 @@ func fakeIndexer(t *testing.T, opts ...fixtureOpt) (*indexer, *recorder) {
 		return f.graphErr
 	}
 	ix.evict = func(context.Context, int, int) (int, error) { return 0, nil }
+	ix.dropRepo = func(_ context.Context, id string) (bool, error) {
+		rec.dropped = append(rec.dropped, id)
+		return true, nil
+	}
 	return ix, rec
 }
 
@@ -1631,6 +1893,54 @@ func TestAShortEmbeddingBatchIsRefusedNamingTheEmbedder(t *testing.T) {
 	if !strings.Contains(rec.failReason(), "vectors for") {
 		t.Fatalf("the failure does not name the short batch: %q", rec.failReason())
 	}
+}
+
+// The numbers in an embed failure are indices into SPANS, not positions in the
+// filtered list embedAll was handed.
+//
+// todo is what the reuse pass left to do and exists nowhere else, so after a
+// pass that filled most of the corpus "spans 0-1" names positions in a list
+// nobody can look up. Driven directly, because the whole point is a todo that
+// does not start at 0 — which through runJob would need a reuse pass staged to
+// fill exactly the right rows to say the same thing less clearly.
+func TestAnEmbedFailureNamesTheSpansAndNotThePositionsInTheBatch(t *testing.T) {
+	spans := make([]store.EmbeddedSpan, 40)
+	for i := range spans {
+		spans[i].Text = fmt.Sprintf("span %d", i)
+	}
+	// embedBatch is 2 here, so one batch covers todo[0] and todo[1] — spans 36
+	// and 39, which share no digit with 0 and 1.
+	todo := []int{36, 39}
+
+	for _, tc := range []struct {
+		name string
+		emb  embed.Embedder
+	}{
+		{"the embedder failed", brokenEmbedder{}},
+		{"the embedder answered short", shortEmbedder{Embedder: embed.NewFake(store.EmbeddingDim)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q := &fakeQueue{}
+			ix, _ := testIndexer(t, q)
+			ix.emb = tc.emb
+			err := ix.embedAll(context.Background(), spans, todo)
+			if err == nil {
+				t.Fatal("want an error")
+			}
+			if !strings.Contains(err.Error(), "spans 36-39") {
+				t.Errorf("the error says %q, want it to name spans 36-39", err)
+			}
+		})
+	}
+}
+
+// brokenEmbedder is the transport failure: it answers nothing at all.
+type brokenEmbedder struct{ embed.Embedder }
+
+func (brokenEmbedder) Model() string { return "broken" }
+func (brokenEmbedder) Dim() int      { return store.EmbeddingDim }
+func (brokenEmbedder) Embed(context.Context, []string) ([][]float32, error) {
+	return nil, errors.New("the embedder is down")
 }
 
 type shortEmbedder struct{ embed.Embedder }

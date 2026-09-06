@@ -10,9 +10,12 @@
 // 4).
 //
 // What can drift is shared rather than copied: source.Read walks with
-// walk.Files and filters with walk.Indexable, store.BlobHash hashes the blob,
-// chunk.StripDocs strips and chunk.Chunks chunks, and store.SpanID keys the
-// row. What is reimplemented is the loop that puts them in order, and
+// walk.Files and filters with walk.Indexable, walk.Lines counts the lines,
+// store.BlobHash hashes the blob, chunk.StripDocs strips and chunk.Chunks
+// chunks, and store.SpanID keys the row. walk.Lines is on that list because it
+// was NOT: this file held a correct second copy of a counter the indexer had
+// wrong, so the two derivations disagreed about how long a file is — which is
+// exactly the drift the source-binding check exists to catch. What is reimplemented is the loop that puts them in order, and
 // corpus.Verify is run against the result by the same tests, so a loop that
 // drifted from the indexer's would have to drift in a way that still satisfies
 // every check the product makes.
@@ -27,6 +30,7 @@ import (
 	"github.com/mralaminahamed/codetrail/packages/shared/embed"
 	"github.com/mralaminahamed/codetrail/packages/shared/models"
 	"github.com/mralaminahamed/codetrail/packages/shared/store"
+	"github.com/mralaminahamed/codetrail/packages/shared/walk"
 )
 
 // Options is one arm: which checkout, at which commit, chunked how, stripped
@@ -68,7 +72,7 @@ func Index(ctx context.Context, s *store.Store, o Options) (string, Counters, er
 	for _, f := range files {
 		row := models.File{
 			ID: store.FileID(repoID, f.Path), RepoID: repoID, Path: f.Path,
-			Lang: f.Lang, Lines: lines(f.Body),
+			Lang: f.Lang, Lines: walk.Lines(f.Body),
 		}
 		if !f.Read {
 			c.Vanished++
@@ -130,20 +134,4 @@ func Index(ctx context.Context, s *store.Store, o Options) (string, Counters, er
 		return "", c, err
 	}
 	return repoID, c, nil
-}
-
-func lines(body []byte) int {
-	if len(body) == 0 {
-		return 0
-	}
-	n := 1
-	for _, b := range body {
-		if b == '\n' {
-			n++
-		}
-	}
-	if body[len(body)-1] == '\n' {
-		n--
-	}
-	return n
 }

@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
-	"strconv"
 	"time"
 
 	"github.com/mralaminahamed/codetrail/packages/shared/chunk"
@@ -62,15 +60,9 @@ func chunkOptions() (chunk.Options, error) {
 // stripDocs reports whether doc comments are blanked before chunking.
 //
 // Production keeps them — they are the best retrieval signal a span has — and
-// only the eval corpus strips them (spec §9). Parsed rather than compared
-// against "true": STRIP_DOC_COMMENTS=yes would otherwise read as false and
-// build an eval corpus holding the very prose its questions came from, which
-// scores both arms on string overlap and looks like a successful run.
-func stripDocs() (bool, error) {
-	v := config.Get("STRIP_DOC_COMMENTS", "false")
-	b, err := strconv.ParseBool(v)
-	if err != nil {
-		return false, fmt.Errorf("STRIP_DOC_COMMENTS must be a boolean, got %q", v)
-	}
-	return b, nil
-}
+// only the eval corpus strips them (spec §9). Through config.GetBool, which
+// parses rather than comparing against "true": STRIP_DOC_COMMENTS=yes would
+// otherwise read as false and build an eval corpus holding the very prose its
+// questions came from, which scores both arms on string overlap and looks like
+// a successful run.
+func stripDocs() (bool, error) { return config.GetBool("STRIP_DOC_COMMENTS", false) }
