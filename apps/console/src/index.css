@@ -657,6 +657,26 @@ form > * + * {
   block-size: 0.85rem;
 }
 
+/* A citation with no digest is still a citation: it has a location and it says
+   what is missing. Grey rule rather than amber — the amber marks a claim you
+   can check, and this one you cannot. */
+.cite-nodigest {
+  border-inline-start-color: var(--control);
+}
+
+/* A code block with a copy button parked in its corner. The button is OUTSIDE
+   the <pre>, because the pre scrolls horizontally and a button inside it
+   scrolls away with the command. */
+.codeblock {
+  position: relative;
+}
+
+.copy-float {
+  position: absolute;
+  inset-block-start: var(--s2);
+  inset-inline-end: var(--s2);
+}
+
 /* The check command, folded. Open on the single-span page, where it is the
    subject; collapsed in a list, where ten of them are noise. */
 .check {

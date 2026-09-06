@@ -46,7 +46,7 @@ export default function SymbolView() {
             <code>{def.value.symbol.name}</code> ({def.value.symbol.kind}) in{" "}
             <code>{def.value.symbol.pkg}</code>
           </p>
-          <Citation citation={def.value.citation} symbol={def.value.symbol} />
+          <Citation citation={def.value.citation} symbol={def.value.symbol} check="open" />
           <Staleness staleness={def.value.staleness} />
         </>
       )}

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { axe } from "jest-axe";
 import Citation from "./Citation";
 import span from "../api/fixtures/span.json";
@@ -118,6 +119,84 @@ describe("the citation", () => {
       const { container, unmount } = render(el);
       expect(await axe(container)).toHaveNoViolations();
       unmount();
+    }
+  });
+});
+
+// The copy buttons and the folded check. Behaviour, never a class name: what is
+// asserted is which values reach the clipboard and whether the check is open,
+// both of which a reader can feel.
+describe("copying a citation, and where the check is folded", () => {
+  test("the digest and the commit each get a copy button whose name says which", async () => {
+    const user = userEvent.setup();
+    render(<Citation citation={github} />);
+
+    // Named, not counted: two unlabelled buttons on one card are a coin toss
+    // for a screen-reader user, and the labels are the whole fix.
+    await user.click(screen.getByRole("button", { name: "Copy the digest" }));
+    expect(await window.navigator.clipboard.readText()).toBe(github.digest);
+    // The confirmation is on the accessible name, because the button has no
+    // text of its own — it cannot have any, see Copy.tsx.
+    expect(screen.getByRole("button", { name: "Copied the digest" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Copy the commit" }));
+    expect(await window.navigator.clipboard.readText()).toBe(github.commit);
+    // And the digest button has gone back to idle, so two checkmarks never
+    // claim two copies are on the clipboard at once.
+    expect(screen.getByRole("button", { name: "Copy the digest" })).toBeInTheDocument();
+  });
+
+  test("the check command is copyable as one line, pipes and all", async () => {
+    const user = userEvent.setup();
+    render(<Citation citation={github} check="open" />);
+    await user.click(screen.getByRole("button", { name: "Copy the check command" }));
+    const copied = await window.navigator.clipboard.readText();
+    expect(copied).toBe(
+      `git show ${github.commit}:${github.path} | sed -n '${github.start_line},${github.end_line}p' | head -c -1 | sha256sum`,
+    );
+    // The one flag a copy must not lose: without it sha256sum hashes one byte
+    // more than the digest covers and every check a reader runs fails.
+    expect(copied).toContain("| head -c -1 |");
+  });
+
+  test("the tuple's values survive the copy buttons sitting inside them", () => {
+    // The regression this guards: a copy button with a text label inside the
+    // <dd> makes the dd read "abc123…Copy", and the tuple's exactness is the
+    // thing every other assertion in this file rests on.
+    const { container } = render(<Citation citation={github} />);
+    expect(term(container, "Digest")).toBe(github.digest);
+    expect(term(container, "Commit")).toBe(github.commit);
+  });
+
+  test("the check is shut in a list and open where the citation is the subject", () => {
+    const list = render(<Citation citation={github} />);
+    expect(list.container.querySelector("details")?.open).toBe(false);
+    // Shut, not absent: the command is still in the DOM for find-in-page and
+    // the summary is still in the tab order.
+    expect(list.container.textContent).toContain("head -c -1");
+    list.unmount();
+
+    const subject = render(<Citation citation={github} check="open" />);
+    expect(subject.container.querySelector("details")?.open).toBe(true);
+  });
+
+  test("a browser with no clipboard says so rather than doing nothing", async () => {
+    // navigator.clipboard is undefined outright on an insecure origin in
+    // Chrome, and this console has no deployment yet: every hand-run of it so
+    // far has been over plain http on localhost.
+    const user = userEvent.setup();
+    render(<Citation citation={github} />);
+    const original = Object.getOwnPropertyDescriptor(window.navigator, "clipboard");
+    Object.defineProperty(window.navigator, "clipboard", { value: undefined, configurable: true });
+    try {
+      await user.click(screen.getByRole("button", { name: "Copy the digest" }));
+      expect(
+        screen.getByRole("button", {
+          name: "Could not copy the digest — this browser refused the clipboard",
+        }),
+      ).toBeInTheDocument();
+    } finally {
+      if (original) Object.defineProperty(window.navigator, "clipboard", original);
     }
   });
 });
