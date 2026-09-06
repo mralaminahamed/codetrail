@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -510,5 +511,61 @@ func TestMigration0009AppliesToAPopulatedDatabaseTwiceLive(t *testing.T) {
 				t.Errorf("run 2: %d tombstones survived, want 1", tombstones)
 			}
 		}
+	}
+}
+
+// Ties in last_queried_at are ordinary rather than exotic: now() is transaction
+// time, so a batch of repositories written together shares a timestamp to the
+// microsecond.
+//
+// With no tiebreak the ORDER BY is a PARTIAL order, and which of a tied group
+// falls beyond OFFSET is then the planner's choice. The consequence this exists
+// to stop is not visible from one process — two indexers evicting at once can
+// each choose a different row at the boundary and delete both, taking the
+// corpus to keep-1 — and that is a counterfactual no test in this suite can
+// force. What it can assert is the property underneath it: the order is TOTAL,
+// so the survivors are named by the corpus rather than by the plan.
+func TestEvictBreaksTiesSoTheOrderIsTotalLive(t *testing.T) {
+	ctx := context.Background()
+	s := evictFresh(t)
+
+	ids := make([]string, 0, 6)
+	for i := range 6 {
+		ids = append(ids, seed(t, s, fmt.Sprintf("tied-%d", i)))
+	}
+	// One statement, so every row carries the same now(): the tie is the point.
+	if _, err := s.pool.Exec(ctx, `UPDATE repos SET last_queried_at = now()`); err != nil {
+		t.Fatal(err)
+	}
+
+	const keep = 3
+	if _, err := s.Evict(ctx, keep, 100); err != nil {
+		t.Fatal(err)
+	}
+
+	// The tiebreak is id DESC, so the survivors are the three largest ids —
+	// named, not merely counted: a partial order keeps three of six too.
+	slices.Sort(ids)
+	want := append([]string{}, ids[len(ids)-keep:]...)
+
+	rows, err := s.pool.Query(ctx, `SELECT id FROM repos ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("survivors %v, want %v: with every last_queried_at equal, "+
+			"which rows survive is decided by the tiebreak or by the plan", got, want)
 	}
 }
