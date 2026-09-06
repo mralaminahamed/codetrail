@@ -22,7 +22,7 @@ function renderSymbol(query = "") {
 }
 
 describe("the definition view", () => {
-  test("depth offers 1 to 5 and a server rejection of depth names the bound", async () => {
+  test("depth offers 1 to 3 and a server rejection of depth names the bound", async () => {
     const select = () => screen.getByLabelText("Depth");
     stub("get", SYMBOL, 200, symbol);
     stub("get", CALLERS, 200, callers);
@@ -30,7 +30,7 @@ describe("the definition view", () => {
     await screen.findByRole("heading", { name: "Callers" });
 
     const options = within_(select()).map((o) => o.value);
-    expect(options).toEqual(["1", "2", "3", "4", "5"]);
+    expect(options).toEqual(["1", "2", "3"]);
 
     // A hand-edited URL the select cannot produce. The console must NOT clamp
     // it: graph.go:358-361 answers a 400 naming the bound rather than silently
@@ -49,7 +49,7 @@ describe("the definition view", () => {
     );
     stub("get", SYMBOL, 200, symbol);
     renderSymbol("?depth=40");
-    expect(await screen.findByText("depth must be between 1 and 5")).toBeInTheDocument();
+    expect(await screen.findByText("depth must be between 1 and 3")).toBeInTheDocument();
     expect(rec.urls[0]).toBe("/api/repos/r1/symbols/s1/callers?depth=40");
   });
 

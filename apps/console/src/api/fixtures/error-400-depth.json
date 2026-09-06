@@ -1,4 +1,4 @@
 {
-  "error": "depth must be between 1 and 5",
+  "error": "depth must be between 1 and 3",
   "rule": "form"
 }
