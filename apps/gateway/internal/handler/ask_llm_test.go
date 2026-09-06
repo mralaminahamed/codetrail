@@ -660,6 +660,32 @@ func TestABelowFloorRefusalStillRefusesWhenTheLoopDegrades(t *testing.T) {
 	}
 }
 
+// LLM_BELOW_FLOOR says what it does: it lets the loop run on a result the FLOOR
+// refused. unscored is not a floor refusal — it is a top score that is not a
+// number at all, so there is nothing for a floor to have been lenient about —
+// and before this the knob silently enabled a second, undocumented behaviour.
+func TestTheBelowFloorKnobDoesNotRunTheLoopOnAnUnscoredRefusal(t *testing.T) {
+	res := result(rag.ModeHybrid, math.NaN(), true)
+	h, f := llmHandler(t, newStore(), &fakeRetriever{res: res}, answeringTurns("never [1]")...)
+	h.LLM.(*Loop).BelowFloor = true
+
+	out := body(t, askBody(t, h, `{"q":"sampler"}`))
+	if out["refused"] != true || out["reason"] != string(rag.ReasonUnscored) {
+		t.Fatalf("response %s, want an unscored refusal", rec2s(out))
+	}
+	// The recorder, because the response is a refusal either way and the
+	// payload alone cannot tell whether spend happened.
+	if n := len(f.Requests()); n != 0 {
+		t.Errorf("the model was called %d time(s) on an unscored refusal with LLM_BELOW_FLOOR=true, want 0", n)
+	}
+	if _, ok := out["llm"]; ok {
+		t.Errorf("an llm block on a refusal the loop never ran for: %s", rec2s(out))
+	}
+	if _, ok := out["degraded"]; ok {
+		t.Errorf("a short-circuit is not a degradation: %v", out["degraded"])
+	}
+}
+
 func TestARefusalNamesWhichAnswererRefused(t *testing.T) {
 	h := hermeticHandler(newStore(), &fakeRetriever{res: rag.Result{Mode: rag.ModeHybrid, VectorRan: true}})
 	out := body(t, askBody(t, h, `{"q":"sampler"}`))
