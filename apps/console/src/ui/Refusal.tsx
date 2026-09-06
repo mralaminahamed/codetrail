@@ -17,7 +17,13 @@ export function floorSentence(floor: Floor, mode: string, topScore: number | nul
     return `This deployment retrieves in ${mode} mode, which produces no similarity score, so no floor was applied.`;
   }
   if (!floor.calibrated) {
-    return `codetrail's score floor is ${floor.value} and has never been calibrated. It is a mechanism, not a measured threshold — the number is measured in P6.`;
+    // No phase identifier. "the number is measured in P6" shipped to users, and
+    // a reader outside this repository cannot act on a plan reference — while
+    // the sentence that replaces it keeps the whole epistemic claim: the number
+    // is a setting, not a finding, so this refusal reports where a knob is and
+    // not that the question was unanswerable. The second half is the actionable
+    // part, and Search is a button away on the same page.
+    return `codetrail's score floor is ${floor.value} and has never been calibrated: it is a mechanism, not a measured threshold. This refusal reports the setting, not a judgement about the question — searching the same repository still ranks spans.`;
   }
   const best = topScore === null ? "no similarity score" : String(topScore);
   return `The best match scored ${best} against a calibrated floor of ${floor.value}.`;
@@ -48,7 +54,7 @@ export default function Refusal({
   topScore: number | null;
 }) {
   return (
-    <div role="status" aria-label="Answer outcome">
+    <div className="panel panel-refusal" role="status" aria-label="Answer outcome">
       <h2>No answer — and no error.</h2>
       {/* The server's sentence, one per reason (read.go:386-398). Never a
           single "no answer" string: spec §10 forbids a generic refusal and

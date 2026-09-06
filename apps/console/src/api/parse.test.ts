@@ -2,6 +2,9 @@ import { describe, expect, test } from "vitest";
 import { parseAsk, parseCallers, parseSearch, parseSpanRead, parseSymbolRead } from "./parse";
 import askAnswered from "./fixtures/ask-answered.json";
 import askAnsweredEmpty from "./fixtures/ask-answered-empty.json";
+import askAnsweredLLM from "./fixtures/ask-answered-llm.json";
+import askAnsweredDegraded from "./fixtures/ask-answered-degraded.json";
+import askRefusedDegraded from "./fixtures/ask-refused-degraded.json";
 import askRefusedNoSpans from "./fixtures/ask-refused-no-spans.json";
 import searchHybrid from "./fixtures/search-hybrid.json";
 import searchLexical from "./fixtures/search-lexical.json";
@@ -140,5 +143,69 @@ describe("the four normalisations", () => {
     expect(parseAsk("<!doctype html>")).toBeNull();
     expect(parseSearch([])).toBeNull();
     expect(parseCallers(42)).toBeNull();
+  });
+
+  test("degraded and llm are absent as null, never as an empty block", () => {
+    // The distinction the two omitempty tags exist to keep. A default {} for
+    // either turns "the model was never asked" into "the model degraded for no
+    // reason", and "the loop never ran" into "the loop ran and stopped at step
+    // 0" — both of which read as facts and are not.
+    const plain = parseAsk(askAnswered);
+    if (plain === null || plain.refused) throw new Error("unreachable");
+    expect(plain.degraded).toBeNull();
+    expect(plain.llm).toBeNull();
+
+    const degraded = parseAsk(askAnsweredDegraded);
+    if (degraded === null || degraded.refused) throw new Error("unreachable");
+    expect(degraded.degraded).toEqual({ from: "llm", reason: "rate_limited" });
+    expect(degraded.llm?.stop).toBe("rate_limited");
+    expect(degraded.llm?.tools).toEqual([]);
+    expect(degraded.llm?.usage.estimated).toBe(false);
+  });
+
+  test("a null tools list still parses to an empty one", () => {
+    // The gateway serialises tools as [] since NewTrace became its only
+    // constructor, so no fixture carries null any more and this asserts on a
+    // literal rather than on one. arr() stays because a .map on null throws
+    // and unmounts the tree, and the wire shape is the server's to change.
+    const wire = {
+      ...(askAnsweredDegraded as unknown as Record<string, unknown>),
+      llm: { ...askAnsweredDegraded.llm, tools: null },
+    };
+    const out = parseAsk(wire);
+    if (out === null || out.refused) throw new Error("unreachable");
+    expect(out.llm?.tools).toEqual([]);
+  });
+
+  test("an llm answer parses its trace, tool names and estimated usage", () => {
+    const out = parseAsk(askAnsweredLLM);
+    if (out === null || out.refused) throw new Error("unreachable");
+    expect(out.answered_by).toBe("llm");
+    expect(out.degraded).toBeNull();
+    expect(out.llm?.model).toBe("fake-scripted");
+    expect(out.llm?.tools).toEqual([{ name: "read_span", ms: 0 }]);
+    // estimated is a real distinction: a token count the client sized itself is
+    // not a token count the provider reported.
+    expect(out.llm?.usage.estimated).toBe(true);
+    expect(out.llm?.usage.input_tokens).toBeGreaterThan(0);
+  });
+
+  test("a refusal carries answered_by, degraded and llm too", () => {
+    // P3 put answered_by on the answer and not on the refusal, which left a
+    // refusal unable to say which answerer refused. read.go puts all three on
+    // refusalResponse, and this is the payload that proves the parser reads
+    // them off both branches rather than only the one.
+    const out = parseAsk(askRefusedDegraded);
+    if (out === null || !out.refused) throw new Error("unreachable");
+    expect(out.answered_by).toBe("extractive");
+    expect(out.reason).toBe("below_floor");
+    expect(out.degraded).toEqual({ from: "llm", reason: "provider_unavailable" });
+    expect(out.llm?.stop).toBe("provider_unavailable");
+
+    // And a refusal from an unconfigured deployment carries neither.
+    const plain = parseAsk(askRefusedNoSpans);
+    if (plain === null || !plain.refused) throw new Error("unreachable");
+    expect(plain.degraded).toBeNull();
+    expect(plain.llm).toBeNull();
   });
 });

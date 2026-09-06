@@ -17,8 +17,16 @@ export default function SymbolView() {
   // bound rather than silently serving 5, and a client that clamps re-hides
   // exactly what that refuses to hide.
   const depth = Number(params.get("depth") ?? "1");
-  const [def, setDef] = useState<Outcome<SymbolRead> | null>(null);
-  const [callers, setCallers] = useState<Outcome<CallersValue> | null>(null);
+  // One stamp for both reads, because they are one Promise.all and the depth is
+  // in it: changing the depth used to leave the previous depth's caller list on
+  // screen — a list whose own sentence says "to depth N" — for the length of a
+  // recursive CTE.
+  const key = `${repo}/${symbol}@${depth}`;
+  const [read, setRead] = useState<{
+    of: string;
+    def: Outcome<SymbolRead>;
+    callers: Outcome<CallersValue>;
+  } | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -27,26 +35,28 @@ export default function SymbolView() {
         getSymbol(repo, symbol),
         callersOf(repo, symbol, { depth }),
       ]);
-      if (!cancelled) {
-        setDef(d);
-        setCallers(c);
-      }
+      if (!cancelled) setRead({ of: `${repo}/${symbol}@${depth}`, def: d, callers: c });
     })();
     return () => {
       cancelled = true;
     };
   }, [repo, symbol, depth]);
 
+  const fresh = read?.of === key ? read : null;
+  const def = fresh?.def ?? null;
+  const callers = fresh?.callers ?? null;
+
   return (
     <>
-      <PageTitle>Definition</PageTitle>
+      <PageTitle title={def?.kind === "ok" ? def.value.symbol.name : undefined}>Definition</PageTitle>
+      {def === null && <p className="pending">Reading the definition…</p>}
       {def?.kind === "ok" && (
         <>
           <p>
             <code>{def.value.symbol.name}</code> ({def.value.symbol.kind}) in{" "}
             <code>{def.value.symbol.pkg}</code>
           </p>
-          <Citation citation={def.value.citation} symbol={def.value.symbol} />
+          <Citation citation={def.value.citation} symbol={def.value.symbol} check="open" />
           <Staleness staleness={def.value.staleness} />
         </>
       )}
@@ -68,6 +78,7 @@ export default function SymbolView() {
         </select>
       </p>
 
+      {callers === null && <p className="pending">Asking who calls this…</p>}
       {callers?.kind === "ok" && <CallersList callers={callers.value} />}
       {callers && callers.kind !== "ok" && (
         <ErrorPanel

@@ -1,7 +1,8 @@
 import type {
   Answered, ApproximateCaller, AskResult, Caller, Callers, Citation, Cited,
-  Floor, Hit, Job, RepoDetail, RepoList, RepoRow, SearchResult, Span, SpanRead,
-  Staleness, Symbol, SymbolList, SymbolRead,
+  Degraded, Floor, Hit, Job, LLMTrace, RepoDetail, RepoList, RepoRow,
+  SearchResult, Span, SpanRead, Staleness, Symbol, SymbolList, SymbolRead,
+  ToolInvocation,
 } from "./types";
 
 // A parser is total: it returns null for a body it cannot read, and http.ts
@@ -110,6 +111,49 @@ function floor(v: unknown): Floor {
   };
 }
 
+// NORMALISATION 5 of 5. An absent block stays null and is never filled in with
+// an empty object. `degraded` is on the wire IFF the loop was attempted and did
+// not write the answer, and `llm` IFF the loop ran at all (read.go:67-71,
+// 161-165); a default {} for either would turn "the model was never asked" into
+// "the model degraded for no reason" and "the loop never ran" into "the loop
+// ran and stopped at step 0" — which is exactly the distinction those two
+// omitempty tags exist to keep.
+function degraded(v: unknown): Degraded | null {
+  const o = obj(v);
+  if (!o) return null;
+  return { from: str(o["from"]), reason: str(o["reason"]) };
+}
+
+function llm(v: unknown): LLMTrace | null {
+  const o = obj(v);
+  if (!o) return null;
+  const tools: ToolInvocation[] = [];
+  // `tools` serialises as null when the loop made no tool call — the trace is
+  // built with append from a nil slice, like `citations` above — and a .map on
+  // null throws. That is not hypothetical: a provider failure on turn one is
+  // the commonest degradation there is, and ask-answered-degraded.json is
+  // exactly that shape.
+  for (const t of arr(o["tools"])) {
+    const row = obj(t);
+    if (!row) continue;
+    tools.push({ name: str(row["name"]), ms: int(row["ms"]) });
+  }
+  const u = obj(o["usage"]) ?? {};
+  return {
+    model: str(o["model"]),
+    steps: int(o["steps"]),
+    tool_calls: int(o["tool_calls"]),
+    stop: str(o["stop"]),
+    tools,
+    usage: {
+      input_tokens: int(u["input_tokens"]),
+      output_tokens: int(u["output_tokens"]),
+      estimated: bool(u["estimated"]),
+    },
+    citations_dropped: int(o["citations_dropped"]),
+  };
+}
+
 export const parseJob: Parse<Job> = (body) => {
   const o = obj(body);
   if (!o) return null;
@@ -213,6 +257,13 @@ export const parseAsk: Parse<AskResult> = (body) => {
     mode: str(o["mode"]),
     top_score: num(o["top_score"]),
     floor: floor(o["floor"]),
+    // On BOTH branches, because read.go puts them on answerResponse and on
+    // refusalResponse. answered_by is here rather than on the answer alone for
+    // the same reason: P3 put it on one shape and not the other, which left a
+    // refusal unable to say which answerer refused.
+    answered_by: str(o["answered_by"]),
+    degraded: degraded(o["degraded"]),
+    llm: llm(o["llm"]),
   };
   // The discriminant is `refused`, not the presence or truthiness of `answer`.
   // An answered response can carry answer: "" — every hit's span failed to
@@ -247,7 +298,6 @@ export const parseAsk: Parse<AskResult> = (body) => {
   const answered: Answered = {
     ...common,
     refused: false,
-    answered_by: str(o["answered_by"]),
     answer: str(o["answer"]),
     citations,
     dropped: int(o["dropped"]),

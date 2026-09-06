@@ -1,3 +1,4 @@
+import { Link } from "react-router";
 import type { Approximate as ApproximateValue } from "../api/types";
 import Citation from "./Citation";
 import Provenance from "./Provenance";
@@ -9,9 +10,11 @@ import Provenance from "./Provenance";
 export default function Approximate({
   approximate,
   toName,
+  repoId,
 }: {
   approximate: ApproximateValue;
   toName: string;
+  repoId: string;
 }) {
   // failed is not "empty". An empty list means nothing matched; a failed query
   // means we do not know (graph.go:100-102, P4 Open question 14). Collapsing
@@ -36,12 +39,13 @@ export default function Approximate({
       <p>Matched on: {approximate.matched_on}.</p>
       {approximate.truncated && <p>This list was truncated; there are more.</p>}
       {approximate.count === 0 && <p>Nothing in this repository calls a name spelled that way.</p>}
-      <ul>
+      <ul className="rows">
         {approximate.callers.map((c) => (
           <li key={`${c.symbol.id}:${c.call.path}:${c.call.line}`}>
             <p>
-              {c.symbol.name} — <Provenance provenance={c.provenance} /> — calls{" "}
-              <code>{c.to_name}</code> at <code>{`${c.call.path}:${c.call.line}`}</code>
+              <Link to={`/repos/${repoId}/symbols/${c.symbol.id}`}>{c.symbol.name}</Link> —{" "}
+              <Provenance provenance={c.provenance} /> — calls <code>{c.to_name}</code> at{" "}
+              <code>{`${c.call.path}:${c.call.line}`}</code>
             </p>
             <Citation citation={c.citation} symbol={c.symbol} />
           </li>

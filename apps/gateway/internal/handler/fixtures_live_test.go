@@ -19,11 +19,14 @@ import (
 	"time"
 
 	"github.com/labstack/echo/v4"
+	"github.com/rs/zerolog"
 
 	"github.com/mralaminahamed/codetrail/packages/shared/admit"
+	"github.com/mralaminahamed/codetrail/packages/shared/agent"
 	"github.com/mralaminahamed/codetrail/packages/shared/chunk"
 	"github.com/mralaminahamed/codetrail/packages/shared/embed"
 	"github.com/mralaminahamed/codetrail/packages/shared/jobs"
+	"github.com/mralaminahamed/codetrail/packages/shared/llm"
 	"github.com/mralaminahamed/codetrail/packages/shared/models"
 	"github.com/mralaminahamed/codetrail/packages/shared/rag"
 	"github.com/mralaminahamed/codetrail/packages/shared/store"
@@ -62,6 +65,9 @@ const consoleRequestID = "01JQ0FIXTURE0000000000REQ"
 //	b — the shipped Handler with one interface stubbed (Retriever, Reader or
 //	    Enqueuer). A stub supplies a rag.Result or a store row; never a body.
 //	c — a hand-written literal. Exactly one, and it says why beside itself.
+//	d — the shipped Handler AND the shipped Loop, with the provider scripted
+//	    and the loop's corpus in memory over real spans. Two seams rather than
+//	    one, which is why it is not b; NOTES.md says why neither can close.
 
 // ---------------------------------------------------------------- the corpus
 
@@ -304,6 +310,79 @@ func (s stubEnqueuer) Enqueue(context.Context, string, string) (jobs.Job, error)
 }
 func (s stubEnqueuer) Get(context.Context, string) (jobs.Job, error) {
 	return jobs.Job{}, s.err
+}
+
+// consoleCorpus is the four tools' store, in memory, holding REAL spans read out
+// of the live database before the loop runs.
+//
+// In memory for one measurable reason: agent.Trace records a per-tool duration
+// as time.Since(start).Milliseconds(), and that is the only value in an /ask
+// response that is not a function of its inputs. A Postgres round trip lands on
+// either side of 1ms depending on the machine, which would make the committed
+// fixture's "ms" drift and fail this guard for a reason that is not a handler
+// change. A map lookup is microseconds, so the field is 0 — and that is
+// asserted at the call site rather than hoped for.
+//
+// The SPANS are real: the id, the path, the line range, the text and the digest
+// all come out of the shipped store, so the citation these fixtures carry is a
+// citation a reader could check byte for byte.
+type consoleCorpus struct{ spans map[string]models.Span }
+
+func (c *consoleCorpus) Search(context.Context, string, string, int) (rag.Result, error) {
+	return rag.Result{}, nil
+}
+
+func (c *consoleCorpus) GetSpan(_ context.Context, _, spanID string) (models.Span, error) {
+	sp, ok := c.spans[spanID]
+	if !ok {
+		return models.Span{}, store.ErrNotFound
+	}
+	return sp, nil
+}
+
+func (c *consoleCorpus) Definitions(context.Context, string, string, string, bool, int) ([]models.Symbol, error) {
+	return nil, nil
+}
+
+func (c *consoleCorpus) CallersOf(context.Context, string, string, int, int) ([]store.Caller, error) {
+	return nil, nil
+}
+
+func (c *consoleCorpus) ApproximateCallersOf(context.Context, string, string, int) ([]store.Approximate, error) {
+	return nil, nil
+}
+
+// consoleLoop is a configured deployment: the shipped Loop, the shipped bounds
+// and tool limits, and a SCRIPTED model.
+//
+// The model is scripted because there is no other way. A real provider call
+// needs a vendor key and a network hop from CI, and read.go's answering branch
+// cannot otherwise be reached at all — which is exactly why no fixture existed
+// for answered_by "llm", for a degraded block or for an llm trace, and why the
+// drift guard could not see any of the three. llm.Fake is the shipped test
+// double for the provider interface and every other seam here is production
+// code: the Loop, agent.Run, the tools, the citation gate, cited(),
+// rag.NewCitation and the response structs.
+func consoleLoop(t *testing.T, st *store.Store, floor rag.Floor, belowFloor bool,
+	spans map[string]models.Span, turns ...llm.Turn,
+) *Handler {
+	t.Helper()
+	h := consoleHandler(t, st, st, rag.ModeHybrid, floor, 40)
+	h.Log = zerolog.Nop()
+	h.LLM = NewLoop(llm.NewFake(turns...), &consoleCorpus{spans: spans},
+		agent.DefaultBounds(), agent.DefaultToolLimits(), belowFloor, 4, 1_000_000,
+		func() time.Time { return consoleNow })
+	// The deployment's default, not a request field: the console does not send
+	// `answerer` and says why beside its Query type.
+	h.AnswerDefault = answererLLM
+	return h
+}
+
+func readSpanTurn(spanID string) llm.Turn {
+	return llm.Turn{Calls: []llm.ToolCall{{
+		ID: "call-1", Name: "read_span",
+		Args: json.RawMessage(`{"span_id":"` + spanID + `"}`),
+	}}}
 }
 
 // ------------------------------------------------------------------ handlers
@@ -555,6 +634,68 @@ func TestConsoleFixturesMatchTheShippedHandlersLive(t *testing.T) {
 	mustContain(t, "ask-refused-unscored.json", un, `"reason":"unscored"`)
 	mustContain(t, "ask-refused-unscored.json", un, `"top_score":null`)
 
+	// --- the three shapes the answering loop puts on the wire.
+	//
+	// Until these existed the console could not see any of them, and the guard
+	// could not either: read.go stamps answered_by "extractive" on a DEGRADED
+	// answer, so a degraded model call and a plain extractive answer were
+	// byte-identical to a client reading only that field. `git log -S degraded
+	// -- apps/console/` was empty.
+	//
+	// Class (d) — the provider is scripted and the loop's corpus is in memory;
+	// NOTES.md says why neither seam can be closed.
+	pushSpanRow, err := st.GetSpan(ctx, main.ID, pushSpan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loopSpans := map[string]models.Span{pushSpan: pushSpanRow}
+	const loopAnswer = "Machine.Push adds n to the machine's running total and returns the new total [1]."
+
+	// 1. The loop answered. answered_by is "llm", there is no degraded block at
+	//    all, and the trace records the one tool call it made.
+	answeredByLLM := consoleLoop(t, st, rag.DefaultFloor(), false, loopSpans,
+		readSpanTurn(pushSpan), llm.Turn{Text: loopAnswer})
+	al := emit(t, "ask-answered-llm.json", http.StatusOK,
+		consolePost(answeredByLLM, "/api/repos/"+main.ID+"/ask", `{"q":"`+consoleQ+`"}`))
+	mustContain(t, "ask-answered-llm.json", al, `"answered_by":"llm"`)
+	mustContain(t, "ask-answered-llm.json", al, `"stop":"final"`)
+	mustContain(t, "ask-answered-llm.json", al, `"name":"read_span"`)
+	// The one field in an /ask response that is not a function of its inputs.
+	// If this ever fails, the loop's corpus has stopped being in memory.
+	mustContain(t, "ask-answered-llm.json", al, `"ms":0`)
+	// degraded is present IFF the loop was attempted AND did not write the
+	// answer (read.go:67-71). This one wrote it.
+	mustNotContain(t, "ask-answered-llm.json", al, `"degraded"`)
+
+	// 2. The loop was asked and could not answer, so the extractive answerer
+	//    wrote the prose. answered_by is "extractive" — the SAME value a
+	//    deployment with no model at all reports — and the only thing that
+	//    tells the two apart is this block.
+	degradedAnswer := consoleLoop(t, st, rag.DefaultFloor(), false, loopSpans,
+		llm.Turn{Err: &llm.Failure{Kind: llm.KindRateLimited, Status: 429}})
+	da := emit(t, "ask-answered-degraded.json", http.StatusOK,
+		consolePost(degradedAnswer, "/api/repos/"+main.ID+"/ask", `{"q":"`+consoleQ+`","limit":3}`))
+	mustContain(t, "ask-answered-degraded.json", da, `"answered_by":"extractive"`)
+	mustContain(t, "ask-answered-degraded.json", da, `"degraded":{"from":"llm","reason":"rate_limited"}`)
+	mustContain(t, "ask-answered-degraded.json", da, `"refused":false`)
+	// The trace travels on a degradation too, so a reader can see the work done
+	// before the fallback (read.go:161-165).
+	mustContain(t, "ask-answered-degraded.json", da, `"stop":"rate_limited"`)
+
+	// 3. A degradation that still ends in a refusal. read.go:443-448: the
+	//    degraded loop does not inherit the floor's permission to be ignored,
+	//    so LLM_BELOW_FLOOR cannot turn every degradation into an answer to a
+	//    question the floor refused. Needs BOTH a floor that refuses and
+	//    LLM_BELOW_FLOOR=true, which is why no query can produce it.
+	refusedDegraded := consoleLoop(t, st, rag.Floor{Value: 0.99}, true, loopSpans,
+		llm.Turn{Err: &llm.Failure{Kind: llm.KindUnavailable, Status: 503}})
+	rd := emit(t, "ask-refused-degraded.json", http.StatusOK,
+		consolePost(refusedDegraded, "/api/repos/"+main.ID+"/ask", `{"q":"`+consoleQ+`"}`))
+	mustContain(t, "ask-refused-degraded.json", rd, `"refused":true`)
+	mustContain(t, "ask-refused-degraded.json", rd, `"reason":"below_floor"`)
+	mustContain(t, "ask-refused-degraded.json", rd, `"answered_by":"extractive"`)
+	mustContain(t, "ask-refused-degraded.json", rd, `"from":"llm"`)
+
 	emit(t, "symbols-one.json", http.StatusOK,
 		consoleGet(hybrid, "/api/repos/"+main.ID+"/symbols?name=Total"))
 	emit(t, "symbol.json", http.StatusOK,
@@ -691,6 +832,17 @@ func mustContain(t *testing.T, name string, body []byte, want string) {
 	t.Helper()
 	if !bytes.Contains(body, []byte(want)) {
 		t.Errorf("%s no longer contains %s:\n%s", name, want, body)
+	}
+}
+
+// The other direction, and it earns its place: `degraded` is present IFF the
+// loop was attempted and did not write the answer, so a fixture that grew one
+// is a fixture that stopped being the shape it was added for — and "contains"
+// cannot see that.
+func mustNotContain(t *testing.T, name string, body []byte, unwanted string) {
+	t.Helper()
+	if bytes.Contains(body, []byte(unwanted)) {
+		t.Errorf("%s now contains %s and should not:\n%s", name, unwanted, body)
 	}
 }
 

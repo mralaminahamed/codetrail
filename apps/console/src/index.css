@@ -1,9 +1,301 @@
 @import "tailwindcss";
 
-@theme {
-  --color-ink: oklch(0.22 0.02 260);
-  --color-paper: oklch(0.99 0.003 260);
+/* ---------------------------------------------------------------------------
+   Why there is a stylesheet at all.
+
+   Tailwind's preflight is a DESTRUCTIVE reset: margin:0 and border:0 on
+   everything, headings inheriting font-size and font-weight, links inheriting
+   colour with no underline, lists losing their markers, inputs and buttons
+   losing their border, background and padding. Importing it and opting nothing
+   back in is worse than shipping no stylesheet, because plain HTML at least
+   distinguishes a link from a sentence and a text field from a paragraph.
+
+   Every rule below is an opt-back-in, and the ones that carry a WCAG number say
+   which. Nothing here is authored with a utility class: the console's markup is
+   already semantic — dl, ol, section, pre, code, label, button — so the
+   selectors are elements, and a component only carries a class where the
+   markup genuinely cannot say which of two panels it is.
+
+   These rules are UNLAYERED on purpose. Tailwind's preflight lives in
+   @layer base, and unlayered CSS beats layered CSS in the cascade regardless
+   of order, so nothing here needs !important to survive.
+   --------------------------------------------------------------------------- */
+
+/* --------------------------------------------------------------- the palette
+
+   Authored in sRGB hex, not oklch. The 2026-09-03 sweep recorded a false
+   contrast pass caused by reading oklch as a ratio of 1.0; hex is the notation
+   the contrast formula actually takes, and src/contrast.test.ts computes every
+   pair below out of this file rather than trusting a claim.
+
+   Two colours carry the product's own identity: the amber is assets/icon.svg's
+   cited-span colour, and it is used for exactly one thing here — the rule down
+   the side of a citation card. A citation is what this console exists to show,
+   so it is the one element allowed a colour of its own.
+
+   --rule is decorative (a card edge, a hairline). --control is the border of a
+   thing you can type in or press, and it is a different token because WCAG
+   1.4.11 applies to it and not to the other: a control whose boundary you
+   cannot see is a control you cannot find. */
+:root {
+  color-scheme: light dark;
+
+  --paper: #f6f8fa;
+  --surface: #ffffff;
+  --ink: #141a21;
+  --quiet: #4b5563;
+  --rule: #d3dae2;
+  --control: #6b7684;
+  --link: #0d5aa7;
+  --visited: #6a3fa0;
+  --code-bg: #f0f3f6;
+  --amber: #8a5400;
+  --amber-rule: #e8a33f;
+
+  --alarm-ink: #a32617;
+  --alarm-bg: #fdf3f2;
+  --alarm-rule: #cf7a6c;
+
+  --note-bg: #eef3f8;
+  --note-rule: #8fa9c1;
+
+  --warn-ink: #7a4d00;
+  --warn-bg: #fdf6e8;
+  --warn-rule: #c99b3c;
+
+  /* A 1.25 scale from a 16px base, stopped at four sizes. A console that needs
+     six type sizes is a console with six kinds of importance, and this one has
+     four: the page, a section, the text, and the labels on a tuple. */
+  --t-xs: 0.75rem;
+  --t-sm: 0.875rem;
+  --t-base: 1rem;
+  --t-lg: 1.25rem;
+  --t-xl: 1.75rem;
+
+  /* A 4px rhythm. Every margin, padding and gap below is one of these. */
+  --s1: 0.25rem;
+  --s2: 0.5rem;
+  --s3: 0.75rem;
+  --s4: 1rem;
+  --s5: 1.5rem;
+  --s6: 2rem;
+  --s7: 3rem;
+
+  /* The measure. Prose caps at 66ch because a 900px line of text is read by
+     nobody twice; the page itself is wider, because a check command is 90
+     mono characters and belongs on one line where it fits. */
+  --measure: 66ch;
+  --page: 54rem;
+
+  --radius: 6px;
+  --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
 }
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #11151a;
+    --surface: #181d24;
+    --ink: #e6ecf3;
+    --quiet: #a2aeba;
+    --rule: #29313a;
+    --control: #7a8695;
+    --link: #7fbaf5;
+    --visited: #c4a6e8;
+    --code-bg: #1e242c;
+    --amber: #e8a33f;
+    --amber-rule: #b3781f;
+
+    --alarm-ink: #ff9d90;
+    --alarm-bg: #2a1715;
+    --alarm-rule: #7c4038;
+
+    --note-bg: #161f29;
+    --note-rule: #3d5871;
+
+    --warn-ink: #e8b25a;
+    --warn-bg: #241c0e;
+    --warn-rule: #6e5426;
+  }
+}
+
+/* ------------------------------------------------------------------ the page */
+
+html {
+  background: var(--paper);
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: var(--t-base);
+  line-height: 1.55;
+  -webkit-text-size-adjust: 100%;
+}
+
+/* WCAG 1.3.1. Preflight sets margin:0 on every block, which runs the citation
+   tuple, the check command, the staleness note and the next citation into one
+   undifferentiated column. Vertical rhythm is what says where one thing ends
+   and the next begins, and it is restored here rather than per component. */
+p,
+ul,
+ol,
+dl,
+pre,
+form,
+figure,
+blockquote,
+table {
+  margin-block: var(--s4);
+}
+
+p,
+li {
+  max-width: var(--measure);
+}
+
+/* WCAG 1.3.1 again: preflight makes h1, h2, h3 and p the same 16px, so a
+   heading is a heading only to a screen reader. */
+h1,
+h2,
+h3 {
+  font-family: var(--sans);
+  line-height: 1.25;
+  text-wrap: balance;
+  margin-block: var(--s5) var(--s3);
+}
+
+h1 {
+  font-size: var(--t-xl);
+  font-weight: 650;
+  letter-spacing: -0.015em;
+  margin-block-start: 0;
+}
+
+h2 {
+  font-size: var(--t-lg);
+  font-weight: 620;
+  letter-spacing: -0.01em;
+}
+
+h3 {
+  font-size: var(--t-base);
+  font-weight: 620;
+}
+
+/* h1 is focusable (PageTitle moves focus there on a route change) and must not
+   look like a control because of it. */
+h1:focus {
+  outline: none;
+}
+
+h1:focus-visible {
+  outline: 2px solid var(--link);
+  outline-offset: 4px;
+}
+
+/* WCAG 1.4.1. Preflight makes a link inherit its colour and drops the
+   underline, so "Ask this repository" is the same pixels as the sentence
+   beside it and can only be found by hovering. Colour AND underline: colour
+   alone is not a distinguishing signal. */
+a {
+  color: var(--link);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.18em;
+}
+
+a:visited {
+  color: var(--visited);
+}
+
+a:hover {
+  text-decoration-thickness: 2px;
+}
+
+/* WCAG 2.4.7 and 2.4.11. One focus style for everything focusable, drawn
+   outside the box so it is never clipped by an overflow container. */
+:focus-visible {
+  outline: 2px solid var(--link);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* Preflight strips list markers. A ranked list whose numbers are gone has
+   thrown away the ranking, which on /search is the API's whole claim. */
+ul,
+ol {
+  padding-inline-start: var(--s5);
+}
+
+ul {
+  list-style: disc;
+}
+
+ol {
+  list-style: decimal;
+}
+
+li {
+  margin-block: var(--s2);
+}
+
+li::marker {
+  color: var(--quiet);
+}
+
+/* --------------------------------------------------------------- code and pre
+
+   WCAG 1.4.10 reflow. Measured at 320px before these existed: scrollWidth 3409
+   against a 320px viewport, from 40-char commit SHAs, 64-char digests and the
+   git show | sha256sum command. The body must never scroll horizontally; wide
+   content scrolls inside its own box instead. */
+pre {
+  overflow-x: auto;
+  max-width: 100%;
+  background: var(--code-bg);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  padding: var(--s3) var(--s4);
+  font-family: var(--mono);
+  font-size: var(--t-sm);
+  line-height: 1.5;
+  tab-size: 4;
+}
+
+pre > code {
+  background: none;
+  border: 0;
+  padding: 0;
+  font-size: inherit;
+}
+
+code {
+  font-family: var(--mono);
+  font-size: 0.9em;
+}
+
+/* An inline code span is a digest or a SHA — one unbreakable token. It wraps,
+   because a horizontal scrollbar per digest is worse than a wrapped digest,
+   and copy-paste is unaffected by where it wraps. */
+:not(pre) > code {
+  overflow-wrap: anywhere;
+  background: var(--code-bg);
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  padding: 0.05em 0.3em;
+}
+
+/* The tuple's values are the long ones and they sit in a dd. */
+dd {
+  overflow-wrap: anywhere;
+  min-width: 0;
+  margin: 0;
+}
+
+/* ---------------------------------------------------------------- the chrome */
 
 /* Off-screen until focused: a skip link that is always visible is a link
    everyone pays for and one person uses. */
@@ -12,33 +304,521 @@
   left: -9999px;
   top: 0;
   z-index: 100;
-  padding: 0.5rem 1rem;
-  background: var(--color-paper);
-  color: var(--color-ink);
-  border: 2px solid var(--color-ink);
+  padding: var(--s2) var(--s4);
+  background: var(--surface);
+  color: var(--ink);
+  border: 2px solid var(--ink);
+  text-decoration: none;
 }
 .skip:focus {
   left: 0;
 }
 
-/* WCAG 1.4.10 reflow. Measured at 320px before this existed: scrollWidth 3409
-   against a 320px viewport, from 40-char commit SHAs, 64-char digests and the
-   git show | sha256sum command. The body must never scroll horizontally; wide
-   content scrolls inside its own box instead. */
-pre {
-  overflow-x: auto;
-  max-width: 100%;
+.bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--s2) var(--s5);
+  padding: var(--s3) var(--s5);
+  border-block-end: 1px solid var(--rule);
+  background: var(--surface);
 }
 
-/* An inline code span is a digest or a SHA — one unbreakable token. It wraps,
-   because a horizontal scrollbar per digest is worse than a wrapped digest,
-   and copy-paste is unaffected by where it wraps. */
-:not(pre) > code {
+.bar > header {
+  font-weight: 650;
+  font-size: var(--t-base);
+  letter-spacing: -0.01em;
+}
+
+.bar > header a {
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.bar > header a::before {
+  content: "";
+  display: inline-block;
+  inline-size: 0.5em;
+  block-size: 1em;
+  margin-inline-end: 0.45em;
+  vertical-align: -0.14em;
+  border-inline-start: 3px solid var(--amber-rule);
+  border-radius: 1px;
+}
+
+.bar > header a:hover {
+  text-decoration: underline;
+}
+
+.bar nav {
+  display: flex;
+  gap: var(--s4);
+}
+
+.bar nav a {
+  color: var(--quiet);
+  text-decoration: none;
+  font-size: var(--t-sm);
+  padding-block: var(--s1);
+  border-block-end: 2px solid transparent;
+}
+
+.bar nav a:hover {
+  color: var(--ink);
+  text-decoration: underline;
+}
+
+/* The current page, said twice: aria-current for a screen reader, weight and
+   an underline for everyone else. Never colour alone. */
+.bar nav a[aria-current="page"] {
+  color: var(--ink);
+  font-weight: 620;
+  border-block-end-color: var(--amber-rule);
+}
+
+main {
+  display: block;
+  max-inline-size: var(--page);
+  margin-inline: auto;
+  padding: var(--s6) var(--s5) var(--s7);
+}
+
+/* ---------------------------------------------------------------- the controls
+
+   WCAG 1.4.11 and 3.2.4. Preflight leaves an input and a button with no
+   border, no background and no padding, which on the first page of this
+   console means you cannot see where to type or what to press. --control is
+   4.3:1 or better against every surface it sits on; see contrast.test.ts. */
+label {
+  display: block;
+  font-size: var(--t-sm);
+  font-weight: 600;
+  color: var(--quiet);
+  margin-block-end: var(--s1);
+}
+
+input[type="text"],
+select {
+  font: inherit;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--control);
+  border-radius: var(--radius);
+  padding: var(--s2) var(--s3);
+  min-block-size: 2.5rem;
+  max-inline-size: 100%;
+}
+
+input[type="text"] {
+  inline-size: min(36rem, 100%);
+}
+
+input[type="text"]:hover,
+select:hover {
+  border-color: var(--ink);
+}
+
+input[type="checkbox"] {
+  inline-size: 1.1rem;
+  block-size: 1.1rem;
+  accent-color: var(--link);
+  margin: 0;
+}
+
+/* A checkbox and its label read as one row, and the label stops being a block
+   so it sits beside the box rather than above it. */
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+}
+
+.check-row label {
+  margin: 0;
+  font-weight: 400;
+  color: var(--ink);
+}
+
+button {
+  font: inherit;
+  font-weight: 560;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--control);
+  border-radius: var(--radius);
+  padding: var(--s2) var(--s4);
+  min-block-size: 2.5rem;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  background: var(--code-bg);
+  border-color: var(--ink);
+}
+
+/* 3.2.4 again, and this one is the audit's: Ask's inFlight disabled only
+   buttons that had no visible affordance at all, so pressing Ask produced no
+   observable change while an embedding and a vector search ran. */
+button:disabled {
+  cursor: progress;
+  opacity: 0.55;
+}
+
+/* The primary action of a form. One per form, and it is a weight and a fill
+   rather than a colour on its own. */
+button[data-primary] {
+  color: var(--surface);
+  background: var(--ink);
+  border-color: var(--ink);
+}
+
+button[data-primary]:hover:not(:disabled) {
+  background: var(--quiet);
+  border-color: var(--quiet);
+}
+
+form > * + * {
+  margin-block-start: var(--s4);
+}
+
+.buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s3);
+}
+
+/* --------------------------------------------------------------- the panels
+
+   Four of them, and the design rule is that no two get the same treatment,
+   because the difference between them is the claim:
+
+     .panel-error     role="alert" — codetrail broke, and here is a request id.
+     .panel-refusal   role="status" — no answer AND no error. Not a failure.
+     .panel-rejected  role="status" — your input was refused by a named rule.
+     .panel-degraded  role="status" — a model was asked and did not answer.
+
+   An error is the only one that is loud: a full alarm-tinted field and a heavy
+   rule down its side. A refusal is quiet and blue-grey with a thin rule — it is
+   an outcome, not damage. A rejection is a bordered card with no fill, because
+   nothing broke and nothing was withheld; the sentence is the whole content. A
+   degradation is amber-ruled, because it is a fact about HOW an answer was
+   written and sits beside an answer that is still valid. */
+.panel {
+  border-radius: var(--radius);
+  padding: var(--s4) var(--s5);
+  margin-block: var(--s5);
+}
+
+.panel > :first-child {
+  margin-block-start: 0;
+}
+
+.panel > :last-child {
+  margin-block-end: 0;
+}
+
+.panel h2 {
+  font-size: var(--t-base);
+}
+
+.panel-error {
+  background: var(--alarm-bg);
+  border: 1px solid var(--alarm-rule);
+  border-inline-start: 5px solid var(--alarm-ink);
+}
+
+.panel-error h2 {
+  color: var(--alarm-ink);
+}
+
+.panel-refusal {
+  background: var(--note-bg);
+  border: 1px solid var(--note-rule);
+}
+
+.panel-rejected {
+  background: var(--surface);
+  border: 1px solid var(--warn-rule);
+  border-block-start: 4px solid var(--warn-ink);
+}
+
+.panel-rejected h2 {
+  color: var(--warn-ink);
+}
+
+.panel-degraded {
+  background: var(--warn-bg);
+  border: 1px dashed var(--warn-rule);
+}
+
+.panel-degraded h2 {
+  color: var(--warn-ink);
+}
+
+/* ------------------------------------------------------------- the citation
+
+   The thing this product exists to render. It is a card with a rule down its
+   side in the icon's amber, its location as its title in mono, the tuple as a
+   compact definition list, and the check folded into a <details> so ten of
+   them in a search result are ten cards and not a hundred and twenty lines.
+
+   Measured before this existed: one answer page was 3409 x 5204 px, and every
+   line on it was the same black 16px text. */
+.cite {
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-inline-start: 4px solid var(--amber-rule);
+  border-radius: var(--radius);
+  padding: var(--s3) var(--s4);
+  margin-block: var(--s3);
+}
+
+.cite > :first-child {
+  margin-block-start: 0;
+}
+
+.cite > :last-child {
+  margin-block-end: 0;
+}
+
+/* The title of a citation is where the code is. Mono, because it is a path and
+   a line range, and those align and compare by column. */
+.cite-loc {
+  font-family: var(--mono);
+  font-size: var(--t-sm);
+  font-weight: 600;
+  margin-block: 0 var(--s3);
+  max-width: none;
   overflow-wrap: anywhere;
 }
 
-/* The tuple's values are the long ones and they sit in a dd. */
-dd {
-  overflow-wrap: anywhere;
-  min-width: 0;
+/* The no-link state. It is a sentence, not a dead link, and it is quiet
+   because the tuple below it is the claim. */
+.cite-nolink {
+  font-size: var(--t-sm);
+  color: var(--quiet);
+  margin-block: 0 var(--s3);
+}
+
+/* The tuple: label in the left column, value in the right, both small. A grid
+   rather than a float, so a 64-char digest wraps inside its own column instead
+   of pushing the label off the card. */
+.tuple {
+  display: grid;
+  grid-template-columns: minmax(5.5rem, max-content) minmax(0, 1fr);
+  gap: var(--s1) var(--s4);
+  margin: 0;
+  font-size: var(--t-sm);
+}
+
+.tuple dt {
+  color: var(--quiet);
+  font-weight: 600;
+}
+
+.tuple dd code {
+  background: none;
+  border: 0;
+  padding: 0;
+  font-size: var(--t-sm);
+}
+
+/* The copy button. An icon and no text, so the dd's textContent is still
+   exactly the value it labels — which is what the citation's tests read. The
+   accessible name is on aria-label and changes when the copy lands. */
+.copy {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  vertical-align: -0.28em;
+  inline-size: 1.6rem;
+  block-size: 1.6rem;
+  min-block-size: 0;
+  padding: 0;
+  margin-inline-start: var(--s2);
+  border-radius: 4px;
+  border: 1px solid var(--control);
+  background: var(--surface);
+  color: var(--quiet);
+}
+
+.copy:hover:not(:disabled) {
+  color: var(--ink);
+  background: var(--code-bg);
+}
+
+.copy[data-copied="true"] {
+  color: var(--link);
+  border-color: var(--link);
+}
+
+.copy svg {
+  inline-size: 0.85rem;
+  block-size: 0.85rem;
+}
+
+/* A citation with no digest is still a citation: it has a location and it says
+   what is missing. Grey rule rather than amber — the amber marks a claim you
+   can check, and this one you cannot. */
+.cite-nodigest {
+  border-inline-start-color: var(--control);
+}
+
+/* A code block with a copy button parked in its corner. The button is OUTSIDE
+   the <pre>, because the pre scrolls horizontally and a button inside it
+   scrolls away with the command. */
+.codeblock {
+  position: relative;
+}
+
+.copy-float {
+  position: absolute;
+  inset-block-start: var(--s2);
+  inset-inline-end: var(--s2);
+}
+
+/* The check command, folded. Open on the single-span page, where it is the
+   subject; collapsed in a list, where ten of them are noise. */
+.check {
+  margin-block-start: var(--s3);
+  font-size: var(--t-sm);
+}
+
+.check > summary {
+  cursor: pointer;
+  color: var(--quiet);
+  font-weight: 600;
+  padding-block: var(--s1);
+}
+
+.check > summary:hover {
+  color: var(--ink);
+}
+
+.check pre {
+  margin-block: var(--s2);
+}
+
+.check p {
+  margin-block: var(--s2);
+  color: var(--quiet);
+}
+
+/* The staleness note is the server's sentence, and it is set quiet and small
+   because it qualifies the citation above it rather than competing with it. */
+.stale {
+  font-size: var(--t-sm);
+  color: var(--quiet);
+  margin-block: var(--s3) 0;
+  max-width: none;
+}
+
+/* A word, never a colour: Staleness renders the literal word "superseded" and
+   this only makes it look like the label it already is. */
+.stale-flag {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: var(--t-xs);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--warn-ink);
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-rule);
+  border-radius: 4px;
+  padding: 0 var(--s2);
+  margin-inline-end: var(--s2);
+}
+
+/* The indexing live region. One sentence, and it is the page's headline while
+   a job runs, so it is set at body size on its own strip rather than as a
+   footnote. Never an alert: role="alert" is reserved for the error panel. */
+.live {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s2);
+  margin-block: var(--s4);
+  padding: var(--s3) var(--s4);
+  background: var(--note-bg);
+  border: 1px solid var(--note-rule);
+  border-radius: var(--radius);
+  font-weight: 560;
+}
+
+/* ------------------------------------------------------------- lists of rows
+
+   A search result, a caller list and a definition list are all "a row, then
+   its citation". The row is the sentence and the card is the evidence. */
+/* A row holds a citation card, and a card is not prose: the 66ch measure that
+   keeps a sentence readable would squeeze a 64-character digest and a
+   two-column tuple into two thirds of the page for no gain. */
+.rows > li,
+.markers > li {
+  max-width: none;
+  margin-block: var(--s4);
+}
+
+.rows > li > p:first-child {
+  margin-block: 0 var(--s2);
+  font-weight: 560;
+}
+
+/* The answer's citation list keeps its markers OFF: every row already renders
+   the server's own marker as [1], [2], and a decimal beside it is a second
+   numbering that can disagree with the first. */
+.markers {
+  list-style: none;
+  padding-inline-start: 0;
+}
+
+.markers > li > p:first-child {
+  font-family: var(--mono);
+  font-size: var(--t-sm);
+}
+
+/* --------------------------------------------------------------- odds and ends */
+
+.meta {
+  font-size: var(--t-sm);
+  color: var(--quiet);
+}
+
+/* A pending read. Not a spinner: there is no motion in this console and the
+   reduced-motion pass is recorded as vacuous, which is a property worth
+   keeping. Text, quiet, in the place the result will appear. */
+.pending {
+  font-size: var(--t-sm);
+  color: var(--quiet);
+  font-style: italic;
+}
+
+.facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s2) var(--s5);
+  margin-block: var(--s4);
+  padding: var(--s3) var(--s4);
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  font-size: var(--t-sm);
+}
+
+.facts > * {
+  margin: 0;
+  max-width: none;
+}
+
+.trace {
+  font-size: var(--t-sm);
+  margin-block: var(--s3);
+}
+
+.trace > summary {
+  cursor: pointer;
+  color: var(--quiet);
+  font-weight: 600;
+}
+
+.trace .tuple {
+  margin-block-start: var(--s2);
 }
