@@ -36,13 +36,22 @@ import (
 type fakeCorpus struct {
 	res    rag.Result
 	getErr error
+	// repos records every repo id the tools were bound to. The handler takes it
+	// out of the URL path and closes over it before the first model call; a
+	// corpus that ignored the argument could not see a handler that passed the
+	// wrong one — and a sweep mutation that fed the loop the request body's
+	// answerer field instead of c.Param("repo") SURVIVED against a fake that
+	// did.
+	repos []string
 }
 
-func (c *fakeCorpus) Search(_ context.Context, _, _ string, _ int) (rag.Result, error) {
+func (c *fakeCorpus) Search(_ context.Context, repoID, _ string, _ int) (rag.Result, error) {
+	c.repos = append(c.repos, repoID)
 	return c.res, nil
 }
 
-func (c *fakeCorpus) GetSpan(_ context.Context, _, spanID string) (models.Span, error) {
+func (c *fakeCorpus) GetSpan(_ context.Context, repoID, spanID string) (models.Span, error) {
+	c.repos = append(c.repos, repoID)
 	if c.getErr != nil {
 		return models.Span{}, c.getErr
 	}
@@ -54,15 +63,18 @@ func (c *fakeCorpus) GetSpan(_ context.Context, _, spanID string) (models.Span, 
 	return models.Span{}, store.ErrNotFound
 }
 
-func (c *fakeCorpus) Definitions(context.Context, string, string, string, bool, int) ([]models.Symbol, error) {
+func (c *fakeCorpus) Definitions(_ context.Context, repoID, _, _ string, _ bool, _ int) ([]models.Symbol, error) {
+	c.repos = append(c.repos, repoID)
 	return nil, nil
 }
 
-func (c *fakeCorpus) CallersOf(context.Context, string, string, int, int) ([]store.Caller, error) {
+func (c *fakeCorpus) CallersOf(_ context.Context, repoID, _ string, _, _ int) ([]store.Caller, error) {
+	c.repos = append(c.repos, repoID)
 	return nil, nil
 }
 
-func (c *fakeCorpus) ApproximateCallersOf(context.Context, string, string, int) ([]store.Approximate, error) {
+func (c *fakeCorpus) ApproximateCallersOf(_ context.Context, repoID, _ string, _ int) ([]store.Approximate, error) {
+	c.repos = append(c.repos, repoID)
 	return nil, nil
 }
 
@@ -895,4 +907,32 @@ func llmMovedSince(t *testing.T, before map[string]float64) map[string]float64 {
 		}
 	}
 	return moved
+}
+
+// The repo id the loop reads is the one in the URL PATH, and nothing a caller
+// puts in the body can change it.
+//
+// Found by the whole-branch sweep: a mutation feeding the loop the request
+// body's `answerer` field instead of c.Param("repo") survived every test in the
+// branch, because the fake corpus ignored the argument. Both halves are fixed —
+// the fake records what it was bound to, and this asserts it.
+func TestTheLoopIsBoundToTheRepoIdInTheUrlPath(t *testing.T) {
+	h, _ := llmHandler(t, newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)},
+		answeringTurns("the sampler drops events [1]")...)
+	c := h.LLM.(*Loop).Corpus.(*fakeCorpus)
+
+	// A body naming an answerer, which is the one request field this route
+	// honours and the nearest string to a repo id in scope.
+	rec := askBody(t, h, `{"q":"sampler","answerer":"llm"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body)
+	}
+	if len(c.repos) == 0 {
+		t.Fatal("the tools were never called, so this test proves nothing")
+	}
+	for _, got := range c.repos {
+		if got != "repo-1" {
+			t.Errorf("a tool was bound to repo %q, want the URL path's %q", got, "repo-1")
+		}
+	}
 }
