@@ -46,7 +46,7 @@ func readChunk() (chunk.Options, bool, error) {
 
 func retrievalConfig(cfg Config) RetrievalConfig {
 	return RetrievalConfig{
-		Mode: cfg.Mode, K: cfg.K, Candidates: cfg.Candidates, Split: cfg.Split,
+		Mode: cfg.Mode, K: cfg.Fusion.K, Candidates: cfg.Candidates, Split: cfg.Split,
 		Limit: cfg.Limit, Ks: cfg.Ks,
 		FloorValue: cfg.Floor.Value, FloorCalibrated: cfg.Floor.Calibrated,
 		AnswerMaxSpans: cfg.Budget.MaxSpans, AnswerMaxChars: cfg.Budget.MaxChars,

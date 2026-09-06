@@ -7,6 +7,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -18,6 +20,7 @@ import (
 
 	"github.com/mralaminahamed/codetrail/apps/gateway/internal/handler"
 	"github.com/mralaminahamed/codetrail/packages/shared/admit"
+	"github.com/mralaminahamed/codetrail/packages/shared/agent"
 	"github.com/mralaminahamed/codetrail/packages/shared/jobs"
 	"github.com/mralaminahamed/codetrail/packages/shared/models"
 	"github.com/mralaminahamed/codetrail/packages/shared/rag"
@@ -153,10 +156,10 @@ func TestNewHandlerWiresTheLoggerPolicyAndQueue(t *testing.T) {
 	// logger.New pins production to InfoLevel; a test logger that accepts more
 	// would pass on a line production never writes.
 	st := deadStore{}
-	ret := &rag.Retriever{Store: st, Mode: rag.ModeHybrid, K: 60, Candidates: 40,
+	ret := &rag.Retriever{Store: st, Mode: rag.ModeHybrid, Fusion: rag.DefaultParams(), Candidates: 40,
 		Floor: rag.Floor{Value: 0.25, Calibrated: false}}
 	budget := rag.Budget{MaxSpans: 3, MaxChars: 4096}
-	h := newHandler(zerolog.New(&logged).Level(zerolog.InfoLevel), q, st, ret, budget)
+	h := newHandler(zerolog.New(&logged).Level(zerolog.InfoLevel), q, st, ret, budget, nil, "extractive")
 
 	h.Log.Error().Msg("ping")
 	if logged.Len() == 0 {
@@ -209,8 +212,8 @@ func TestNewServerAssemblesWhatMainServes(t *testing.T) {
 
 	var logged bytes.Buffer
 	e := newServer(zerolog.New(&logged).Level(zerolog.InfoLevel), deadStore{pool},
-		&rag.Retriever{Store: deadStore{pool}, Mode: rag.ModeHybrid, K: 60, Candidates: 40, Floor: rag.DefaultFloor()},
-		rag.DefaultBudget())
+		&rag.Retriever{Store: deadStore{pool}, Mode: rag.ModeHybrid, Fusion: rag.DefaultParams(), Candidates: 40, Floor: rag.DefaultFloor()},
+		rag.DefaultBudget(), nil, "extractive")
 
 	// Readiness has to reflect the dependency, not a constant.
 	if rec := serve(e, http.MethodGet, "/health", ""); rec.Code != http.StatusOK {
@@ -383,18 +386,19 @@ func TestTheFloorGaugeIsSetFromTheConfiguredValue(t *testing.T) {
 	}
 }
 
-// The shipped defaults, all of them, in one place: hybrid because spec §8
-// defines retrieval as hybrid, k=60 from the paper, 40 candidates because that
-// is pgvector's hnsw.ef_search default, and a floor of -1 that cannot exclude
-// anything. If any of these moves, the README moved with it.
-func TestTheDefaultRetrieverIsHybridAtTheUncalibratedFloor(t *testing.T) {
+// The shipped defaults, all of them, in one place: VECTOR since P7, on a
+// measurement rather than on conformance; k=60 from the paper; 40 candidates
+// because that is pgvector's hnsw.ef_search default; unit fusion weights; and a
+// floor of -1 that cannot exclude anything. If any of these moves, the README
+// moved with it — which the test below asserts rather than asks.
+func TestTheDefaultRetrieverIsVectorAtTheUncalibratedFloor(t *testing.T) {
 	bootEnv(t)
 	r, logged, err := boot(t)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Mode != rag.ModeHybrid || r.K != 60 || r.Candidates != 40 || !r.Split {
-		t.Errorf("mode=%s k=%d candidates=%d split=%v", r.Mode, r.K, r.Candidates, r.Split)
+	if r.Mode != rag.ModeVector || r.Fusion != rag.DefaultParams() || r.Candidates != 40 || !r.Split {
+		t.Errorf("mode=%s fusion=%+v candidates=%d split=%v", r.Mode, r.Fusion, r.Candidates, r.Split)
 	}
 	if r.Floor != rag.DefaultFloor() || r.Floor.Value != -1 || r.Floor.Calibrated {
 		t.Errorf("floor %+v, want -1 uncalibrated", r.Floor)
@@ -498,5 +502,210 @@ func TestAnOperatorsFloorIsNeverLabelledCalibrated(t *testing.T) {
 func TestTheUnsetFloorIsTheShippedDefaultWhole(t *testing.T) {
 	if got, err := scoreFloor(); err != nil || got != rag.DefaultFloor() {
 		t.Errorf("with no environment the floor is %+v (%v), want %+v", got, err, rag.DefaultFloor())
+	}
+}
+
+// A default that moved with no published measurement beside it is the "guess
+// wearing a measurement's clothes" the -1 floor was chosen to prevent, and the
+// README is where a reader checks. A test on the constant alone cannot detect a
+// README that still says hybrid.
+func TestTheDefaultRetrievalModeMatchesWhatTheReadmeRecords(t *testing.T) {
+	bootEnv(t)
+	r, _, err := boot(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readme, err := os.ReadFile(filepath.Join("..", "..", "..", "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sec := section(t, string(readme), "## Retrieval")
+	want := "`RETRIEVAL_MODE` defaults to `" + string(r.Mode) + "`"
+	if !strings.Contains(sec, want) {
+		t.Errorf("boot default %q; the README's Retrieval section does not say %q", r.Mode, want)
+	}
+	// And the numbers that moved it, so the default and its evidence cannot
+	// drift apart. Each of these is a figure from the run, not a rounding
+	// anybody may adjust.
+	for _, n := range []string{"0.7492", "0.4023", "0.1637", "google/uuid", "2d3c2a9", "74"} {
+		if !strings.Contains(sec, n) {
+			t.Errorf("the README's Retrieval section does not carry %q", n)
+		}
+	}
+	// The SCOPED CLAIM itself, verbatim, not a phrase that could appear
+	// incidentally. Measured: asserting only that the words "one corpus" occur
+	// somewhere in the section passed under a mutation that deleted every
+	// hedge, because a different sentence about P6's floor also contains them.
+	// A result stated without its scope is a broader claim than the run
+	// supports, and this is the sentence that carries the scope.
+	for _, claim := range []string{
+		"fusion does not help on doc-comment prose queries, on this corpus, at these settings",
+		"Measured on **one corpus**",
+		"no identifier-lookup question at all",
+	} {
+		if !strings.Contains(sec, claim) {
+			t.Errorf("the README's Retrieval section does not state the limit %q", claim)
+		}
+	}
+}
+
+// section returns one "## " heading's body.
+func section(t *testing.T, doc, heading string) string {
+	t.Helper()
+	i := strings.Index(doc, heading)
+	if i < 0 {
+		t.Fatalf("the README has no %q section", heading)
+	}
+	rest := doc[i+len(heading):]
+	if j := strings.Index(rest, "\n## "); j >= 0 {
+		return rest[:j]
+	}
+	return rest
+}
+
+// ---- the answering loop's boot contract -----------------------------------
+
+func llmEnv(t *testing.T) {
+	t.Helper()
+	for _, k := range []string{
+		"LLM_PROVIDER", "LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY", "LLM_API_KEY_FILE",
+		"LLM_BELOW_FLOOR", "LLM_MAX_CONCURRENT", "LLM_TOKENS_PER_HOUR", "ANSWER_DEFAULT",
+	} {
+		t.Setenv(k, "")
+	}
+}
+
+func answeringBoot(t *testing.T) (handler.Answerer, string, *bytes.Buffer, error) {
+	t.Helper()
+	var logged bytes.Buffer
+	loop, def, err := answering(zerolog.New(&logged).Level(zerolog.InfoLevel), deadStore{}, &rag.Retriever{})
+	return loop, def, &logged, err
+}
+
+// spec:230-232's default. With no provider the loop does not exist: no client,
+// no key, and nothing that could make an offline deploy look degraded.
+func TestTheDefaultDeploymentHasNoLoopAndIsNotDegraded(t *testing.T) {
+	llmEnv(t)
+	loop, def, logged, err := answeringBoot(t)
+	if err != nil {
+		t.Fatalf("the default configuration does not boot: %v", err)
+	}
+	if loop != nil {
+		t.Errorf("a loop was built with no provider configured: %v", loop)
+	}
+	if def != "extractive" {
+		t.Errorf("ANSWER_DEFAULT defaulted to %q, want extractive", def)
+	}
+	if !strings.Contains(logged.String(), "nothing is a degradation") {
+		t.Errorf("the boot log does not say an unconfigured deployment is not a degraded one: %s", logged)
+	}
+}
+
+// A setting an operator believes is in force and is not. Every other knob in
+// this codebase refuses at boot for this reason.
+func TestAnswerDefaultLlmWithoutAProviderRefusesToBoot(t *testing.T) {
+	llmEnv(t)
+	t.Setenv("ANSWER_DEFAULT", "llm")
+	_, _, _, err := answeringBoot(t)
+	if err == nil {
+		t.Fatalf("booted with ANSWER_DEFAULT=llm and LLM_PROVIDER=none")
+	}
+	for _, want := range []string{"ANSWER_DEFAULT", "LLM_PROVIDER"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the boot error does not name %s: %v", want, err)
+		}
+	}
+}
+
+func TestAnUnknownAnswerDefaultRefusesToBoot(t *testing.T) {
+	llmEnv(t)
+	t.Setenv("ANSWER_DEFAULT", "extractve")
+	if _, _, _, err := answeringBoot(t); err == nil {
+		t.Errorf("booted with ANSWER_DEFAULT=extractve")
+	}
+}
+
+// The house rule: parsed, never compared against "true". TRUE and 1 are
+// booleans ParseBool accepts and == "true" does not.
+func TestTheLoopsBooleanKnobIsParsedNotCompared(t *testing.T) {
+	for _, v := range []string{"TRUE", "1", "t", "True"} {
+		llmEnv(t)
+		t.Setenv("LLM_PROVIDER", "fake")
+		t.Setenv("LLM_BELOW_FLOOR", v)
+		loop, _, _, err := answeringBoot(t)
+		if err != nil {
+			t.Fatalf("LLM_BELOW_FLOOR=%s: %v", v, err)
+		}
+		if l, ok := loop.(*handler.Loop); !ok || !l.BelowFloor {
+			t.Errorf("LLM_BELOW_FLOOR=%s did not enable the knob", v)
+		}
+	}
+	llmEnv(t)
+	t.Setenv("LLM_PROVIDER", "fake")
+	t.Setenv("LLM_BELOW_FLOOR", "yes please")
+	if _, _, _, err := answeringBoot(t); err == nil {
+		t.Errorf("LLM_BELOW_FLOOR=%q was accepted", "yes please")
+	}
+}
+
+func TestTheLoopsIntegerKnobsAreValidatedAtBoot(t *testing.T) {
+	for _, tc := range []struct{ key, value string }{
+		{"LLM_MAX_CONCURRENT", "0"},
+		{"LLM_MAX_CONCURRENT", "-1"},
+		{"LLM_MAX_CONCURRENT", "2O"}, // a letter O, the RETRIEVAL_CANDIDATES=4O shape
+		{"LLM_TOKENS_PER_HOUR", "0"},
+		{"LLM_TOKENS_PER_HOUR", "not a number"},
+	} {
+		t.Run(tc.key+"="+tc.value, func(t *testing.T) {
+			llmEnv(t)
+			t.Setenv("LLM_PROVIDER", "fake")
+			t.Setenv(tc.key, tc.value)
+			if _, _, _, err := answeringBoot(t); err == nil {
+				t.Errorf("booted with %s=%s", tc.key, tc.value)
+			} else if !strings.Contains(err.Error(), tc.key) {
+				t.Errorf("the boot error does not name %s: %v", tc.key, err)
+			}
+		})
+	}
+}
+
+// The bounds an operator is running under are in the boot log, so the published
+// worst case can be checked against the process rather than against the README
+// alone.
+func TestTheBoundsAreInTheBootLog(t *testing.T) {
+	llmEnv(t)
+	t.Setenv("LLM_PROVIDER", "fake")
+	loop, def, logged, err := answeringBoot(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loop == nil {
+		t.Fatal("no loop built for LLM_PROVIDER=fake")
+	}
+	if def != "extractive" {
+		t.Errorf("ANSWER_DEFAULT is %q with a provider configured, want extractive", def)
+	}
+	for _, want := range []string{
+		`"worst_case_tokens":13500`, `"max_steps":6`, `"max_tool_calls":12`,
+		`"llm_tokens_per_hour":200000`, `"llm_max_concurrent":2`,
+		"per process",
+	} {
+		if !strings.Contains(logged.String(), want) {
+			t.Errorf("the boot log does not carry %q: %s", want, logged)
+		}
+	}
+}
+
+// The client's own timeout must be LONGER than the loop's whole deadline.
+//
+// The loop's context is what should end a call; a client timeout shorter than
+// it would end one first and report a client error where the trace should say
+// `deadline`. Found by the whole-branch sweep: shortening it to 5s survived
+// everything, because nothing related the two numbers.
+func TestTheClientTimeoutOutlastsTheLoopDeadline(t *testing.T) {
+	b := agent.DefaultBounds()
+	if llmClientTimeout <= b.Deadline {
+		t.Errorf("llmClientTimeout is %v and the loop's deadline is %v: the client would end a call first and report the wrong reason",
+			llmClientTimeout, b.Deadline)
 	}
 }

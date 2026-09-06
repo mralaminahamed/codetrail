@@ -1,6 +1,7 @@
 {
   "repo_id": "ae4bae98f7440ee9e4c013b6c69be7e4",
   "refused": true,
+  "answered_by": "extractive",
   "reason": "unscored",
   "detail": "The best match has no usable similarity score, so there is nothing to judge it by.",
   "mode": "hybrid",

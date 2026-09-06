@@ -1,5 +1,10 @@
-# Env / secrets
-.env
+# Env / secrets. .env alone does not match .env.local, and P7 is the phase that
+# introduces this project's first API key. Nothing here reads a .env file —
+# config is os.LookupEnv and nothing else — so the pattern exists to stop one
+# being committed by a hand that assumes otherwise. The example is exempt so a
+# deployment can carry one.
+.env*
+!.env.example
 
 # Terraform. Three artifacts hold secrets in cleartext, not one: the plan file,
 # the show -json output CI generates from it (which carries the assembled
