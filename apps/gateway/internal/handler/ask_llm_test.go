@@ -679,7 +679,9 @@ func TestTheQuestionAndThePromptAreNeverLogged(t *testing.T) {
 	var logged bytes.Buffer
 	h, _ := llmHandler(t, newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)},
 		readTurn("r", "span-c"), llm.Turn{Text: answer + " with no marker"})
-	h.Log = zerolog.New(&logged).Level(zerolog.DebugLevel)
+	// InfoLevel, which is what logger.New pins production to: a test logger
+	// that accepted more would pass on a line production never writes.
+	h.Log = zerolog.New(&logged).Level(zerolog.InfoLevel)
 	rec := askBody(t, h, `{"q":"`+question+` sampler"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body)
@@ -688,6 +690,14 @@ func TestTheQuestionAndThePromptAreNeverLogged(t *testing.T) {
 	// under test was written.
 	if !strings.Contains(logged.String(), "degraded") {
 		t.Fatalf("the degradation was never logged, so this test proves nothing: %s", logged.String())
+	}
+	// AT WARN, so it is visible at production's level. graph.go's idiom is Info
+	// on the good outcome and Warn on anything else, and a degradation logged at
+	// Debug is a silent downgrade with extra steps — which is the failure spec
+	// §8 calls the one that costs a week. Found by the whole-branch sweep:
+	// demoting this line to Debug survived every other assertion.
+	if !strings.Contains(logged.String(), `"level":"warn"`) {
+		t.Errorf("the degradation is not logged at warn, so production never sees it: %s", logged.String())
 	}
 	for _, canary := range []string{question, answer} {
 		if strings.Contains(logged.String(), canary) {
@@ -709,7 +719,7 @@ func TestTheQuestionAndThePromptAreNeverLogged(t *testing.T) {
 	var answered bytes.Buffer
 	h2, _ := llmHandler(t, newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)},
 		answeringTurns(answer+" [1]")...)
-	h2.Log = zerolog.New(&answered).Level(zerolog.DebugLevel)
+	h2.Log = zerolog.New(&answered).Level(zerolog.InfoLevel)
 	rec2 := askBody(t, h2, `{"q":"`+question+` sampler"}`)
 	out2 := body(t, rec2)
 	if out2["answered_by"] != answererLLM {
@@ -762,6 +772,11 @@ func TestTheAnswerCounterStillHasThreeOutcomesAndADegradationIsAnswered(t *testi
 		`codetrail_answer_total{outcome="answered"}`:       1,
 		`codetrail_answer_by_total{answerer="extractive"}`: 1,
 		`codetrail_llm_stop_total{reason="rate_limited"}`:  1,
+		// A degradation is work too: one model call was made and paid for, and
+		// an operator sizing spend needs to see it. The histogram moves for
+		// every loop, not only for a successful one.
+		"codetrail_llm_steps_count": 1,
+		"codetrail_llm_steps_sum":   1,
 	}
 	for series, delta := range want {
 		if moved[series] != delta {
@@ -769,6 +784,16 @@ func TestTheAnswerCounterStillHasThreeOutcomesAndADegradationIsAnswered(t *testi
 		}
 		delete(moved, series)
 	}
+	// A failure before any usage is reported spends nothing, so the token
+	// counters may or may not move; the budget gauge must not have risen.
+	for _, d := range metrics.TokenDirections {
+		delete(moved, `codetrail_llm_tokens_total{direction="`+d+`"}`)
+	}
+	if moved["codetrail_llm_budget_remaining"] > 0 {
+		t.Errorf("codetrail_llm_budget_remaining rose by %v after a degradation",
+			moved["codetrail_llm_budget_remaining"])
+	}
+	delete(moved, "codetrail_llm_budget_remaining")
 	for series, delta := range moved {
 		t.Errorf("%s moved %v, want 0", series, delta)
 	}
@@ -786,6 +811,11 @@ func TestAnAnsweredLoopCountsAsLlmOnTheAnswererCounter(t *testing.T) {
 		`codetrail_answer_total{outcome="answered"}`: 1,
 		`codetrail_answer_by_total{answerer="llm"}`:  1,
 		`codetrail_llm_stop_total{reason="final"}`:   1,
+		// The work the loop did, not only that it happened. A histogram nothing
+		// observes and a token counter nothing adds to are two instruments a
+		// dashboard would render as flat.
+		"codetrail_llm_steps_count": 1,
+		"codetrail_llm_steps_sum":   2,
 	}
 	for series, delta := range want {
 		if moved[series] != delta {
@@ -793,6 +823,23 @@ func TestAnAnsweredLoopCountsAsLlmOnTheAnswererCounter(t *testing.T) {
 		}
 		delete(moved, series)
 	}
+	// The token counters move by whatever the fake reported, which is not fixed
+	// — so they are asserted as non-zero rather than as a value, and named so a
+	// mutant that stops incrementing them fails here.
+	for _, d := range metrics.TokenDirections {
+		series := `codetrail_llm_tokens_total{direction="` + d + `"}`
+		if moved[series] <= 0 {
+			t.Errorf("%s moved %v, want more than 0", series, moved[series])
+		}
+		delete(moved, series)
+	}
+	// And the budget gauge, which is a level rather than a delta: it must have
+	// gone DOWN by what the loop spent.
+	if moved["codetrail_llm_budget_remaining"] >= 0 {
+		t.Errorf("codetrail_llm_budget_remaining moved %v, want a decrease",
+			moved["codetrail_llm_budget_remaining"])
+	}
+	delete(moved, "codetrail_llm_budget_remaining")
 	for series, delta := range moved {
 		t.Errorf("%s moved %v, want 0", series, delta)
 	}
@@ -876,10 +923,33 @@ func llmCounters(t *testing.T) map[string]float64 {
 	}
 	out := map[string]float64{}
 	for _, line := range strings.Split(string(raw), "\n") {
+		// The histogram and the gauge as well as the counters. Their absence is
+		// what the whole-branch sweep found: mutations deleting
+		// metrics.ObserveLLM and metrics.SetLLMBudget both SURVIVED, because
+		// nothing read either back — the "side effect nothing reads back" shape
+		// P3's and P4's sweeps kept finding, and two rows the plan's own ledger
+		// marked "fill this in".
 		if !strings.HasPrefix(line, "codetrail_answer_total{") &&
 			!strings.HasPrefix(line, "codetrail_refusal_total{") &&
 			!strings.HasPrefix(line, "codetrail_answer_by_total{") &&
-			!strings.HasPrefix(line, "codetrail_llm_stop_total{") {
+			!strings.HasPrefix(line, "codetrail_llm_stop_total{") &&
+			!strings.HasPrefix(line, "codetrail_llm_tokens_total{") &&
+			!strings.HasPrefix(line, "codetrail_llm_steps_count") &&
+			!strings.HasPrefix(line, "codetrail_llm_steps_sum") &&
+			!strings.HasPrefix(line, "codetrail_llm_budget_remaining") {
+			continue
+		}
+		if !strings.Contains(line, "}") {
+			// codetrail_llm_steps_count 3 — a bare series with no labels.
+			name, value, ok := strings.Cut(line, " ")
+			if !ok {
+				t.Fatalf("unparseable metric line %q", line)
+			}
+			v, err := strconv.ParseFloat(value, 64)
+			if err != nil {
+				t.Fatalf("metric %q: %v", line, err)
+			}
+			out[name] = v
 			continue
 		}
 		series, value, ok := strings.Cut(line, "} ")
