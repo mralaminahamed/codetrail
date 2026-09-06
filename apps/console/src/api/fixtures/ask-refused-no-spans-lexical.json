@@ -1,6 +1,7 @@
 {
   "repo_id": "e00f79438626e09bd156709cb9884a77",
   "refused": true,
+  "answered_by": "extractive",
   "reason": "no_spans",
   "detail": "Nothing in this repository's index matched the question.",
   "mode": "lexical",

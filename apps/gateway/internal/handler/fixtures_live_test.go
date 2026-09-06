@@ -311,7 +311,7 @@ func consoleHandler(t *testing.T, rd Reader, st *store.Store, mode rag.Mode, flo
 		Jobs:   jobs.New(st.Pool()),
 		Repos:  rd,
 		Rag: &rag.Retriever{Store: st, Emb: emb, Mode: mode,
-			K: 60, Candidates: candidates, Split: true, Floor: floor},
+			Fusion: rag.DefaultParams(), Candidates: candidates, Split: true, Floor: floor},
 		Floor:  floor,
 		Budget: rag.DefaultBudget(),
 		Now:    func() time.Time { return consoleNow },
@@ -603,6 +603,24 @@ func TestConsoleFixturesMatchTheShippedHandlersLive(t *testing.T) {
 	pinRepoClock(t, st, gl.ID, consoleNow.Add(-40*day), consoleNow.Add(-1*time.Minute))
 	pinRepoClock(t, st, main.ID, consoleNow.Add(-3*day), consoleNow.Add(-2*time.Minute))
 	pinRepoClock(t, st, cb.ID, consoleNow.Add(-9*day), consoleNow.Add(-3*time.Minute))
+	// EVERY repository the reads above touched is re-pinned here, not only the
+	// three this listing expects to see. Without the two lines below the test
+	// fails, and it fails on trunk at e7cd491 before P7 touched anything:
+	// `repos.json[0] is …/emptycorpus, want …/thirdforge`.
+	//
+	// The cause is the LRU clock doing exactly its job. Every successful read
+	// winds last_queried_at, TouchRepo writes the DATABASE's now() rather than
+	// Handler.Now, and the seed-time pins at the top of this function are
+	// therefore erased by the reads in between: the refusal fixtures ask
+	// against empty.ID and repo-stale.json reads moved.ID, so both end the run
+	// at wall-clock now and sort above everything pinned into the past.
+	//
+	// Re-pinning after the reads is what makes this listing's order a property
+	// of the fixture rather than of when the suite happened to run.
+	pinRepoClock(t, st, empty.ID, consoleNow.Add(-5*day), consoleNow.Add(-50*day))
+	pinRepoClock(t, st, moved.ID, consoleNow.Add(-30*day), consoleNow.Add(-30*day))
+	pinRepoClock(t, st, newer.ID, consoleNow.Add(-2*day), consoleNow.Add(-2*day))
+	pinRepoClock(t, st, evicted.ID, consoleNow.Add(-99*day), consoleNow.Add(-99*day))
 	rp := emit(t, "repos.json", http.StatusOK, consoleGet(hybrid, "/api/repos?limit=3"))
 	assertReposOrder(t, rp, glRemote, ghRemote, cbRemote)
 

@@ -90,7 +90,12 @@ func answeringTurns(text string) []llm.Turn {
 	return []llm.Turn{readTurn("r1", "span-c"), {Text: text}}
 }
 
-func ask(t *testing.T, h *Handler, body string) *httptest.ResponseRecorder {
+// askBody posts one /ask body against the hermetic fixture repository.
+//
+// Not named ask: read_live_test.go already has one with a different signature,
+// and two helpers with one name in a package that builds under two tag sets is
+// a build break that only appears under -tags=live.
+func askBody(t *testing.T, h *Handler, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	return do(mount(h), http.MethodPost, "/api/repos/repo-1/ask", body)
 }
@@ -105,32 +110,32 @@ func TestEveryAskResponseNamesWhatAnsweredIt(t *testing.T) {
 	cases := map[string]func(t *testing.T) *httptest.ResponseRecorder{
 		"answered extractive": func(t *testing.T) *httptest.ResponseRecorder {
 			h := hermeticHandler(newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)})
-			return ask(t, h, `{"q":"sampler"}`)
+			return askBody(t, h, `{"q":"sampler"}`)
 		},
 		"answered llm": func(t *testing.T) *httptest.ResponseRecorder {
 			h, _ := llmHandler(t, newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)},
 				answeringTurns("the sampler drops events [1]")...)
-			return ask(t, h, `{"q":"sampler"}`)
+			return askBody(t, h, `{"q":"sampler"}`)
 		},
 		"refused no_spans": func(t *testing.T) *httptest.ResponseRecorder {
 			h := hermeticHandler(newStore(), &fakeRetriever{res: rag.Result{Mode: rag.ModeHybrid, VectorRan: true}})
-			return ask(t, h, `{"q":"sampler"}`)
+			return askBody(t, h, `{"q":"sampler"}`)
 		},
 		"refused below_floor": func(t *testing.T) *httptest.ResponseRecorder {
 			h := hermeticHandler(newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.2, true)})
 			h.Floor = rag.Floor{Value: 0.5}
-			return ask(t, h, `{"q":"sampler"}`)
+			return askBody(t, h, `{"q":"sampler"}`)
 		},
 		"refused unscored": func(t *testing.T) *httptest.ResponseRecorder {
 			h := hermeticHandler(newStore(), &fakeRetriever{res: unscoredResult()})
-			return ask(t, h, `{"q":"sampler"}`)
+			return askBody(t, h, `{"q":"sampler"}`)
 		},
 	}
 	for _, stop := range degradations() {
 		name, turn := stop.name, stop.turn
 		cases["degraded "+name] = func(t *testing.T) *httptest.ResponseRecorder {
 			h, _ := llmHandler(t, newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)}, turn...)
-			return ask(t, h, `{"q":"sampler"}`)
+			return askBody(t, h, `{"q":"sampler"}`)
 		}
 	}
 	for name, run := range cases {
@@ -161,7 +166,7 @@ func TestAnExtractiveAnswerNeverClaimsToBeTheModel(t *testing.T) {
 	// The model fails on turn 1, so extractive answers.
 	h, f := llmHandler(t, newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)},
 		llm.Turn{Err: &llm.Failure{Kind: llm.KindRateLimited, Status: 429}})
-	rec := ask(t, h, `{"q":"sampler"}`)
+	rec := askBody(t, h, `{"q":"sampler"}`)
 	out := body(t, rec)
 	if out["answered_by"] != answererExtractive {
 		t.Errorf("answered_by %v with a failed model: the response claims the model wrote an answer the extractive path wrote", out["answered_by"])
@@ -176,7 +181,7 @@ func TestAnExtractiveAnswerNeverClaimsToBeTheModel(t *testing.T) {
 	// "extractive" under a mutant that called the model anyway.
 	h2, f2 := llmHandler(t, newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)},
 		answeringTurns("never reached [1]")...)
-	rec2 := ask(t, h2, `{"q":"sampler","answerer":"extractive"}`)
+	rec2 := askBody(t, h2, `{"q":"sampler","answerer":"extractive"}`)
 	out2 := body(t, rec2)
 	if out2["answered_by"] != answererExtractive {
 		t.Errorf("answered_by %v", out2["answered_by"])
@@ -251,7 +256,7 @@ func TestEachDegradationDegradesToExtractiveAndSaysWhich(t *testing.T) {
 			if d.name == "tool_error" {
 				h.LLM.(*Loop).Corpus.(*fakeCorpus).getErr = errors.New("pool exhausted")
 			}
-			rec := ask(t, h, `{"q":"sampler"}`)
+			rec := askBody(t, h, `{"q":"sampler"}`)
 			if rec.Code != http.StatusOK {
 				t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body)
 			}
@@ -300,7 +305,7 @@ func TestEveryStopReasonDegradesToExtractiveAndSaysWhich(t *testing.T) {
 		if d.name == "tool_error" {
 			h.LLM.(*Loop).Corpus.(*fakeCorpus).getErr = errors.New("pool exhausted")
 		}
-		out := body(t, ask(t, h, `{"q":"sampler"}`))
+		out := body(t, askBody(t, h, `{"q":"sampler"}`))
 		if deg, ok := out["degraded"].(map[string]any); ok {
 			covered[deg["reason"].(string)] = true
 		}
@@ -338,7 +343,7 @@ func TestEveryStopReasonDegradesToExtractiveAndSaysWhich(t *testing.T) {
 
 func TestAnUnconfiguredDeploymentIsNotADegradedOne(t *testing.T) {
 	h := hermeticHandler(newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)})
-	rec := ask(t, h, `{"q":"sampler"}`)
+	rec := askBody(t, h, `{"q":"sampler"}`)
 	out := body(t, rec)
 	if out["answered_by"] != answererExtractive {
 		t.Errorf("answered_by %v", out["answered_by"])
@@ -354,7 +359,7 @@ func TestAnUnconfiguredDeploymentIsNotADegradedOne(t *testing.T) {
 func TestAskingForLlmOnAnUnconfiguredDeploymentIsFourHundredNamingTheRule(t *testing.T) {
 	h := hermeticHandler(newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)})
 	rt := h.Rag.(*fakeRetriever)
-	rec := ask(t, h, `{"q":"sampler","answerer":"llm"}`)
+	rec := askBody(t, h, `{"q":"sampler","answerer":"llm"}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("want 400, got %d: %s", rec.Code, rec.Body)
 	}
@@ -375,7 +380,7 @@ func TestAnUnknownAnswererIsFourHundred(t *testing.T) {
 	h, _ := llmHandler(t, newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)},
 		answeringTurns("never [1]")...)
 	for _, v := range []string{`"gpt"`, `""`, `"LLM"`, `null`} {
-		rec := ask(t, h, `{"q":"sampler","answerer":`+v+`}`)
+		rec := askBody(t, h, `{"q":"sampler","answerer":`+v+`}`)
 		if v == `null` {
 			// An explicit null is absence, as it is for mode and limit.
 			if rec.Code != http.StatusOK {
@@ -392,7 +397,7 @@ func TestAnUnknownAnswererIsFourHundred(t *testing.T) {
 func TestAskingForExtractiveOnAConfiguredDeploymentCallsNoModel(t *testing.T) {
 	h, f := llmHandler(t, newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)},
 		answeringTurns("never reached [1]")...)
-	out := body(t, ask(t, h, `{"q":"sampler","answerer":"extractive"}`))
+	out := body(t, askBody(t, h, `{"q":"sampler","answerer":"extractive"}`))
 	if out["answered_by"] != answererExtractive || len(f.Requests()) != 0 {
 		t.Errorf("answered_by %v with %d model calls, want extractive with 0", out["answered_by"], len(f.Requests()))
 	}
@@ -403,7 +408,7 @@ func TestAskingForExtractiveOnAConfiguredDeploymentCallsNoModel(t *testing.T) {
 	h2, f2 := llmHandler(t, newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)},
 		answeringTurns("the sampler drops events [1]")...)
 	h2.AnswerDefault = answererExtractive
-	out2 := body(t, ask(t, h2, `{"q":"sampler","answerer":"llm"}`))
+	out2 := body(t, askBody(t, h2, `{"q":"sampler","answerer":"llm"}`))
 	if n := len(f2.Requests()); n == 0 {
 		t.Errorf("the model was called %d times for an explicit answerer=llm, want it called", n)
 	}
@@ -416,7 +421,7 @@ func TestTheDefaultAnswererIsExtractiveEvenWithAProviderConfigured(t *testing.T)
 	h, f := llmHandler(t, newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)},
 		answeringTurns("never reached [1]")...)
 	h.AnswerDefault = answererExtractive
-	out := body(t, ask(t, h, `{"q":"sampler"}`))
+	out := body(t, askBody(t, h, `{"q":"sampler"}`))
 	if out["answered_by"] != answererExtractive || len(f.Requests()) != 0 {
 		t.Errorf("a default-answerer request cost %d model calls and read %v", len(f.Requests()), out["answered_by"])
 	}
@@ -510,7 +515,7 @@ func TestAnExhaustedTokenBudgetDegradesAndSaysSo(t *testing.T) {
 		func() time.Time { return fixtureNow })
 	h.AnswerDefault = answererLLM
 
-	out := body(t, ask(t, h, `{"q":"sampler"}`))
+	out := body(t, askBody(t, h, `{"q":"sampler"}`))
 	if out["answered_by"] != answererExtractive {
 		t.Errorf("answered_by %v", out["answered_by"])
 	}
@@ -580,7 +585,7 @@ func TestTheBudgetWindowRolls(t *testing.T) {
 func TestNoSpansRefusesBeforeAnyModelCall(t *testing.T) {
 	h, f := llmHandler(t, newStore(), &fakeRetriever{res: rag.Result{Mode: rag.ModeHybrid, VectorRan: true}},
 		answeringTurns("never [1]")...)
-	out := body(t, ask(t, h, `{"q":"sampler"}`))
+	out := body(t, askBody(t, h, `{"q":"sampler"}`))
 	if out["refused"] != true || out["reason"] != string(rag.ReasonNoSpans) {
 		t.Errorf("response %s, want a no_spans refusal", rec2s(out))
 	}
@@ -603,7 +608,7 @@ func TestABelowFloorRefusalDoesNotRunTheLoopWhenTheKnobIsOff(t *testing.T) {
 	h, f := llmHandler(t, newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.2, true)},
 		answeringTurns("never [1]")...)
 	h.Floor = rag.Floor{Value: 0.5}
-	out := body(t, ask(t, h, `{"q":"sampler"}`))
+	out := body(t, askBody(t, h, `{"q":"sampler"}`))
 	if out["refused"] != true || out["reason"] != string(rag.ReasonBelowFloor) {
 		t.Errorf("response %s, want a below_floor refusal", rec2s(out))
 	}
@@ -620,7 +625,7 @@ func TestABelowFloorRefusalStillRefusesWhenTheLoopDegrades(t *testing.T) {
 		llm.Turn{Err: &llm.Failure{Kind: llm.KindRateLimited, Status: 429}})
 	h.Floor = rag.Floor{Value: 0.5}
 	h.LLM.(*Loop).BelowFloor = true
-	out := body(t, ask(t, h, `{"q":"sampler"}`))
+	out := body(t, askBody(t, h, `{"q":"sampler"}`))
 	if n := len(f.Requests()); n != 1 {
 		t.Fatalf("the model was called %d times with LLM_BELOW_FLOOR=true, want 1", n)
 	}
@@ -645,7 +650,7 @@ func TestABelowFloorRefusalStillRefusesWhenTheLoopDegrades(t *testing.T) {
 
 func TestARefusalNamesWhichAnswererRefused(t *testing.T) {
 	h := hermeticHandler(newStore(), &fakeRetriever{res: rag.Result{Mode: rag.ModeHybrid, VectorRan: true}})
-	out := body(t, ask(t, h, `{"q":"sampler"}`))
+	out := body(t, askBody(t, h, `{"q":"sampler"}`))
 	if _, ok := out["answered_by"]; !ok {
 		t.Fatalf("refusal response has no answered_by key: %s", rec2s(out))
 	}
@@ -663,7 +668,7 @@ func TestTheQuestionAndThePromptAreNeverLogged(t *testing.T) {
 	h, _ := llmHandler(t, newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)},
 		readTurn("r", "span-c"), llm.Turn{Text: answer + " with no marker"})
 	h.Log = zerolog.New(&logged).Level(zerolog.DebugLevel)
-	rec := ask(t, h, `{"q":"`+question+` sampler"}`)
+	rec := askBody(t, h, `{"q":"`+question+` sampler"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body)
 	}
@@ -693,7 +698,7 @@ func TestTheQuestionAndThePromptAreNeverLogged(t *testing.T) {
 	h2, _ := llmHandler(t, newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)},
 		answeringTurns(answer+" [1]")...)
 	h2.Log = zerolog.New(&answered).Level(zerolog.DebugLevel)
-	rec2 := ask(t, h2, `{"q":"`+question+` sampler"}`)
+	rec2 := askBody(t, h2, `{"q":"`+question+` sampler"}`)
 	out2 := body(t, rec2)
 	if out2["answered_by"] != answererLLM {
 		t.Fatalf("the answered fixture did not answer from the model, so this half proves nothing: %s", rec2.Body)
@@ -713,7 +718,7 @@ func TestTheLlmBlockIsAbsentWhenTheLoopDidNotRun(t *testing.T) {
 		"no provider": hermeticHandler(newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)}),
 	} {
 		t.Run(name, func(t *testing.T) {
-			out := body(t, ask(t, h, `{"q":"sampler"}`))
+			out := body(t, askBody(t, h, `{"q":"sampler"}`))
 			if v, ok := out["llm"]; ok {
 				t.Errorf("llm %v although the loop did not run", v)
 			}
@@ -722,7 +727,7 @@ func TestTheLlmBlockIsAbsentWhenTheLoopDidNotRun(t *testing.T) {
 	// And on a configured deployment where the caller asked for extractive.
 	h, _ := llmHandler(t, newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)},
 		answeringTurns("never [1]")...)
-	out := body(t, ask(t, h, `{"q":"sampler","answerer":"extractive"}`))
+	out := body(t, askBody(t, h, `{"q":"sampler","answerer":"extractive"}`))
 	if v, ok := out["llm"]; ok {
 		t.Errorf("llm %v although the caller asked for extractive", v)
 	}
@@ -735,7 +740,7 @@ func TestTheAnswerCounterStillHasThreeOutcomesAndADegradationIsAnswered(t *testi
 	before := llmCounters(t)
 	h, _ := llmHandler(t, newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)},
 		llm.Turn{Err: &llm.Failure{Kind: llm.KindRateLimited, Status: 429}})
-	if rec := ask(t, h, `{"q":"sampler"}`); rec.Code != http.StatusOK {
+	if rec := askBody(t, h, `{"q":"sampler"}`); rec.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d", rec.Code)
 	}
 	// The WHOLE delta vector, so a mutant that increments two series fails even
@@ -761,7 +766,7 @@ func TestAnAnsweredLoopCountsAsLlmOnTheAnswererCounter(t *testing.T) {
 	before := llmCounters(t)
 	h, _ := llmHandler(t, newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)},
 		answeringTurns("the sampler drops events [1]")...)
-	if rec := ask(t, h, `{"q":"sampler"}`); rec.Code != http.StatusOK {
+	if rec := askBody(t, h, `{"q":"sampler"}`); rec.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d", rec.Code)
 	}
 	moved := llmMovedSince(t, before)
@@ -786,7 +791,7 @@ func TestAnAnsweredLoopCountsAsLlmOnTheAnswererCounter(t *testing.T) {
 func TestAnAnsweredLoopCitesTheSpansItOpened(t *testing.T) {
 	h, _ := llmHandler(t, newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)},
 		answeringTurns("the sampler drops events [1]")...)
-	rec := ask(t, h, `{"q":"sampler"}`)
+	rec := askBody(t, h, `{"q":"sampler"}`)
 	out := body(t, rec)
 	if out["answered_by"] != answererLLM {
 		t.Fatalf("answered_by %v: %s", out["answered_by"], rec.Body)
