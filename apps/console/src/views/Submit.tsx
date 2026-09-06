@@ -1,17 +1,50 @@
 import { useEffect, useRef, useState } from "react";
-import { useNavigate } from "react-router";
 import { submitRepo } from "../api/client";
 import type { Outcome, Job } from "../api/types";
 import PageTitle from "../ui/PageTitle";
 import Rejected from "../ui/Rejected";
 import ErrorPanel from "../ui/ErrorPanel";
-import { rememberJob } from "../ui/recent";
+import { Link, useNavigate } from "react-router";
+import { rememberJob, readRecent } from "../ui/recent";
+
+// recent.ts has written localStorage since P5 and nothing has ever read it back:
+// readRecent was imported by its own test and by no component. Its own header
+// says why it exists — "there is no endpoint that lists jobs … so the only way
+// back to a job whose tab was closed is its id" — and a store nobody renders
+// answers that with nothing.
+//
+// Read during render rather than held in state, so an accepted submission that
+// does not navigate (it always does today) would still see its own row. The
+// read is total: a private window, cleared site data or a browser refusing
+// storage all come back as an empty list rather than a thrown render.
+function Recent() {
+  const jobs = readRecent();
+  if (jobs.length === 0) return null;
+  return (
+    <section>
+      <h2>Jobs you started here</h2>
+      <p className="meta">
+        codetrail has no endpoint that lists jobs, so this list is kept in this browser and is lost
+        with the profile. The id is the only way back to a job whose tab was closed.
+      </p>
+      <ul className="rows">
+        {jobs.map((j) => (
+          <li key={j.id}>
+            <Link to={`/jobs/${j.id}`}>{j.remote}</Link> at <code>{j.ref}</code> —{" "}
+            <code>{j.id}</code>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
 
 export default function Submit() {
   const [outcome, setOutcome] = useState<Outcome<Job> | null>(null);
   const [inFlight, setInFlight] = useState(false);
   const result = useRef<HTMLDivElement>(null);
   const navigate = useNavigate();
+
 
   async function onSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
@@ -89,6 +122,7 @@ export default function Submit() {
           <ErrorPanel title="codetrail could not be reached." detail={outcome.detail} requestId={null} />
         )}
       </div>
+      <Recent />
     </>
   );
 }

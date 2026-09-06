@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, test } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { axe } from "jest-axe";
 import { MemoryRouter, Route, Routes } from "react-router";
@@ -222,5 +222,30 @@ describe("submitting a repository", () => {
     await submit("https://github.com/rs/zerolog");
     await screen.findByRole("alert");
     expect(await axe(failed.container)).toHaveNoViolations();
+  });
+
+  test("a job started earlier in this browser is listed and linked", async () => {
+    // recent.ts wrote localStorage from P5 and readRecent was imported by its
+    // own test and by nothing else. Its header says why it exists: there is no
+    // endpoint that lists jobs, so the id is the only way back to one whose tab
+    // was closed — and a store nobody renders answers that with nothing.
+    stub("post", "/api/repos", 202, jobPending);
+    renderSubmit();
+    await submit("https://github.com/codetrail-live/pending");
+    await screen.findByRole("heading", { name: "Indexing job" });
+
+    // A fresh mount, which is what "the tab was closed" means.
+    const back = renderSubmit();
+    const link = await within(back.container).findByRole("link", { name: jobPending.remote });
+    expect(link).toHaveAttribute("href", `/jobs/${jobPending.id}`);
+    expect(back.container.textContent).toContain(jobPending.id);
+    // And it says where the list lives, because it is lost with the profile.
+    expect(back.container.textContent).toContain("kept in this browser");
+  });
+
+  test("nothing is listed on a first visit, rather than an empty heading", () => {
+    const { container } = renderSubmit();
+    expect(readRecent()).toHaveLength(0);
+    expect(container.textContent).not.toContain("Jobs you started here");
   });
 });

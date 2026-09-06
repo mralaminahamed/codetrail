@@ -1,4 +1,4 @@
-import { http, HttpResponse } from "msw";
+import { delay, http, HttpResponse } from "msw";
 import { server } from "./setup";
 
 // What the handler saw. A count and the parsed bodies, because the mutations
@@ -56,6 +56,17 @@ export function stubSequence(method: Method, path: string, bodies: unknown[]): R
   return record(method, path, (rec) => {
     const at = Math.min(rec.calls - 1, bodies.length - 1);
     return HttpResponse.json(bodies[at] as object, { status: 200 });
+  });
+}
+
+// A response that takes a measurable moment. Without one, a pending state is
+// unobservable in this suite: MSW answers within the same tick userEvent
+// already awaits, so "is the previous result still on screen while the next
+// request runs" has no window to be asked in.
+export function stubSlow(method: Method, path: string, status: number, body: unknown, ms = 120): Recorder {
+  return record(method, path, async () => {
+    await delay(ms);
+    return HttpResponse.json(body as object, { status });
   });
 }
 

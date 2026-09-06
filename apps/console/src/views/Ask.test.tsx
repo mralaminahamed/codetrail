@@ -4,7 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { axe } from "jest-axe";
 import { MemoryRouter, Route, Routes } from "react-router";
 import Ask from "./Ask";
-import { stub } from "../test/msw";
+import { stub, stubSlow } from "../test/msw";
 import answered from "../api/fixtures/ask-answered.json";
 import answeredEmpty from "../api/fixtures/ask-answered-empty.json";
 import noSpans from "../api/fixtures/ask-refused-no-spans.json";
@@ -330,7 +330,9 @@ describe("searching", () => {
     // interleaves the two.
     const links = screen
       .getAllByRole("link")
-      .filter((a) => a.getAttribute("href")?.startsWith("/repos/"))
+      // The SPAN links specifically. The repository header now also links to
+      // the symbol graph, which is an in-app /repos/ link and not a hit.
+      .filter((a) => a.getAttribute("href")?.includes("/spans/"))
       .map((a) => a.textContent);
     const want = searchHybrid.hits.map((h) => `${h.path}:${h.start_line}-${h.end_line}`);
     expect(links).toEqual(want);
@@ -362,5 +364,86 @@ describe("searching", () => {
       expect(await axe(container)).toHaveNoViolations();
       unmount();
     }
+  });
+});
+
+describe("what the page shows while it is still working, and what it stops showing", () => {
+  test("pressing Ask produces an observable change before any answer arrives", async () => {
+    // The audit's sentence: inFlight only disabled two buttons that had no
+    // visible affordance to lose, so an embedding and a vector search ran with
+    // nothing on screen saying so.
+    stubSlow("post", ASK, 200, answered);
+    renderAsk();
+    await askQuestion();
+    const pending = screen.getByRole("status", { name: "Request progress" });
+    expect(pending.textContent).toContain("embedding the question");
+    // Announced rather than merely drawn: the region is not aria-busy, because
+    // aria-busy would tell a screen reader to DEFER exactly this sentence.
+    expect(screen.getByRole("region", { name: "Result" })).not.toHaveAttribute("aria-busy", "true");
+    await screen.findByRole("heading", { name: "Answer" });
+    expect(screen.queryByRole("status", { name: "Request progress" })).toBeNull();
+  });
+
+  test("a second question never renders the first question's citations beside it", async () => {
+    const user = userEvent.setup();
+    stub("post", ASK, 200, answered);
+    const { container } = renderAsk();
+    await askQuestion();
+    await screen.findByRole("heading", { name: "Answer" });
+    const firstDigest = answered.citations[0]!.citation.digest;
+    expect(container.textContent).toContain(firstDigest);
+
+    // setResult ran AFTER the await, so the first question's answer — and its
+    // citations — stayed on screen beside the second question for as long as
+    // the second embedding and vector search took. For a product whose claim is
+    // a checkable citation, showing one that answers a different question is
+    // the worst available stale state.
+    stubSlow("post", ASK, 200, noSpans);
+    await user.clear(screen.getByLabelText("Question"));
+    await user.type(screen.getByLabelText("Question"), "an entirely different question");
+    await user.click(screen.getByRole("button", { name: "Ask" }));
+
+    expect(screen.getByRole("status", { name: "Request progress" })).toBeInTheDocument();
+    expect(container.textContent).not.toContain(firstDigest);
+    expect(screen.queryByRole("heading", { name: "Answer" })).toBeNull();
+
+    await screen.findByRole("status", { name: "Answer outcome" });
+  });
+
+  test("a repository the console cannot read says so, instead of the header silently vanishing", async () => {
+    // getRepo's outcome was thrown away unless it was ok, so a 410 made the
+    // whole header disappear and the server's eviction sentence — which the
+    // console had already fetched and parsed — went on the floor.
+    stub("get", "/api/repos/:repo", 410, error410);
+    render(
+      <MemoryRouter initialEntries={["/repos/r1"]}>
+        <Routes>
+          <Route path="/repos/:repo" element={<Ask />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("this repository was indexed and has since been evicted");
+    // And the question form is still there: the repository facts failing does
+    // not mean the ask endpoint will.
+    expect(screen.getByLabelText("Question")).toBeInTheDocument();
+  });
+
+  test("the repository's facts offer a way into the symbol graph", async () => {
+    // routes.tsx has registered /repos/:repo/symbols since P4 and nothing in
+    // the tree linked to it: seven Links, none reaching the graph.
+    stub("post", ASK, 200, answered);
+    renderAsk();
+    const link = await screen.findByRole("link", { name: "Find a definition and who calls it" });
+    expect(link).toHaveAttribute("href", `/repos/${repoDetail.id}/symbols`);
+  });
+
+  test("the browser tab names the repository once its facts are read", async () => {
+    stub("post", ASK, 200, answered);
+    renderAsk();
+    await screen.findByText(repoDetail.staleness.note);
+    // PageTitle has taken a `title` prop since P5 and no caller passed one, so
+    // every tab read the same string for the life of the view.
+    expect(document.title).toBe(`${repoDetail.remote.replace("https://", "")} — codetrail`);
   });
 });
