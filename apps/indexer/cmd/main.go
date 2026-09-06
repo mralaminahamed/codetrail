@@ -11,6 +11,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"os"
 	"os/signal"
@@ -199,6 +200,10 @@ func main() {
 	// too: with a fresh id each start that normally finds nothing, and one
 	// syscall is cheaper than depending on it having found nothing.
 	ix.sweepHome()
+	// After sweepHome, so this worker's own (empty) tree is not a candidate,
+	// and before the loop, so a killed predecessor's checkout is off the disk
+	// before this one starts filling it.
+	ix.sweepStale()
 	defer ix.sweepHome()
 
 	ix.logToolchain()
@@ -275,12 +280,58 @@ func allowedHosts() []string {
 func (ix *indexer) home() string { return filepath.Join(ix.scratch, ix.id) }
 
 // sweepHome removes this worker's subtree and nothing else. A peer's tree is
-// left alone deliberately: nothing here distinguishes a crashed worker's
-// directory from a live one's, and removing the wrong one is the collision
-// above with extra steps. A worker killed hard therefore still leaks its tree.
+// left alone deliberately: removing a live one is the collision above with
+// extra steps. What reclaims a dead peer's is sweepStale, at boot.
 func (ix *indexer) sweepHome() {
 	if err := removeScratch(ix.home()); err != nil {
 		ix.log.Warn().Err(err).Str("dir", ix.home()).Msg("could not clear the worker's scratch tree")
+	}
+}
+
+// sweepStale removes the scratch entries that cannot belong to a live worker.
+//
+// Without it the tree leaks without bound across hard kills. home() is
+// scratch/<random id> and workerID generates a fresh id every boot, so
+// sweepHome removes only the tree of the process running it — and no future
+// worker ever cleans up after a killed one. Every OOM-kill therefore strands
+// up to MAX_REPO_BYTES, permanently, on a volume sized for one checkout.
+//
+// AGE is what distinguishes a dead worker's directory from a live one's, and
+// it is the only thing that does without a registry. The window is the job's
+// deadline plus the lease that outlasts it (run leases for Deadline+1m), so an
+// entry untouched for longer than a worker can legally hold one job is not a
+// worker still working: a live one's home is stamped afresh every time a job
+// directory is made or removed inside it, and a job cannot outlive jobCtx.
+// That is the bound sweepHome's warning is about — inside the window a peer's
+// in-flight clone is untouchable, which is what makes this safe to run against
+// a shared SCRATCH_DIR.
+//
+// At boot rather than on the lease loop: the leak it repairs is one per killed
+// process, and a periodic sweep would spend the syscalls to find nothing.
+// This worker's own tree is not a candidate — it is created by the first job,
+// after this has run.
+func (ix *indexer) sweepStale() {
+	entries, err := os.ReadDir(ix.scratch)
+	if err != nil {
+		// A scratch directory that does not exist yet is the normal first boot.
+		if !errors.Is(err, fs.ErrNotExist) {
+			ix.log.Warn().Err(err).Str("dir", ix.scratch).Msg("could not read the scratch directory")
+		}
+		return
+	}
+	cutoff := ix.now().Add(-(2*ix.lim.clone.Deadline + time.Minute))
+	for _, e := range entries {
+		info, ierr := e.Info()
+		if ierr != nil || !info.ModTime().Before(cutoff) {
+			continue
+		}
+		p := filepath.Join(ix.scratch, e.Name())
+		if rerr := removeScratch(p); rerr != nil {
+			ix.log.Warn().Err(rerr).Str("dir", p).Msg("could not clear an abandoned scratch tree")
+			continue
+		}
+		ix.log.Info().Str("dir", p).Time("modified", info.ModTime()).
+			Msg("removed a scratch tree no live worker can own")
 	}
 }
 
