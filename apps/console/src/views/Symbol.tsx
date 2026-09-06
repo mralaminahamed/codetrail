@@ -8,7 +8,7 @@ import Staleness from "../ui/Staleness";
 import CallersList from "../ui/Callers";
 import ErrorPanel from "../ui/ErrorPanel";
 
-const DEPTHS = [1, 2, 3, 4, 5];
+const DEPTHS = [1, 2, 3];
 
 export default function SymbolView() {
   const { repo = "", symbol = "" } = useParams();

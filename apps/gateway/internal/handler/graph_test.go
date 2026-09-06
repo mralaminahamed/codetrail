@@ -613,9 +613,9 @@ func TestTwoCallerRowsSharingOneSpanReadItOnce(t *testing.T) {
 // Out of range is a 400 naming the rule, not a clamp: a caller asking for depth
 // 40 has misunderstood the endpoint and quietly serving 5 hides it. Both ends,
 // because a clamp-to-max and a clamp-to-min are different mutants.
-func TestDepthOutsideOneToFiveIsFourHundredNamingTheRule(t *testing.T) {
+func TestDepthOutsideOneToThreeIsFourHundredNamingTheRule(t *testing.T) {
 	st, e := graphHandler(t)
-	for _, raw := range []string{"40", "0", "-1", "6", "five"} {
+	for _, raw := range []string{"40", "0", "-1", "4", "five"} {
 		rec := getPath(e, "/api/repos/repo-1/symbols/"+symStoreGet+"/callers?depth="+raw)
 		if rec.Code != http.StatusBadRequest {
 			// The depth it served, not the whole body: a clamp answers 200 and
@@ -628,7 +628,7 @@ func TestDepthOutsideOneToFiveIsFourHundredNamingTheRule(t *testing.T) {
 		d, _ := out["error"].(string)
 		// Which rule, not merely that a rule fired: a 400 naming the wrong
 		// field is what §10's "never a generic refusal" is about.
-		if !strings.Contains(d, "depth") || !strings.Contains(d, "1") || !strings.Contains(d, "5") {
+		if !strings.Contains(d, "depth") || !strings.Contains(d, "1") || !strings.Contains(d, strconv.Itoa(maxDepth)) {
 			t.Errorf("depth=%s: the 400 says %q, want it to name depth and its bounds", raw, d)
 		}
 		if out["rule"] != "form" {
@@ -641,9 +641,9 @@ func TestDepthOutsideOneToFiveIsFourHundredNamingTheRule(t *testing.T) {
 		t.Errorf("a refused depth reached the store as %d", st.callersCall.depth)
 	}
 	// Both ends of the accepted range, from the accepted side: without this,
-	// maxDepth could be any number above 5 and the refusals above would still
-	// pass.
-	for _, raw := range []string{"1", "5"} {
+	// maxDepth could be any number above the range and the refusals above
+	// would still pass.
+	for _, raw := range []string{"1", "3"} {
 		out := decodeAs[callersPayload](t,
 			getPath(e, "/api/repos/repo-1/symbols/"+symStoreGet+"/callers?depth="+raw), http.StatusOK)
 		if out.Depth != mustAtoi(t, raw) || st.callersCall.depth != mustAtoi(t, raw) {

@@ -530,7 +530,10 @@ func TestAHighFloorRefusesTheSameQueryTheDefaultAnswers(t *testing.T) {
 	if refused.Floor.Value != 1 || refused.Floor.Calibrated {
 		t.Errorf("the refusal reports floor %+v; an operator's own number is still not measured", refused.Floor)
 	}
-	if !strings.Contains(refused.Detail, "not calibrated") {
+	// Matched on the wording rather than on the phase the sentence used to
+	// name; detail() branches on Calibrated now, so a measured floor gets a
+	// different sentence instead of this one going stale.
+	if !strings.Contains(refused.Detail, "not a measured threshold") {
 		t.Errorf("the refusal detail does not say the floor is uncalibrated: %q", refused.Detail)
 	}
 	// The whole set of series that moved, not only the one expected: a mutant
