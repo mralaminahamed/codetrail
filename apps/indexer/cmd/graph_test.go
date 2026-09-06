@@ -539,35 +539,115 @@ func TestTwoDefinitionsOnOneLineResolveTheSameWayInEitherOrder(t *testing.T) {
 	}
 }
 
-// The link is nullable and this is the shape that needs it: with
-// STRIP_DOC_COMMENTS=true the chunker sees a file whose doc comments are gone,
-// so its spans start at the `func` keyword — while a definition's range comes
-// from the raw bytes and starts at the comment. The definition's first line is
-// then inside no span at all.
+// The link from a symbol to its span survives STRIP_DOC_COMMENTS, and that
+// setting is how BOTH eval corpora are built (the Makefile's eval-corpus
+// target).
 //
-// Measured rather than assumed, and it is the eval corpus that runs this way.
-func TestADeclarationWithNoSpanStillGetsASymbolWithANullLink(t *testing.T) {
-	ix, rec := fakeIndexer(t, stripping(), withFiles(graphRepo),
-		withResolver(nil, symbols.Stats{Reason: symbols.ReasonOK}))
-	ix.runJob(context.Background(), aJob())
+// index parses the RAW body and chunks the STRIPPED one, deliberately: a
+// go/packages resolution is keyed against the file on disk, so the graph pass
+// cannot be handed the stripped bytes. A blanked doc comment is no longer an
+// *ast.CommentGroup, so chunk.Decl starts the span at the `func` keyword while
+// the definition still starts at the comment — ABOVE every span in the file.
+// Containment of the definition's first line then missed, silently, and
+// store.PutGraph wrote span_id NULL: measured over this repository's own 156
+// Go files, 1339 of 2092 definitions (64.0%) under CHUNK_STRATEGY=ast, against
+// 0 with stripping off. Downstream, agent/tools.go hands the model an empty
+// span_id it cannot then read_span.
+//
+// Asserted as an EQUALITY between the two arms and not as "not empty". A link
+// to SOME span is not the property; a link to the declaration's OWN span is,
+// and a fix that pointed every symbol at the file's first span would satisfy a
+// non-empty check.
+func TestASymbolLinksToItsOwnSpanWithOrWithoutDocComments(t *testing.T) {
+	links := func(t *testing.T, opts ...fixtureOpt) map[string]string {
+		t.Helper()
+		ix, rec := fakeIndexer(t, append(opts, withFiles(graphRepo),
+			withResolver(nil, symbols.Stats{Reason: symbols.ReasonOK}))...)
+		ix.runJob(context.Background(), aJob())
 
-	links := map[string]string{}
-	for _, s := range rec.syms {
-		links[s.Name] = s.SpanID
+		byID := map[string]string{}
+		for _, sp := range rec.spans {
+			byID[sp.ID] = string(sp.Kind) + ":" + sp.Symbol
+		}
+		out := map[string]string{}
+		for _, sy := range rec.syms {
+			// The span the symbol names, described by what that span IS rather
+			// than by its id: the ids differ between the two arms, because a
+			// span id hashes its range and its text and stripping moves both.
+			out[sy.Path+" "+sy.Name] = byID[sy.SpanID]
+		}
+		if len(rec.syms) != 4 {
+			t.Fatalf("the graph has %d symbols, want 4", len(rec.syms))
+		}
+		return out
 	}
-	for _, name := range []string{"F", "G"} {
-		if links[name] != "" {
-			t.Errorf("%s links to span %s; with the doc comment stripped its first line is inside no span, and the nearest one below it belongs to another declaration",
-				name, links[name])
+
+	var kept, stripped map[string]string
+	t.Run("doc comments kept", func(t *testing.T) { kept = links(t) })
+	t.Run("doc comments stripped", func(t *testing.T) { stripped = links(t, stripping()) })
+
+	// Written out rather than derived, so the test says which span each symbol
+	// is supposed to be citable by.
+	want := map[string]string{
+		"a.go F":           "func:F",
+		"a.go G":           "func:G",
+		"a.go fns":         "var:fns",
+		"b/util.go Helper": "func:Helper",
+	}
+	for _, tc := range []struct {
+		arm string
+		got map[string]string
+	}{{"kept", kept}, {"stripped", stripped}} {
+		for name, w := range want {
+			if got := tc.got[name]; got != w {
+				t.Errorf("doc comments %s: %s links to %q, want its own span %q", tc.arm, name, got, w)
+			}
 		}
 	}
-	// And the undocumented declaration in the same file still links, so the
-	// null above is a property of the range and not of the whole job.
-	if links["fns"] == "" {
-		t.Errorf("fns links to no span, yet it has no doc comment for stripping to remove")
+}
+
+// The link is still NULLABLE, and this is what is left of the shape that needs
+// it now that a stripped declaration links: a definition in a file that
+// produced no spans at all. store.PutGraph writes NULL for it, and the
+// alternative — inventing an id — would be a citation to a row that is not
+// there.
+//
+// A unit test rather than a job, because a job cannot reach it: index parses a
+// file only after walk.Indexable admits it, and every declaration chunk.Decl
+// names is one chunk.Chunks emits. That is the honest statement of the case,
+// and it is why the integration shape this test used to have was the defect
+// rather than the invariant.
+func TestADefinitionInAFileWithNoSpansHasNoLink(t *testing.T) {
+	if id, ok := spanFor(nil, 3, 9); ok || id != "" {
+		t.Fatalf("spanFor over no spans answered %q, %v", id, ok)
 	}
-	if len(rec.syms) != 4 {
-		t.Errorf("the graph has %d symbols, want 4: a missing span costs a link, not a definition", len(rec.syms))
+}
+
+// The overlap fallback picks the declaration's HEAD window, which is the one a
+// start-line lookup would have found before stripping moved the definition's
+// first line off the top of it. A declaration over MaxDeclLines is several
+// windows, so "any overlapping span" is not specific enough to be a rule.
+//
+// The tie-break is pinned in either order for mostSpecific's reason: two spans
+// with the same range must not resolve by the order rows came back in.
+func TestTheOverlapFallbackTakesTheHeadWindowAndIsOrderIndependent(t *testing.T) {
+	head := container{"head", 4, 43}
+	tail := container{"tail", 34, 73}
+	for _, cs := range [][]container{{head, tail}, {tail, head}} {
+		if id, ok := spanFor(cs, 3, 90); !ok || id != head.id {
+			t.Errorf("%v resolved to %q, want the head window %q", cs, id, head.id)
+		}
+	}
+	same := []container{{"bbb", 4, 9}, {"aaa", 4, 9}}
+	first, _ := spanFor(same, 3, 9)
+	second, _ := spanFor([]container{same[1], same[0]}, 3, 9)
+	if first != second || first != "aaa" {
+		t.Errorf("two spans with one range resolved to %q and %q, want the smaller id \"aaa\"", first, second)
+	}
+	// And a span that does not reach the definition at all is not a fallback:
+	// the next declaration's span must never become this declaration's link.
+	if id, ok := spanFor([]container{{"below", 20, 30}}, 3, 9); ok {
+		t.Errorf("a span at 20..30 was linked to a definition at 3..9: %q", id)
 	}
 }
 

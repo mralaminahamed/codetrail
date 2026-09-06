@@ -173,6 +173,18 @@ const writingGit = "#!/bin/sh\nfor a in \"$@\"; do last=$a; done\nmkdir -p \"$la
 const headFailingGit = "#!/bin/sh\nfor a in \"$@\"; do last=$a; done\n" +
 	"if [ \"$1\" = clone ]; then mkdir -p \"$last\" && echo x > \"$last/f\" && exit 0; fi\nexit 1\n"
 
+// headRecordingGit clones successfully and records what the rev-parse was
+// handed, which is the one fork in this package no test used to watch.
+const headRecordingGit = "#!/bin/sh\nfor a in \"$@\"; do last=$a; done\n" +
+	"if [ \"$1\" = clone ]; then mkdir -p \"$last\" && echo x > \"$last/f\" && exit 0; fi\n" +
+	"{ printf 'ARG:%s\\n' \"$@\"; env; } > \"$SHIM_RECORD\"\nexit 1\n"
+
+// headEscapingGit clones successfully, then puts the rev-parse's child in a
+// new session where it goes on holding the output pipe head() is reading.
+const headEscapingGit = "#!/bin/sh\nfor a in \"$@\"; do last=$a; done\n" +
+	"if [ \"$1\" = clone ]; then mkdir -p \"$last\" && echo x > \"$last/f\" && exit 0; fi\n" +
+	"setsid sleep 300 &\necho $! > \"$SHIM_RECORD\"\nwait\n"
+
 // unreadableGit leaves behind a directory the size walk cannot read, which is
 // how the tests reach the dirSize failure path.
 const unreadableGit = "#!/bin/sh\nfor a in \"$@\"; do last=$a; done\n" +
@@ -278,6 +290,75 @@ func TestCloneEnvironmentIsPinned(t *testing.T) {
 		if env[k] != want {
 			t.Errorf("child saw %s=%q, want %q", k, env[k], want)
 		}
+	}
+}
+
+// The rev-parse gets the same containment the clone does. It is a separate
+// test because it was a separate fork: head() built its own exec.Cmd and
+// therefore ran with none of gitCmd's five overrides, no process group and no
+// WaitDelay, while TestCloneEnvironmentIsPinned watched only the clone and
+// passed throughout.
+func TestHeadRunsUnderTheSameGitEnvironmentAsClone(t *testing.T) {
+	record := shimGit(t, headRecordingGit)
+	dst := filepath.Join(t.TempDir(), "checkout")
+
+	if _, err := Run(context.Background(), "file:///src", "HEAD", dst, limits(time.Minute)); err == nil {
+		t.Fatal("the shim fails every rev-parse; want an error")
+	}
+	argv, env := readRecord(t, record)
+	// The control: without this the assertions below would pass against the
+	// clone's own record if the rev-parse never ran at all.
+	if !slices.Contains(argv, "rev-parse") {
+		t.Fatalf("the record is not the rev-parse's: %v", argv)
+	}
+	for k, want := range map[string]string{
+		"GIT_TERMINAL_PROMPT": "0",
+		"GIT_ASKPASS":         "/bin/false",
+		"GIT_CONFIG_NOSYSTEM": "1",
+		"GIT_CONFIG_GLOBAL":   "/dev/null",
+		"HOME":                filepath.Dir(dst),
+	} {
+		if env[k] != want {
+			t.Errorf("the rev-parse saw %s=%q, want %q", k, env[k], want)
+		}
+	}
+	// The parent environment is still inherited: gitCmd closes five variables
+	// and no more, and routing head through it must not have narrowed that.
+	if env["PATH"] == "" {
+		t.Error("the rev-parse inherited no PATH, so its environment is no longer append(os.Environ(), …)")
+	}
+}
+
+// The half of gitCmd that only this call site can lose, and the reason its doc
+// says WaitDelay is there: cmd.Output() waits on the output pipe, and waiting
+// on that pipe has no timeout of its own. With a descendant outside the
+// process group holding it open, a hand-built exec.Cmd does not return late —
+// it does not return at all.
+func TestCloneReturnsWhenTheRevParseLeaksAChild(t *testing.T) {
+	if _, err := exec.LookPath("setsid"); err != nil {
+		t.Skip("setsid is needed to put a child outside the process group")
+	}
+	record := shimGit(t, headEscapingGit)
+	dst := filepath.Join(t.TempDir(), "checkout")
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := Run(context.Background(), "file:///src", "HEAD", dst, limits(2*time.Second))
+		done <- err
+	}()
+	pid := readPID(t, record)
+	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("want an error from the deadline")
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run never returned: the rev-parse's escaped child held the output pipe, and head() waited on it forever")
+	}
+	if syscall.Kill(pid, 0) != nil {
+		t.Fatal("the escaped child died anyway, so this run proves nothing about WaitDelay")
 	}
 }
 

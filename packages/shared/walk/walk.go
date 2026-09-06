@@ -4,8 +4,10 @@
 // a checkout: the indexer, and the eval harness, which generates its questions
 // from the same tree the indexer read (spec §9). Go's internal rule makes
 // apps/indexer/internal/walk unimportable from apps/evalrunner, so the choice
-// was this or a second copy of Files, ReadRegular and Indexable — and a second
-// copy is the drift the source-binding check exists to catch. Spec:45-46 lists
+// was this or a second copy of Files, ReadRegular, Lines and Indexable — and a
+// second copy is the drift the source-binding check exists to catch. Lines is
+// named because it WAS the copy: the harness held a correct one while this
+// package counted terminators, so the two disagreed about how long a file is. Spec:45-46 lists
 // packages/shared's contents and does not name walk; neither does it name
 // admit, jobs or testdb, which are already there.
 package walk
@@ -145,7 +147,7 @@ func Files(ctx context.Context, root string, lim Limits) ([]File, error) {
 		out = append(out, File{
 			Path:  filepath.ToSlash(rel),
 			Bytes: size,
-			Lines: bytes.Count(body, []byte{'\n'}),
+			Lines: Lines(body),
 			Lang:  langByExt[strings.ToLower(filepath.Ext(rel))],
 		})
 		return nil
@@ -154,6 +156,32 @@ func Files(ctx context.Context, root string, lim Limits) ([]File, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+// Lines counts the lines in body, the way a citation counts them.
+//
+// A terminator ENDS a line, it does not add one: counting '\n' alone is one
+// too small for every file that does not end in one, and answers 0 for a
+// one-line file with no terminator. That is not cosmetic, because files.lines
+// is the only thing that says how long a file is while chunk names ranges out
+// of the same bytes: "package b\nvar X = 1" recorded 1 line while the chunker
+// emitted a span citing 1..1 — a file whose own row said the code it cites is
+// not there.
+//
+// Exported and shared with apps/evalrunner for walk.Indexable's reason: the
+// eval harness derives its rows from the same checkout the indexer read, and
+// this counter was already reimplemented there, correctly, in a file whose doc
+// says it mirrors the indexer's pipeline. Two derivations agree on the day
+// they are written.
+func Lines(body []byte) int {
+	if len(body) == 0 {
+		return 0
+	}
+	n := bytes.Count(body, []byte{'\n'})
+	if body[len(body)-1] != '\n' {
+		n++
+	}
+	return n
 }
 
 // ReadRegular reads p, re-deciding on the file itself what the listing only
