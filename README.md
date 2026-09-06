@@ -1409,8 +1409,9 @@ same walk the same way.
 response says `"matched":"exact"` or `"matched":"suffix"` so a widening is never silent.
 `?pkg=` narrows the symbol lookup to one package — `…/symbols?name=Logger.Info&pkg=zerolog` — which
 is what makes the route usable on a repository where the same method name appears in several
-packages; the console sends it. `?limit=` bounds the returned list on the symbol
-lookup and the caller walk, defaulting to 20 on each.
+packages. The console's API client serialises it; **no console view passes one yet**, so today it
+is an API affordance rather than a shipped feature. `?limit=` bounds the returned list on the
+symbol lookup and the caller walk, defaulting to 20 on each.
 
 The `content-type` header is not optional: without it the body is bound as a form, `q` is empty,
 and the answer is a `400` naming that rule rather than the question you meant to ask.
