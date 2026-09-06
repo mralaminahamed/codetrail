@@ -78,6 +78,15 @@ type ToolInvocation struct {
 // unkillable. Steps says where it stopped, Stop says which ceiling, and Tools
 // is an ordered list a test can compare element by element — three observers
 // for every ceiling, beside the fake's own request recorder.
+// NewTrace starts one, and is the only place a Trace is built: the gateway
+// makes one of its own for the two degradations decided before Run is called,
+// and a Tools grown from nil by append serialises as null on exactly those —
+// busy and budget_exhausted, the loops that called no tool. One empty list
+// spelled two ways is one a client has to guess about.
+func NewTrace(model string) Trace {
+	return Trace{Model: model, Tools: []ToolInvocation{}}
+}
+
 type Trace struct {
 	Model            string           `json:"model"`
 	Steps            int              `json:"steps"`

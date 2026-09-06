@@ -110,7 +110,7 @@ func Run(ctx context.Context, m llm.Model, ts ToolSet, b Bounds, question string
 	ctx, cancel := context.WithTimeout(ctx, b.Deadline)
 	defer cancel()
 
-	l := &loop{m: m, ts: ts, b: b, tr: Trace{Model: m.Name()}, seen: map[string]int{}}
+	l := &loop{m: m, ts: ts, b: b, tr: NewTrace(m.Name()), seen: map[string]int{}}
 	l.msgs = []llm.Message{{Role: llm.RoleUser, Text: question}}
 	l.specs = ts.Specs()
 	l.names = make(map[string]bool, len(l.specs))

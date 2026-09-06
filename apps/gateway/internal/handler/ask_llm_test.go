@@ -1041,3 +1041,28 @@ func TestAnswererIsRefusedOnSearchAndHonouredOnAsk(t *testing.T) {
 		t.Errorf("ask with answerer:llm called no model")
 	}
 }
+
+// The two degradations the gateway decides before agent.Run is ever called
+// build their own trace, and it reaches a client as llm.tools. Before this it
+// was null on exactly those and [] on every loop that ran one — one field, two
+// spellings of empty, chosen by which stop fired.
+func TestADegradationThatCalledNoToolServesToolsAsAnEmptyList(t *testing.T) {
+	h := hermeticHandler(newStore(), &fakeRetriever{res: result(rag.ModeHybrid, 0.83, true)})
+	// A budget under one worst-case request, so the loop is refused before any
+	// model call and the trace is the handler's own.
+	h.LLM = NewLoop(llm.NewFake(answeringTurns("never [1]")...),
+		&fakeCorpus{res: result(rag.ModeHybrid, 0.83, true)},
+		agent.DefaultBounds(), agent.DefaultToolLimits(), false, 2, 100,
+		func() time.Time { return fixtureNow })
+	h.AnswerDefault = answererLLM
+
+	rec := askBody(t, h, `{"q":"sampler"}`)
+	out := body(t, rec)
+	deg, _ := out["degraded"].(map[string]any)
+	if deg == nil || deg["reason"] != string(agent.StopBudgetExhausted) {
+		t.Fatalf("degraded %v, want reason budget_exhausted", out["degraded"])
+	}
+	if !strings.Contains(rec.Body.String(), `"tools":[]`) {
+		t.Errorf("llm.tools is not an empty list: %s", rec.Body)
+	}
+}
