@@ -5,6 +5,7 @@ import type { AskResult, Outcome, RepoDetail, SearchResult } from "../api/types"
 import PageTitle from "../ui/PageTitle";
 import Answer from "../ui/Answer";
 import Refusal from "../ui/Refusal";
+import Degraded from "../ui/Degraded";
 import Hits from "../ui/Hits";
 import ErrorPanel from "../ui/ErrorPanel";
 import GraphCounts from "../ui/GraphCounts";
@@ -147,21 +148,30 @@ export default function Ask() {
           </p>
         )}
 
-        {asked !== null &&
-          // The discriminant is `refused`, never whether `answer` is non-empty:
-          // an answered response can carry answer: "" (answer.go:83-89), and
-          // branching on the answer renders a refusal with no reason.
-          (asked.refused ? (
-            <Refusal
-              reason={asked.reason}
-              detail={asked.detail}
-              floor={asked.floor}
-              mode={asked.mode}
-              topScore={asked.top_score}
-            />
-          ) : (
-            <Answer answer={asked} />
-          ))}
+        {asked !== null && (
+          <>
+            {/* Beside both branches, because read.go puts `degraded` and `llm`
+                on answerResponse AND on refusalResponse. Never inside Refusal:
+                that panel's contract is the floor and no request id, asserted
+                in both directions, and it keeps exactly that shape. */}
+            <Degraded degraded={asked.degraded} llm={asked.llm} />
+            {/* The discriminant is `refused`, never whether `answer` is
+                non-empty: an answered response can carry answer: ""
+                (answer.go:83-89), and branching on the answer renders a
+                refusal with no reason. */}
+            {asked.refused ? (
+              <Refusal
+                reason={asked.reason}
+                detail={asked.detail}
+                floor={asked.floor}
+                mode={asked.mode}
+                topScore={asked.top_score}
+              />
+            ) : (
+              <Answer answer={asked} />
+            )}
+          </>
+        )}
 
         {result?.of === "search" && result.outcome.kind === "ok" && (
           <Hits repo={repo} result={result.outcome.value} />

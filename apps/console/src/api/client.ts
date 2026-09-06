@@ -38,6 +38,25 @@ export function getSpan(repo: string, span: string): Promise<Outcome<SpanRead>> 
 // proxy between the caller and the gateway (handler.go:49-52). `mode` is never
 // sent — read.go:452-455 refuses the field outright, every value including the
 // configured one, so sending it turns every query into a 400.
+//
+// `answerer` is NOT in this type, and unlike `mode` that is a decision rather
+// than a constraint: /ask honours it (read.go:297-303, 519-537). It is left out
+// for two reasons that pull the same way.
+//
+// 1. It is the operator's setting, not the caller's. ANSWER_DEFAULT is what the
+//    deployment decided; a console that put `answerer` on every request would
+//    override that from the browser and make its answers differ from every
+//    other client's against the same gateway, silently.
+// 2. A control offering it would be a 400 generator on the default deployment.
+//    The console cannot see whether a model provider is configured — that is
+//    boot configuration the browser has no view of, the same reason Submit.tsx
+//    refuses to check ALLOWED_HOSTS client-side. Asking for `llm` where there
+//    is none is a 400 naming the rule, which is right for an API and wrong for
+//    a button that looked available.
+//
+// Nothing is lost by leaving it out: the one thing the console needs — WHICH
+// answerer wrote the prose, and whether one was tried and failed — arrives on
+// every response as `answered_by`, `degraded` and `llm`, and is rendered.
 type Query = { q: string; limit?: number };
 
 function query(q: string, limit?: number): Query {

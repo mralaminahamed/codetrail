@@ -7,6 +7,9 @@ import Ask from "./Ask";
 import { stub, stubSlow } from "../test/msw";
 import answered from "../api/fixtures/ask-answered.json";
 import answeredEmpty from "../api/fixtures/ask-answered-empty.json";
+import answeredLLM from "../api/fixtures/ask-answered-llm.json";
+import answeredDegraded from "../api/fixtures/ask-answered-degraded.json";
+import refusedDegraded from "../api/fixtures/ask-refused-degraded.json";
 import noSpans from "../api/fixtures/ask-refused-no-spans.json";
 import noSpansLexical from "../api/fixtures/ask-refused-no-spans-lexical.json";
 import belowFloor from "../api/fixtures/ask-refused-below-floor.json";
@@ -445,5 +448,109 @@ describe("what the page shows while it is still working, and what it stops showi
     // PageTitle has taken a `title` prop since P5 and no caller passed one, so
     // every tab read the same string for the life of the view.
     expect(document.title).toBe(`${repoDetail.remote.replace("https://", "")} — codetrail`);
+  });
+});
+
+describe("the two fields the console ignored for a phase", () => {
+  // The pair the whole defect rests on. Measured, not assumed: strip `degraded`
+  // and `llm` from the degraded fixture and it is BYTE-IDENTICAL to the plain
+  // extractive one — same answered_by, same prose, same three citations, same
+  // top_score. read.go stamps answered_by "extractive" on a degraded answer, so
+  // those two fields are the only difference there is.
+  test("the degraded fixture differs from the plain one in exactly those two keys", () => {
+    const strip = (o: Record<string, unknown>) => {
+      const c = { ...o };
+      delete c["degraded"];
+      delete c["llm"];
+      return JSON.stringify(c);
+    };
+    expect(strip(answeredDegraded)).toBe(strip(answered));
+    expect(answeredDegraded.answered_by).toBe("extractive");
+    expect(answered).not.toHaveProperty("degraded");
+  });
+
+  test("a degraded answer does not render identically to a plain extractive one", async () => {
+    stub("post", ASK, 200, answered);
+    const plain = renderAsk();
+    await askQuestion();
+    await screen.findByRole("heading", { name: "Answer" });
+    const plainText = plain.container.textContent;
+    expect(plainText).not.toMatch(/fallback/i);
+    plain.unmount();
+
+    stub("post", ASK, 200, answeredDegraded);
+    const degraded = renderAsk();
+    await askQuestion();
+    await screen.findByRole("heading", { name: "Answer" });
+
+    // The claim: two payloads that differ only in `degraded` and `llm` must not
+    // produce the same page. Before this, they did.
+    expect(degraded.container.textContent).not.toBe(plainText);
+    const panel = screen.getByRole("status", { name: "Answer provenance" });
+    expect(panel.textContent).toContain("This answer is the fallback, not the model's.");
+    // The reason as the server spelled it, never a gloss of this console's own:
+    // the stop set is closed server-side and a lookup table here would render a
+    // tenth reason as nothing.
+    expect(panel.textContent).toContain(answeredDegraded.degraded.reason);
+    expect(panel.textContent).toContain(answeredDegraded.degraded.from);
+    // And the answer itself is still rendered: a degradation is a fact about
+    // how, not about whether.
+    expect(degraded.container.textContent).toContain(answered.answer.slice(0, 40));
+  });
+
+  test("an answer the model wrote says so and carries its trace, with no degradation", async () => {
+    stub("post", ASK, 200, answeredLLM);
+    const { container } = renderAsk();
+    await askQuestion();
+    await screen.findByRole("heading", { name: "Answer" });
+    expect(screen.getByText("llm")).toBeInTheDocument();
+    // `degraded` is present IFF the loop was attempted and did NOT write the
+    // answer, so a panel here would be the console inventing a downgrade.
+    expect(screen.queryByRole("status", { name: "Answer provenance" })).toBeNull();
+    expect(container.textContent).not.toMatch(/fallback/i);
+    // The trace still renders, because the loop ran.
+    expect(container.textContent).toContain(answeredLLM.llm.model);
+    expect(container.textContent).toContain(answeredLLM.llm.tools[0]!.name);
+  });
+
+  test("a refusal that degraded first renders both the degradation and the floor", async () => {
+    // read.go:443-448 — the degraded loop does not inherit the floor's
+    // permission to be ignored. Both facts are on the same payload and the
+    // console renders both, in two panels: the degradation is not smuggled
+    // into Refusal, whose contract is the floor and no request id.
+    stub("post", ASK, 200, refusedDegraded);
+    const { container } = renderAsk();
+    await askQuestion();
+    const refusal = await screen.findByRole("status", { name: "Answer outcome" });
+    const provenance = screen.getByRole("status", { name: "Answer provenance" });
+    expect(refusal.textContent).toContain("has never been calibrated");
+    expect(refusal.textContent).not.toContain(refusedDegraded.degraded.reason);
+    expect(provenance.textContent).toContain(refusedDegraded.degraded.reason);
+    expect(provenance.textContent).not.toContain("has never been calibrated");
+    expect(container.textContent).toContain(refusedDegraded.reason);
+  });
+
+  test("a trace with no tool calls survives its null tools list", async () => {
+    // `tools` serialises as null when the loop made no tool call, which a
+    // provider failure on turn one always does — the commonest degradation
+    // there is. A .map on null throws and unmounts the tree.
+    expect(answeredDegraded.llm.tools).toBeNull();
+    stub("post", ASK, 200, answeredDegraded);
+    const { container } = renderAsk();
+    await askQuestion();
+    await screen.findByRole("heading", { name: "Answer" });
+    expect(container.textContent).toContain("none");
+    expect(container.textContent).toContain(answeredDegraded.llm.stop);
+  });
+
+  test("a deployment with no model renders no provenance block at all", async () => {
+    // The shipped default sends neither field, and an unconfigured console must
+    // look exactly as it did.
+    stub("post", ASK, 200, answered);
+    const { container } = renderAsk();
+    await askQuestion();
+    await screen.findByRole("heading", { name: "Answer" });
+    expect(screen.queryByRole("status", { name: "Answer provenance" })).toBeNull();
+    expect(container.textContent).not.toContain("What the model did");
   });
 });
