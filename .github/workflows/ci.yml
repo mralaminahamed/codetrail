@@ -142,7 +142,7 @@ jobs:
           docker tag codetrail/gateway:test codetrail/gateway:dev
           docker tag codetrail/indexer:test codetrail/indexer:dev
           docker compose -f infra/docker-compose.yml --profile apps up -d --no-build
-          ./infra/smoke.sh --target compose http://localhost:8080
+          ./infra/smoke.sh --target compose http://localhost:8401
 
       - name: live datastore tests
         env:

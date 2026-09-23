@@ -5,7 +5,7 @@ import tailwindcss from "@tailwindcss/vite";
 // Every gateway path the browser may reach, proxied in dev and in preview so
 // the console is same-origin in both. The gateway has no CORS middleware and
 // is not getting one; see the phase plan's Global Constraints.
-const gateway = "http://localhost:8080";
+const gateway = "http://localhost:8401";
 const proxy = {
   "/api": gateway,
   "/health": gateway,
@@ -15,8 +15,8 @@ const proxy = {
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
-  server: { proxy },
-  preview: { proxy },
+  server: { port: 8400, proxy },
+  preview: { port: 8400, proxy },
   test: {
     globals: true,
     environment: "jsdom",

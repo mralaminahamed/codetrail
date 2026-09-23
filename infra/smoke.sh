@@ -43,7 +43,7 @@ while [ $# -gt 0 ]; do
 done
 
 case $TARGET in
-compose) BASE=${BASE:-http://localhost:8080} ;;
+compose) BASE=${BASE:-http://localhost:8401} ;;
 deployed)
 	if [ -z "$BASE" ]; then
 		echo "--target deployed needs a base URL" >&2
@@ -231,7 +231,7 @@ fi
 # Proves the metrics the alerts depend on actually moved, on a real job, in the
 # deployed shape.
 if [ "$TARGET" = compose ]; then
-	INDEXER_METRICS=${INDEXER_METRICS:-http://localhost:9090/metrics}
+	INDEXER_METRICS=${INDEXER_METRICS:-http://localhost:8402/metrics}
 fi
 if [ -n "$INDEXER_METRICS" ]; then
 	done_count=$(curl -sS "$INDEXER_METRICS" 2>/dev/null |
