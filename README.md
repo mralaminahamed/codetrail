@@ -121,8 +121,8 @@ the test suite runs on.
 make build
 export DATABASE_URL='postgres://codetrail:codetrail@localhost:55432/codetrail?sslmode=disable'
 export EMBED_PROVIDER=ollama OLLAMA_URL=http://localhost:11435
-./bin/gateway &   # :8080
-./bin/indexer &   # probe and metrics on :9090
+PORT=8401 ./bin/gateway &         # :8401
+PROBE_PORT=8402 ./bin/indexer &   # probe and metrics on :8402
 ```
 
 The gateway **embeds the question**, so it depends on the embedder at boot: with
@@ -134,7 +134,7 @@ avoid.
 **4. Index a repository.**
 
 ```bash
-JOB=$(curl -s -XPOST localhost:8080/api/repos \
+JOB=$(curl -s -XPOST localhost:8401/api/repos \
   -H 'content-type: application/json' \
   -d '{"remote":"https://github.com/rs/zerolog","ref":"master"}' | jq -r .id)
 ```
@@ -145,8 +145,8 @@ without it the body binds as a form and you get a `400` naming that rule.
 **5. Poll until it is done.**
 
 ```bash
-curl -s localhost:8080/api/jobs/$JOB | jq .
-REPO=$(curl -s localhost:8080/api/jobs/$JOB | jq -r .repo_id)
+curl -s localhost:8401/api/jobs/$JOB | jq .
+REPO=$(curl -s localhost:8401/api/jobs/$JOB | jq -r .repo_id)
 ```
 
 `status` walks `pending` → `leased` → `done`, and `repo_id` is empty until it lands. `rs/zerolog` is
@@ -156,7 +156,7 @@ attempt goes back to `pending` and waits out a backoff of 30s, then 60s.
 **6. Ask something.**
 
 ```bash
-curl -s -XPOST localhost:8080/api/repos/$REPO/ask \
+curl -s -XPOST localhost:8401/api/repos/$REPO/ask \
   -H 'content-type: application/json' \
   -d '{"q":"how does the sampler decide to drop an event"}' | jq .
 ```
@@ -178,10 +178,10 @@ covers and get a different hash. The check is only a check if it fails when it s
 **8. Walk the graph.** Three `GET`s, because a symbol name is an identifier rather than prose:
 
 ```bash
-curl -s "localhost:8080/api/repos/$REPO/symbols?name=Event.Msg" | jq .
-SYM=$(curl -s "localhost:8080/api/repos/$REPO/symbols?name=Event.Msg" | jq -r .symbols[0].id)
-curl -s "localhost:8080/api/repos/$REPO/symbols/$SYM" | jq .
-curl -s "localhost:8080/api/repos/$REPO/symbols/$SYM/callers?depth=2&limit=10" | jq .
+curl -s "localhost:8401/api/repos/$REPO/symbols?name=Event.Msg" | jq .
+SYM=$(curl -s "localhost:8401/api/repos/$REPO/symbols?name=Event.Msg" | jq -r .symbols[0].id)
+curl -s "localhost:8401/api/repos/$REPO/symbols/$SYM" | jq .
+curl -s "localhost:8401/api/repos/$REPO/symbols/$SYM/callers?depth=2&limit=10" | jq .
 ```
 
 The indexer needs a `go` binary on `PATH` for any edge to say `resolved`. Without one it still
@@ -190,10 +190,10 @@ indexes, every edge is `syntactic`, and it says so once at boot.
 **9. Optionally, the console.**
 
 ```bash
-cd apps/console && npm ci && npm run dev   # http://localhost:5173
+cd apps/console && npm ci && npm run dev   # http://localhost:8400
 ```
 
-Vite proxies `/api`, `/health`, `/ready` and `/metrics` to `localhost:8080` in both `dev` and
+Vite proxies `/api`, `/health`, `/ready` and `/metrics` to `localhost:8401` in both `dev` and
 `preview`, so the browser is same-origin against the gateway. There is no build-time API URL.
 
 ## API reference

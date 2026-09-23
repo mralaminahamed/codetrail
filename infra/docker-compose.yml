@@ -46,7 +46,7 @@ services:
       DATABASE_URL: postgres://codetrail:codetrail@postgres:5432/codetrail?sslmode=disable
       EMBED_PROVIDER: ${EMBED_PROVIDER:-fake}
       OLLAMA_URL: http://ollama:11434
-    ports: ["8080:8080"]
+    ports: ["127.0.0.1:8401:8080"]
     read_only: true
     tmpfs: ["/tmp"]
     healthcheck:
@@ -69,7 +69,7 @@ services:
       EMBED_PROVIDER: ${EMBED_PROVIDER:-fake}
       OLLAMA_URL: http://ollama:11434
       ALLOWED_HOSTS: github.com,codeberg.org
-    ports: ["9090:9090"]
+    ports: ["127.0.0.1:8402:9090"]
     read_only: true
     # The two writable paths, and no others: the same surface Task 5's task
     # definition gives it.

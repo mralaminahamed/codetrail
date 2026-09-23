@@ -10,19 +10,19 @@ built by Vite into a static bundle.
 
 ```bash
 npm ci
-npm run dev        # localhost:5173, proxying /api to localhost:8080
+npm run dev        # localhost:8400, proxying /api to localhost:8401
 npm run build      # tsc --noEmit && vite build  ->  dist/
 npm run preview    # serves dist/ with the same proxy
 npm run test -- --run
 npm run lint && npm run typecheck
 ```
 
-It needs a gateway on `localhost:8080`. From the repository root:
+It needs a gateway on `localhost:8401`. From the repository root:
 
 ```bash
 make up                      # Postgres
-DATABASE_URL=... EMBED_PROVIDER=fake ./bin/gateway
-DATABASE_URL=... EMBED_PROVIDER=fake ./bin/indexer
+DATABASE_URL=... EMBED_PROVIDER=fake PORT=8401 ./bin/gateway
+DATABASE_URL=... EMBED_PROVIDER=fake PROBE_PORT=8402 ./bin/indexer
 ```
 
 `vite.config.ts` proxies `/api`, `/health`, `/ready` and `/metrics` in **both**
