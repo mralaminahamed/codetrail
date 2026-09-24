@@ -1,0 +1,10 @@
+* text=auto eol=lf
+
+*.png binary
+
+# Emitted from the shipped handlers by TestConsoleFixtures.
+apps/console/src/api/fixtures/** linguist-generated=true
+
+apps/console/package-lock.json linguist-generated=true
+infra/terraform/.terraform.lock.hcl linguist-generated=true
+go.sum linguist-generated=true
