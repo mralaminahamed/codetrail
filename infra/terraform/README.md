@@ -85,11 +85,10 @@ these** — they are the honest remainder.
 | 13 | `queue: max` really queues three dispatches FIFO. | Dispatch three times and watch the run list |
 | 14 | The circuit breaker rolls a bad image back rather than stalling. | Deploy a tag that does not exist and watch the service |
 | 15 | Prometheus in the VPC discovers both services over Cloud Map. | `observability_enabled = true`, then the targets page |
-| 16 | The Ollama image builds with the model baked in. | `docker build -f infra/ollama.Dockerfile .` — **this one needs no account and was still not run**: it starts a server during the build to pull ~274 MB |
+| 16 | The Ollama image builds with the model baked in. | `docker build -f infra/ollama.Dockerfile .` — needs no account. **Proven since 2026-09-10**: the `build (ollama)` job in `images.yml` runs it, pulling the model during the build, and its `build` step has passed on every run since (first: run 34447270448; 7 runs as of 2026-09-24). On `trunk` the job still fails afterwards at `assume the push role`, which is row 11 |
 | 17 | `manage_master_user_password = true` would keep the password out of state. | The first change to make once an account exists — it needs a data source, which is why it is not the design today |
 
-### Two things in the second column are not account-required and were still not done
+### One thing in the second column is not account-required and was still not done
 
-Row 16 is a build this machine could have run and did not, and it is listed
-rather than quietly omitted. And `edge_enabled` — the middle parked mode in the
-README's cost table — is not built at all.
+`edge_enabled` — the middle parked mode in the README's cost table — is not
+built at all. (Row 16 was the other; CI has built it since 2026-09-10.)
