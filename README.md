@@ -49,13 +49,15 @@ had nothing to say" inside an error-rate panel is how a dashboard starts lying.
 
 ## Status
 
-Everything described in this file is built, merged and green in CI. **Nothing is deployed.** The list
+Everything described in this file is built and merged. The CI workflow is disabled on GitHub — its
+last run was on 3 September 2026 — so the gates run locally; see [Development](#development).
+**Nothing is deployed.** The list
 below is what that leaves untrue, stated once here so no section has to keep apologising.
 
 - **There is no live instance.** No AWS account stands behind this repository, no OIDC role, no state
   bucket, no `production` environment. `terraform apply` has never run, no image has ever been
   pushed, and the deploy workflow has never been dispatched. What can be proved without an account is
-  proved on every pull request; see [Deployment](#deployment).
+  proved by `make` targets run locally; see [Deployment](#deployment).
 - **The score floor is a mechanism, not a measured threshold.** `ANSWER_SCORE_FLOOR` defaults to `-1`
   — the bottom of the cosine range, which excludes nothing — and every answer carries
   `"floor": {"value": -1, "calibrated": false}`. Nobody has measured a threshold. One consequence to
@@ -68,8 +70,8 @@ below is what that leaves untrue, stated once here so no section has to keep apo
   answer is. Two of the three corpora named before the run were refused by the leakage probe.
 - **No paid LLM request has ever been made from this repository.** The tool loop is proved against a
   deterministic in-process fake and against `httptest` servers on loopback. A `-tags=llm` suite
-  exists and CI type-checks it; it has never been run. Every cost figure here is arithmetic over a
-  published price list, not a bill.
+  exists and `ci.yml` would type-check it, but that workflow is disabled; the suite has never been
+  run. Every cost figure here is arithmetic over a published price list, not a bill.
 - **`POST /api/repos` is unauthenticated and there is no rate limit on any route.** What it does is
   `git clone` a stranger's URL on your bill. Per-job caps bound one job; nothing bounds the arrival
   rate. With an LLM provider configured, any caller may also request the paid path.
@@ -1191,7 +1193,7 @@ moved" into "may be out of date", and a test asserts the exact sentence *and* th
 appears anywhere in the tree.
 
 **No console test hits a live gateway.** All 183, across 21 files, run against MSW over fixtures that a
-`-tags=live` Go test emits from the shipped handlers over a real Postgres, and CI fails when a
+`-tags=live` Go test emits from the shipped handlers over a real Postgres, and that test fails when a
 committed fixture stops matching what those handlers produce. That pins the shape and the content of
 what the console renders; it proves nothing about a browser reaching a running process, which was done
 once by hand. None of the tests asserts a class name, which is what makes the design safe to change.
@@ -1210,9 +1212,9 @@ and no `production` environment. `terraform apply` has never run, no image has e
 registry, and `deploy.yml` — which is `workflow_dispatch` only — has never been dispatched once. What
 follows is what exists and what it has been proved to do.
 
-| | Verified with no cloud account, on every pull request | Needs a live account |
+| | Verified with no cloud account | Needs a live account |
 | --- | --- | --- |
-| **Images** | Both application images build, and `infra/image_test.sh` asserts what is inside them: uid 65532 under a read-only root filesystem answering `/health`, `/ready` and `/metrics`; exactly one `go` on `PATH`, at `/usr/local/go/bin/go`; no `GO*`, `GIT_*` or `*_PROXY` in either image's environment; no shell at all in the gateway image; the RDS trust store readable by the runtime user; and a real `git clone https://…` succeeding from inside the indexer. | Every push to a registry. **The Ollama image has never been built at all.** |
+| **Images** | Both application images build, and `infra/image_test.sh` asserts what is inside them: uid 65532 under a read-only root filesystem answering `/health`, `/ready` and `/metrics`; exactly one `go` on `PATH`, at `/usr/local/go/bin/go`; no `GO*`, `GIT_*` or `*_PROXY` in either image's environment; no shell at all in the gateway image; the RDS trust store readable by the runtime user; and a real `git clone https://…` succeeding from inside the indexer. | Every push to a registry. |
 | **Terraform** | `fmt`, `validate`, an offline `plan` under mock credentials on empty state, and **29 assertions** over the plan JSON. Two plans of one configuration are byte-identical. | `apply`. Every resource identifier. The destroy → apply → empty-plan cycle. |
 | **Alerts** | `promtool check rules`, `check config` on both scrape files, and `test rules` — **19 tests covering all twelve rules**, every conjunct proved to decide its outcome, and four of the five state alerts proved to fire with no traffic at all. | That Prometheus in the deployed VPC can discover either service. |
 | **Smoke test** | All nine assertions, against the built images over `docker compose`, including an end-to-end index of `rs/zerolog`. | The same script against a deployed URL. |
@@ -1347,9 +1349,10 @@ OLLAMA_URL=http://localhost:11435 go test -tags=ollama ./packages/shared/embed/
 LLM_PROVIDER=anthropic LLM_API_KEY=sk-… go test -tags=llm ./packages/shared/llm/
 ```
 
-CI runs the default and `live` suites and the plan policy suite on every pull request. It `go vet`s
-the `ollama` and `llm` suites without running them, so an opt-in suite cannot rot unnoticed between
-the runs nobody makes.
+`ci.yml` runs the default and `live` suites and the plan policy suite, and `go vet`s the `ollama` and
+`llm` suites without running them, but the workflow is disabled on GitHub, so none of them runs on a
+pull request. Run them locally; `go vet -tags=ollama ./...` and `go vet -tags=llm ./...` are the checks
+that keep an opt-in suite from rotting unnoticed between the runs nobody makes.
 
 **Each live suite creates a throwaway database of its own** beside the one `DATABASE_URL` names,
 migrates it, and drops it when the suite ends. That is not tidiness: these tests clear whole tables —
@@ -1360,7 +1363,8 @@ role it names has to be allowed to do.
 
 ### The other checks
 
-`make test` runs **none** of these, and CI runs each as its own step.
+`make test` runs **none** of these. `ci.yml` runs each as its own step, but it is disabled, so run them
+yourself.
 
 ```bash
 make policy          # terraform plan under mock credentials, then the assertions over its JSON
@@ -1376,7 +1380,8 @@ make eval-corpus     # the two indexer passes the chunking comparison needs, as 
 `make smoke`, `make images` and `make image-test` need Docker.
 
 Console fixtures are not written by hand — they are emitted from the shipped handlers over a real
-Postgres, and CI fails when a committed fixture stops matching what those handlers produce:
+Postgres, and the `live` suite fails when a committed fixture stops matching what those handlers
+produce:
 
 ```bash
 DATABASE_URL='…' UPDATE_CONSOLE_FIXTURES=1 \

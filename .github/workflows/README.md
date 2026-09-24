@@ -4,7 +4,7 @@
 
 | Workflow | Trigger | Has it ever run? |
 | --- | --- | --- |
-| `ci.yml` | push to `trunk`, pull request | Yes, on every pull request. |
+| `ci.yml` | push to `trunk`, pull request | **Disabled on GitHub.** It ran on pull requests until 3 September 2026 and has not run since. Run its gates locally. |
 | `images.yml` | push, pull request, dispatch | **The build half only.** `push: false` on a pull request builds all three Dockerfiles with no account. **Every push to a registry is unproven: it has never run.** |
 | `deploy.yml` | `workflow_dispatch` only | **Never. Not once.** No `terraform apply`, no rollout wait, no deployed smoke test. |
 
@@ -12,9 +12,10 @@ There is no AWS account, no OIDC role, no state bucket and no `production`
 environment behind this repository. Nothing above softens that, and nothing
 should: the sibling project shipped a Terraform stack and two workflows that had
 never been executed once, and said so plainly. This says so too, with the
-addition that everything provable without an account **is** proved, on every
-pull request — the images build and are asserted, the Terraform plans and is
-asserted, and the alert rules are replayed through `promtool`.
+addition that everything provable without an account **is** proved: the images
+build on every pull request, and `make image-test`, `make policy` and
+`make alerts-test` assert the images, the Terraform plan and the alert rules
+locally, because `ci.yml` is disabled.
 
 ## The gates on `deploy.yml`
 
